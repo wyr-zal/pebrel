@@ -3,7 +3,7 @@
 //! Hook events are facts; screen matches are observations with limited authority.
 //! Command ownership ends at the shell boundary, never because output goes quiet.
 
-use crate::ai_agents::{AgentStatus, AgentStatusSource, Detection};
+use crate::ai_agents::{AgentKind, AgentStatus, AgentStatusSource, Detection};
 
 use super::{AiHookEvent, AiHookKind};
 
@@ -335,7 +335,13 @@ impl AgentActivity {
                 if matches!(self.coverage, HookCoverage::Completion | HookCoverage::Turns) {
                     return false;
                 }
-                if self.turn_observed { AgentStatus::Done } else { AgentStatus::Idle }
+                // Codex returns to the same composer after success, provider
+                // failure and interruption. Without a hook, idle is not Done.
+                if self.turn_observed && detection.agent != AgentKind::Codex {
+                    AgentStatus::Done
+                } else {
+                    AgentStatus::Idle
+                }
             },
             status @ (AgentStatus::Working | AgentStatus::Blocked) => {
                 self.idle_samples = 0;

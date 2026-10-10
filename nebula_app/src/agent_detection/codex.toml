@@ -33,6 +33,7 @@ priority = 400
 region = "bottom_non_empty_lines(16)"
 any = [
   { line_regex = ['^[•◦]\s+(?:Working|Compacting context) \([^)]*esc to interrupt\)(?: · .*)?$'] },
+  { line_regex = ['^[•◦]\s+Reconnecting(?:\.\.\.|…) [1-9][0-9]*/[1-9][0-9]* \([^)]*[·•] esc to interrupt\)(?: · .*)?$'] },
   { line_regex = ['^[•◦]\s+Messages to be submitted after next tool call \(press esc to interrupt and send immediately\)$'] },
 ]
 

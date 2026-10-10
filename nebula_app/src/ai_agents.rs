@@ -1080,6 +1080,41 @@ mod tests {
     }
 
     #[test]
+    fn codex_reconnecting_chrome_stays_working_above_error_and_tip() {
+        let footer =
+            "› Ask Codex to do anything\ngpt-6-astra medium · Context 4% used\n? for shortcuts";
+        for bullet in ["•", "◦"] {
+            for ellipsis in ["...", "…"] {
+                for attempt in [1, 5] {
+                    let chrome = format!(
+                        "{bullet} Reconnecting{ellipsis} {attempt}/5 (5m 03s • esc to interrupt)"
+                    );
+                    let frame = format!(
+                        "{chrome}\n  └ Rate limit exceeded: token rate limit.\n  └ Tip: Use /hooks to view and manage lifecycle hooks.\n{footer}"
+                    );
+                    let detection = detect("codex", &frame).unwrap();
+                    assert_eq!(detection.status, AgentStatus::Working, "{frame}");
+                    assert_eq!(detection.rule_id, "working_status");
+                    let stale = format!("{chrome}\n{}{footer}", "completed output\n".repeat(20));
+                    assert_eq!(detect("codex", &stale).unwrap().status, AgentStatus::Idle);
+                }
+            }
+        }
+        for prose in [
+            "The log says Reconnecting... 1/5 (5m 03s • esc to interrupt).",
+            "• Reconnecting... is mentioned in the provider documentation.",
+            "• Reconnecting... 1/5 without live interrupt controls",
+            "■ stream disconnected before completion: failed to send request",
+        ] {
+            let frame = format!("{prose}\n{footer}");
+            assert!(
+                !detect("codex", &frame).is_some_and(|d| d.status == AgentStatus::Working),
+                "{frame}"
+            );
+        }
+    }
+
+    #[test]
     fn real_codex_idle_chrome_reads_idle() {
         // codex 早已答完，屏幕上就是空闲输入框。这块屏幕当初根本没人去匹:
         // running_program 是 None，1 Hz 看门狗在入口就早退了，于是转圈长挂。

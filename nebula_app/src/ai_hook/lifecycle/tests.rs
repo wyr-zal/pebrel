@@ -1,5 +1,4 @@
 use super::*;
-use crate::ai_agents::AgentKind;
 use crate::ai_hook::parse_remote_envelope;
 
 fn event(source: &str, session: &str, name: &str) -> AiHookEvent {
@@ -118,36 +117,90 @@ fn codex_capabilities_follow_the_installed_notify_bridge() {
 
 #[test]
 fn fallback_requires_consecutive_idle_and_work_before_a_completion() {
-    let mut activity = AgentActivity::default();
-    activity.begin_command(true);
-    for _ in 0..2 {
+    for agent in AgentKind::ALL {
+        let screen = |status| Some(Detection { agent, status, rule_id: "test.chrome".into() });
+        let mut activity = AgentActivity::default();
+        activity.begin_command(true);
+        for _ in 0..2 {
+            activity.observe_screen(screen(AgentStatus::Idle));
+        }
+        assert_eq!(activity.status(), AgentStatus::Idle, "opening a CLI did not finish a turn");
+        activity.observe_screen(screen(AgentStatus::Working));
         activity.observe_screen(screen(AgentStatus::Idle));
+        activity.observe_screen(None);
+        activity.observe_screen(screen(AgentStatus::Idle));
+        assert_eq!(activity.status(), AgentStatus::Working);
+        assert!(activity.observe_screen(screen(AgentStatus::Idle)));
+        let (expected, notification) = if agent == AgentKind::Codex {
+            (AgentStatus::Idle, None)
+        } else {
+            (AgentStatus::Done, Some(false))
+        };
+        assert_eq!(activity.status(), expected, "{agent:?}");
+        assert_eq!(
+            screen_notification(AgentStatus::Working, activity.status(), false),
+            notification,
+            "{agent:?}"
+        );
+        assert_eq!(screen_notification(activity.status(), activity.status(), false), None);
     }
-    assert_eq!(activity.status(), AgentStatus::Idle, "opening a CLI did not finish a turn");
-    activity.observe_screen(screen(AgentStatus::Working));
-    activity.observe_screen(screen(AgentStatus::Idle));
-    activity.observe_screen(None);
-    activity.observe_screen(screen(AgentStatus::Idle));
-    assert_eq!(activity.status(), AgentStatus::Working);
-    assert!(activity.observe_screen(screen(AgentStatus::Idle)));
-    assert_eq!(activity.status(), AgentStatus::Done);
-    assert_eq!(screen_notification(AgentStatus::Working, activity.status(), false), Some(false));
-    assert_eq!(screen_notification(activity.status(), activity.status(), false), None);
 }
 
 #[test]
 fn runtime_submission_does_not_finish_on_the_previous_idle_frame() {
-    let mut activity = AgentActivity::default();
-    activity.submitted();
-    for _ in 0..8 {
-        activity.observe_screen(screen(AgentStatus::Idle));
+    for agent in AgentKind::ALL {
+        let screen = |status| Some(Detection { agent, status, rule_id: "test.chrome".into() });
+        let mut activity = AgentActivity::default();
+        activity.submitted();
+        for _ in 0..8 {
+            activity.observe_screen(screen(AgentStatus::Idle));
+        }
+        assert_eq!(activity.status(), AgentStatus::Working);
+        activity.observe_screen(screen(AgentStatus::Working));
+        for _ in 0..2 {
+            activity.observe_screen(screen(AgentStatus::Idle));
+        }
+        let expected =
+            if agent == AgentKind::Codex { AgentStatus::Idle } else { AgentStatus::Done };
+        assert_eq!(activity.status(), expected, "{agent:?}");
     }
-    assert_eq!(activity.status(), AgentStatus::Working);
-    activity.observe_screen(screen(AgentStatus::Working));
-    for _ in 0..2 {
-        activity.observe_screen(screen(AgentStatus::Idle));
+}
+
+#[test]
+fn codex_screen_idle_cannot_certify_an_answer_or_failure() {
+    let footer =
+        "› Ask Codex to do anything\ngpt-6-astra medium · Context 4% used\n? for shortcuts";
+    for preceding in [AgentStatus::Working, AgentStatus::Blocked] {
+        for output in [
+            "Completed answer.",
+            "■ stream disconnected before completion: failed to send request",
+            "■ Rate limit exceeded",
+            "■ 401 Unauthorized",
+            "■ 503 Service Unavailable",
+            "■ Turn interrupted",
+        ] {
+            let mut activity = AgentActivity::default();
+            activity.begin_command(true);
+            activity.observe_screen(screen(AgentStatus::Working));
+            activity.observe_screen(screen(preceding));
+            let frame = format!("{output}\n{footer}");
+            for _ in 0..6 {
+                let previous = activity.status();
+                activity.observe_screen(crate::ai_agents::detect("codex", &frame));
+                assert_eq!(screen_notification(previous, activity.status(), false), None);
+            }
+            assert_eq!(activity.status(), AgentStatus::Idle, "{preceding:?}: {output}");
+            assert_eq!(activity.source(), AgentStatusSource::Screen);
+            assert!(!activity.hook_seen());
+            // An idle observation does not disable the next work/permission edge.
+            assert!(activity.observe_screen(screen(AgentStatus::Working)));
+            assert!(activity.observe_screen(screen(AgentStatus::Blocked)));
+            assert_eq!(
+                screen_notification(AgentStatus::Working, activity.status(), false),
+                Some(true)
+            );
+        }
     }
-    assert_eq!(activity.status(), AgentStatus::Done);
 }
 
 #[test]
