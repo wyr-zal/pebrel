@@ -227,12 +227,13 @@ fn codex_screen_retry_and_idle_do_not_emit_completion(cx: &mut TestAppContext) {
     });
     let footer =
         "› Ask Codex to do anything\ngpt-6-astra medium · Context 4% used\n? for shortcuts";
-    for output in [
-        "Completed answer.",
-        "■ stream disconnected before completion: failed to send request",
-        "■ Rate limit exceeded",
-        "■ Turn interrupted",
+    for (output, expected) in [
+        ("Completed answer.", AgentStatus::Idle),
+        ("■ stream disconnected before completion: failed to send request", AgentStatus::Failed),
+        ("■ Rate limit exceeded", AgentStatus::Failed),
+        ("■ Turn interrupted", AgentStatus::Idle),
     ] {
+        notifications.borrow_mut().clear();
         view.update(window, |view, cx| {
             view.running_program = Some("codex".into());
             screen(view, &format!("• Working (12s • esc to interrupt)\n{footer}"));
@@ -252,13 +253,35 @@ fn codex_screen_retry_and_idle_do_not_emit_completion(cx: &mut TestAppContext) {
             for _ in 0..4 {
                 view.refresh_agent_screen_state(cx);
             }
-            assert_eq!(view.agent_activity.status(), AgentStatus::Idle, "{output}");
+            assert_eq!(view.agent_activity.status(), expected, "{output}");
             assert_eq!(view.agent_activity.source(), AgentStatusSource::Screen);
             assert!(!view.agent_activity.hook_seen());
-            assert_eq!(view.runtime_task_state(), RuntimeTaskState::Idle);
-            assert_eq!(view.sidebar_activity(), SidebarActivity::Idle);
+            let expected_runtime = if expected == AgentStatus::Failed {
+                RuntimeTaskState::Failed
+            } else {
+                RuntimeTaskState::Idle
+            };
+            let expected_sidebar = if expected == AgentStatus::Failed {
+                SidebarActivity::Failed
+            } else {
+                SidebarActivity::Idle
+            };
+            assert_eq!(view.runtime_task_state(), expected_runtime);
+            assert_eq!(view.sidebar_activity(), expected_sidebar);
         });
-        assert!(notifications.borrow().is_empty(), "{output}: no unverified completion");
+        let notes = notifications.borrow();
+        if expected == AgentStatus::Failed {
+            assert_eq!(notes.len(), 1, "{output}: one failure notification");
+            assert!(matches!(
+                notes.first(),
+                Some(crate::notify::Notification::AiTurnIssue {
+                    outcome: crate::ai_hook::AiTurnOutcome::Failed,
+                    ..
+                })
+            ));
+        } else {
+            assert!(notes.is_empty(), "{output}: no unverified completion");
+        }
     }
 }
 

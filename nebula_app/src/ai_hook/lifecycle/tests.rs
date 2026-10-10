@@ -171,13 +171,16 @@ fn codex_screen_idle_cannot_certify_an_answer_or_failure() {
     let footer =
         "› Ask Codex to do anything\ngpt-6-astra medium · Context 4% used\n? for shortcuts";
     for preceding in [AgentStatus::Working, AgentStatus::Blocked] {
-        for output in [
-            "Completed answer.",
-            "■ stream disconnected before completion: failed to send request",
-            "■ Rate limit exceeded",
-            "■ 401 Unauthorized",
-            "■ 503 Service Unavailable",
-            "■ Turn interrupted",
+        for (output, expected) in [
+            ("Completed answer.", AgentStatus::Idle),
+            (
+                "■ stream disconnected before completion: failed to send request",
+                AgentStatus::Failed,
+            ),
+            ("■ Rate limit exceeded", AgentStatus::Failed),
+            ("■ 401 Unauthorized", AgentStatus::Failed),
+            ("■ 503 Service Unavailable", AgentStatus::Failed),
+            ("■ Turn interrupted", AgentStatus::Idle),
         ] {
             let mut activity = AgentActivity::default();
             activity.begin_command(true);
@@ -187,11 +190,21 @@ fn codex_screen_idle_cannot_certify_an_answer_or_failure() {
             for _ in 0..6 {
                 let previous = activity.status();
                 activity.observe_screen(crate::ai_agents::detect("codex", &frame));
-                assert_eq!(screen_notification(previous, activity.status(), false), None);
+                let notification = screen_notification(previous, activity.status(), false);
+                assert_eq!(
+                    notification,
+                    (expected == AgentStatus::Failed && previous != AgentStatus::Failed)
+                        .then_some(false),
+                    "{output}"
+                );
             }
-            assert_eq!(activity.status(), AgentStatus::Idle, "{preceding:?}: {output}");
+            assert_eq!(activity.status(), expected, "{preceding:?}: {output}");
             assert_eq!(activity.source(), AgentStatusSource::Screen);
             assert!(!activity.hook_seen());
+            if expected == AgentStatus::Failed {
+                // The persistent composer does not erase the failure.
+                assert!(!activity.observe_screen(screen(AgentStatus::Idle)));
+            }
             // An idle observation does not disable the next work/permission edge.
             assert!(activity.observe_screen(screen(AgentStatus::Working)));
             assert!(activity.observe_screen(screen(AgentStatus::Blocked)));

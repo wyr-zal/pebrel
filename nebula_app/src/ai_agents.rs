@@ -359,6 +359,7 @@ pub enum AgentStatus {
     Working,
     Blocked,
     Done,
+    Failed,
     #[default]
     Unknown,
 }
@@ -451,6 +452,7 @@ enum RuleState {
     Idle,
     Working,
     Blocked,
+    Failed,
 }
 
 impl From<RuleState> for AgentStatus {
@@ -459,6 +461,7 @@ impl From<RuleState> for AgentStatus {
             RuleState::Idle => Self::Idle,
             RuleState::Working => Self::Working,
             RuleState::Blocked => Self::Blocked,
+            RuleState::Failed => Self::Failed,
         }
     }
 }

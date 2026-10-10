@@ -14,6 +14,18 @@ contains = ["openai codex"]
 regex = ['(?m)^[ \t]*› Ask Codex to do anything[ \t]*\r?\n(?:[ \t]*\r?\n)*[ \t]*\S+[ \t]+(?:minimal|low|medium|high|xhigh|max)[ \t]*[·•][^\r\n]*\s*\z']
 
 [[rules]]
+id = "request_failed"
+state = "failed"
+priority = 950
+region = "bottom_non_empty_lines(12)"
+any = [
+  { line_regex = ['^■ stream disconnected before completion: .+$'] },
+  { line_regex = ['^■ Rate limit exceeded$'] },
+  { line_regex = ['^■ [45][0-9][0-9] .+$'] },
+]
+not = [{ contains = ["esc to interrupt"] }]
+
+[[rules]]
 id = "strong_blocker"
 state = "blocked"
 priority = 900

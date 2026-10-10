@@ -752,6 +752,7 @@ fn task_state(state: &crate::display::NebulaPaneState) -> RuntimeTaskState {
         AgentStatus::Working => return RuntimeTaskState::Running,
         AgentStatus::Blocked => return RuntimeTaskState::Attention,
         AgentStatus::Done => return RuntimeTaskState::Finished,
+        AgentStatus::Failed => return RuntimeTaskState::Failed,
         AgentStatus::Idle => return RuntimeTaskState::Idle,
         AgentStatus::Unknown => {},
     }

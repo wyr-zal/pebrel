@@ -24,11 +24,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Kuddev"
             VALUE "FileDescription", "Pebrel"
-            VALUE "FileVersion", "2.2.1"
+            VALUE "FileVersion", "2.2.2"
             VALUE "InternalName", "nebula"
             VALUE "OriginalFilename", "pebrel.exe"
             VALUE "ProductName", "Pebrel"
-            VALUE "ProductVersion", "2.2.1"
+            VALUE "ProductVersion", "2.2.2"
         END
     END
     BLOCK "VarFileInfo"
