@@ -15,6 +15,7 @@ Every release entry is provided in English and Simplified Chinese.
 #### Fixed
 
 - Fixed: Duplicate stop-failure deliveries for the same Claude turn are rejected once the failure has been handled, so a redelivered failure does not re-enter the event pipeline.
+- Fixed: Auto-continue resends were blocked on Claude failures because the resend gate only accepted an idle agent. It now accepts the failure state, so a resend fires while the error stays visible.
 
 ### 中文
 
@@ -25,6 +26,7 @@ Every release entry is provided in English and Simplified Chinese.
 #### 修复
 
 - 修复：同一 Claude 回合的失败在消费一次后拒绝重复投递，重复送达的失败不会再进入事件流程。
+- 修复：Claude 失败后的自动续跑被拦截——重发校验此前只接受空闲状态；现在失败状态同样放行，错误界面保持可见的同时照常重发。
 
 ### Contributors
 

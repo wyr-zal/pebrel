@@ -44,7 +44,12 @@ impl TerminalView {
                     || view.marked_text.is_some()
                     || view.pending_runtime_submit.is_some()
                     || view.running_program.as_deref() != Some("claude")
-                    || view.agent_activity.status() != AgentStatus::Idle
+                    // A retryable claude failure parks in Failed with the error
+                    // screen still visible; Idle only covers the legacy mapping.
+                    || !matches!(
+                        view.agent_activity.status(),
+                        AgentStatus::Idle | AgentStatus::Failed
+                    )
                     || !view.last_command_failed
                     || !view.ai_session.as_ref().is_some_and(|identity| {
                         identity.source == "claude" && identity.session_id == session_id
