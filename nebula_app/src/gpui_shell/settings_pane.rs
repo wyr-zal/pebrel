@@ -778,6 +778,8 @@ impl SettingsPane {
             "ghost" => flag!(ghost),
             "ai_toasts" => flag!(ai_toasts),
             "ai_auto_continue" => flag!(ai_auto_continue),
+            "ai_auto_continue_attempts" => pick!(ai_auto_continue_attempts),
+            "ai_auto_continue_interval" => pick!(ai_auto_continue_interval),
             "ctrl_wheel_font_zoom" => flag!(ctrl_wheel_font_zoom),
             "notification_duration" => pick!(notification_duration),
             "cursor_motion" => pick!(cursor_motion),
@@ -1311,6 +1313,21 @@ impl SettingsPane {
                 self.runtime.ai_auto_continue,
                 cx,
             ))
+            .when(self.runtime.ai_auto_continue, |group| {
+                group
+                    .child(self.select_row(
+                        "ai_auto_continue_attempts",
+                        language.pick("自动续跑次数", "Auto-continue attempts"),
+                        help("ai_auto_continue_attempts", language),
+                        cx,
+                    ))
+                    .child(self.select_row(
+                        "ai_auto_continue_interval",
+                        language.pick("自动续跑间隔", "Auto-continue interval"),
+                        help("ai_auto_continue_interval", language),
+                        cx,
+                    ))
+            })
             .child(self.select_row(
                 "notification_duration",
                 language.text(crate::i18n::Message::SettingsNotificationsDuration),

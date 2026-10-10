@@ -53,6 +53,103 @@ impl NotificationDuration {
     }
 }
 
+/// How many times the AI auto-continue may resend before giving up on a turn.
+/// The default keeps the original bound; higher caps suit relays that only
+/// recover after several attempts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AutoContinueAttempts {
+    #[default]
+    Three,
+    Five,
+    Ten,
+    Twenty,
+    Thirty,
+}
+
+impl AutoContinueAttempts {
+    pub const VALUES: &'static [&'static str] = &["3", "5", "10", "20", "30"];
+
+    pub fn from_settings(value: &str) -> Option<Self> {
+        match value.trim() {
+            "3" => Some(Self::Three),
+            "5" => Some(Self::Five),
+            "10" => Some(Self::Ten),
+            "20" => Some(Self::Twenty),
+            "30" => Some(Self::Thirty),
+            _ => None,
+        }
+    }
+
+    pub fn settings_value(self) -> &'static str {
+        match self {
+            Self::Three => "3",
+            Self::Five => "5",
+            Self::Ten => "10",
+            Self::Twenty => "20",
+            Self::Thirty => "30",
+        }
+    }
+
+    /// Maximum number of auto-continue sends per failed turn.
+    pub fn count(self) -> u8 {
+        match self {
+            Self::Three => 3,
+            Self::Five => 5,
+            Self::Ten => 10,
+            Self::Twenty => 20,
+            Self::Thirty => 30,
+        }
+    }
+}
+
+/// Minimum spacing between two consecutive AI auto-continue sends. Tuned for
+/// waiting out relay rate limits, so the shortest choice is already minutes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AutoContinueInterval {
+    #[default]
+    ThreeMinutes,
+    FiveMinutes,
+    TenMinutes,
+    FifteenMinutes,
+    TwentyMinutes,
+}
+
+impl AutoContinueInterval {
+    pub const VALUES: &'static [&'static str] = &["180", "300", "600", "900", "1200"];
+
+    pub fn from_settings(value: &str) -> Option<Self> {
+        match value.trim() {
+            "180" => Some(Self::ThreeMinutes),
+            "300" => Some(Self::FiveMinutes),
+            "600" => Some(Self::TenMinutes),
+            "900" => Some(Self::FifteenMinutes),
+            "1200" => Some(Self::TwentyMinutes),
+            _ => None,
+        }
+    }
+
+    pub fn settings_value(self) -> &'static str {
+        match self {
+            Self::ThreeMinutes => "180",
+            Self::FiveMinutes => "300",
+            Self::TenMinutes => "600",
+            Self::FifteenMinutes => "900",
+            Self::TwentyMinutes => "1200",
+        }
+    }
+
+    /// Wait enforced before each auto-continue send.
+    pub fn interval(self) -> Duration {
+        match self {
+            Self::ThreeMinutes => Duration::from_secs(180),
+            Self::FiveMinutes => Duration::from_secs(300),
+            Self::TenMinutes => Duration::from_secs(600),
+            Self::FifteenMinutes => Duration::from_secs(900),
+            Self::TwentyMinutes => Duration::from_secs(1200),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +228,38 @@ mod auto_continue_tests {
             let raw = RawSettings::from_text(&format!("ai_auto_continue={value}\n"));
             assert!(RuntimeSettings::from_raw(&raw).ai_auto_continue);
         }
+    }
+
+    #[test]
+    fn auto_continue_count_and_interval_parse_round_trip_and_fall_back() {
+        use crate::{AutoContinueAttempts, AutoContinueInterval};
+        let defaults = RuntimeSettings::from_raw(&RawSettings::default());
+        assert_eq!(defaults.ai_auto_continue_attempts, AutoContinueAttempts::Three);
+        assert_eq!(defaults.ai_auto_continue_attempts.count(), 3);
+        assert_eq!(defaults.ai_auto_continue_interval, AutoContinueInterval::ThreeMinutes);
+        assert_eq!(
+            defaults.ai_auto_continue_interval.interval(),
+            std::time::Duration::from_secs(180)
+        );
+        let saved = apply_updates(
+            "custom_data=keep\n",
+            &[
+                ("ai_auto_continue_attempts", "10".to_owned()),
+                ("ai_auto_continue_interval", "600".to_owned()),
+            ],
+        );
+        let runtime = RuntimeSettings::from_raw(&RawSettings::from_text(&saved));
+        assert_eq!(runtime.ai_auto_continue_attempts.count(), 10);
+        assert_eq!(
+            runtime.ai_auto_continue_interval.interval(),
+            std::time::Duration::from_secs(600)
+        );
+        assert!(saved.contains("custom_data=keep"));
+        // Unknown tokens fall back to the defaults rather than silencing retries.
+        let bad =
+            RawSettings::from_text("ai_auto_continue_attempts=7\nai_auto_continue_interval=45\n");
+        let runtime = RuntimeSettings::from_raw(&bad);
+        assert_eq!(runtime.ai_auto_continue_attempts, AutoContinueAttempts::Three);
+        assert_eq!(runtime.ai_auto_continue_interval, AutoContinueInterval::ThreeMinutes);
     }
 }

@@ -168,9 +168,13 @@ impl AgentActivity {
         {
             return false;
         }
+        // A consumed turn rejects duplicates in every terminal state it can
+        // hold until a new prompt: Done, claude's cancelled/legacy Idle, and
+        // the explicit failure that auto-continue already observed.
         if event.kind == AiHookKind::TurnDone
             && (self.status == AgentStatus::Done
-                || event.source == "claude" && self.status == AgentStatus::Idle)
+                || event.source == "claude"
+                    && matches!(self.status, AgentStatus::Idle | AgentStatus::Failed))
             && event.turn_id.is_some()
             && event.turn_id == self.turn_id
         {

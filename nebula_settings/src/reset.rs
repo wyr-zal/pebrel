@@ -46,6 +46,8 @@ const RESET_KEYS: &[&str] = &[
     "bell",
     "ai_toasts",
     "ai_auto_continue",
+    "ai_auto_continue_attempts",
+    "ai_auto_continue_interval",
     "notification_duration",
     "fetch",
     "auto_check_updates",

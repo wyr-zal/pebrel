@@ -19,7 +19,14 @@ impl TerminalView {
     pub(super) fn schedule_auto_continue(&mut self, event: &AiHookEvent, cx: &mut Context<Self>) {
         // A newer accepted event cancels the old turn's timer, even if not retryable.
         self.auto_continue_task = None;
-        let delay = self.auto_continue.observe(event, Instant::now());
+        let settings = cx.try_global::<Settings>();
+        let max_attempts = settings
+            .map(|settings| settings.ai_auto_continue_attempts)
+            .unwrap_or_else(|| nebula_settings::AutoContinueAttempts::default().count());
+        let interval = settings
+            .map(|settings| settings.ai_auto_continue_interval)
+            .unwrap_or_else(|| nebula_settings::AutoContinueInterval::default().interval());
+        let delay = self.auto_continue.observe(event, Instant::now(), max_attempts, interval);
         if !cx.try_global::<Settings>().is_some_and(|settings| settings.ai_auto_continue) {
             return;
         }

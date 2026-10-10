@@ -14,7 +14,11 @@ fn auto_continue_sends_once_to_owning_pane_without_hiding_failure(cx: &mut TestA
     let owner = "auto-sends";
     let (view, window, receiver) = open(cx);
     window.update(|_, cx| {
-        cx.update_global::<Settings, _>(|settings, _| settings.ai_auto_continue = true)
+        cx.update_global::<Settings, _>(|settings, _| {
+            settings.ai_auto_continue = true;
+            // Every send waits the full configured interval; no 1.5s quick-first floor.
+            settings.ai_auto_continue_interval = Duration::from_secs(5);
+        })
     });
     view.update(window, |view, cx| {
         let mut prompt = hook(owner, "UserPromptSubmit", 1);
@@ -29,7 +33,7 @@ fn auto_continue_sends_once_to_owning_pane_without_hiding_failure(cx: &mut TestA
         view.handle_ai_hook(&failure, cx);
     });
     window.run_until_parked();
-    window.executor().advance_clock(Duration::from_millis(1499));
+    window.executor().advance_clock(Duration::from_millis(4999));
     window.run_until_parked();
     assert!(!receiver.try_iter().any(|msg| matches!(msg, Msg::Input(_))));
     window.executor().advance_clock(Duration::from_millis(1));
@@ -55,7 +59,13 @@ fn auto_continue_cancels_on_input_setting_changes_new_events_and_exit(cx: &mut T
     for action in ["input", "toggle", "prompt", "stop", "end", "command", "identity", "closed"] {
         let owner = action;
         let (view, window, receiver) = open(cx);
-        window.update(|_, cx| cx.update_global::<Settings, _>(|s, _| s.ai_auto_continue = true));
+        window.update(|_, cx| {
+            cx.update_global::<Settings, _>(|s, _| {
+                s.ai_auto_continue = true;
+                // Short interval keeps the cancellation assertions discriminating.
+                s.ai_auto_continue_interval = Duration::from_secs(1);
+            })
+        });
         view.update(window, |view, cx| {
             view.handle_ai_hook(&hook(owner, "UserPromptSubmit", 1), cx);
             view.handle_ai_hook(&hook(owner, "StopFailure", 2), cx);
@@ -103,7 +113,12 @@ fn auto_continue_disabled_and_foreign_failure_never_submit(cx: &mut TestAppConte
     for enabled in [false, true] {
         let owner = if enabled { "auto-foreign" } else { "auto-disabled" };
         let (view, window, receiver) = open(cx);
-        window.update(|_, cx| cx.update_global::<Settings, _>(|s, _| s.ai_auto_continue = enabled));
+        window.update(|_, cx| {
+            cx.update_global::<Settings, _>(|s, _| {
+                s.ai_auto_continue = enabled;
+                s.ai_auto_continue_interval = Duration::from_secs(1);
+            })
+        });
         view.update(window, |view, cx| {
             view.handle_ai_hook(&hook(owner, "UserPromptSubmit", 1), cx);
             let mut event = hook(owner, "StopFailure", 2);
@@ -126,7 +141,13 @@ fn auto_continue_cancels_when_ime_preedit_is_abandoned(cx: &mut TestAppContext) 
     for clear_with_unmark in [true, false] {
         let owner = if clear_with_unmark { "ime-unmark" } else { "ime-empty" };
         let (view, window, receiver) = open(cx);
-        window.update(|_, cx| cx.update_global::<Settings, _>(|s, _| s.ai_auto_continue = true));
+        window.update(|_, cx| {
+            cx.update_global::<Settings, _>(|s, _| {
+                s.ai_auto_continue = true;
+                // Short interval keeps the cancellation assertions discriminating.
+                s.ai_auto_continue_interval = Duration::from_secs(1);
+            })
+        });
         view.update(window, |view, cx| {
             view.handle_ai_hook(&hook(owner, "UserPromptSubmit", 1), cx);
             view.handle_ai_hook(&hook(owner, "StopFailure", 2), cx);

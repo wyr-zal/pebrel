@@ -104,6 +104,20 @@ impl SettingsPane {
             window,
             cx,
         );
+        add_select(
+            "ai_auto_continue_attempts",
+            nebula_settings::AutoContinueAttempts::VALUES,
+            runtime.ai_auto_continue_attempts.settings_value(),
+            window,
+            cx,
+        );
+        add_select(
+            "ai_auto_continue_interval",
+            nebula_settings::AutoContinueInterval::VALUES,
+            runtime.ai_auto_continue_interval.settings_value(),
+            window,
+            cx,
+        );
         // 选项顺序与文案照抄旧壳 `CURSOR_SHAPE_OPTIONS` / `cursor_shape_label`。
         add_select(
             "cursor_shape",

@@ -37,7 +37,7 @@ mod language;
 mod ligatures;
 pub use ligatures::Ligatures;
 mod notifications;
-pub use notifications::NotificationDuration;
+pub use notifications::{AutoContinueAttempts, AutoContinueInterval, NotificationDuration};
 mod quick_terminal;
 mod scrolling;
 pub use scrolling::{
@@ -1049,6 +1049,10 @@ pub struct RuntimeSettings {
     /// terminal/tab state are independent. Default on for existing users.
     pub ai_toasts: bool,
     pub ai_auto_continue: bool,
+    /// Max auto-continue sends per failed turn (default keeps the original 3).
+    pub ai_auto_continue_attempts: AutoContinueAttempts,
+    /// Minimum spacing between auto-continue sends (default 3 minutes).
+    pub ai_auto_continue_interval: AutoContinueInterval,
     /// Display lifetime for in-app cards; default mode retains each kind's lifetime.
     pub notification_duration: NotificationDuration,
     /// 新会话欢迎屏 fastfetch（默认关：启动速度优先于观感，旧壳裁定）。
@@ -1250,6 +1254,14 @@ impl RuntimeSettings {
             bell: raw.value("bell").and_then(BellModeName::from_settings).unwrap_or_default(),
             ai_toasts: raw.bool_on("ai_toasts").unwrap_or(true),
             ai_auto_continue: raw.bool_on("ai_auto_continue").unwrap_or(true),
+            ai_auto_continue_attempts: raw
+                .value("ai_auto_continue_attempts")
+                .and_then(AutoContinueAttempts::from_settings)
+                .unwrap_or_default(),
+            ai_auto_continue_interval: raw
+                .value("ai_auto_continue_interval")
+                .and_then(AutoContinueInterval::from_settings)
+                .unwrap_or_default(),
             notification_duration: raw
                 .value("notification_duration")
                 .and_then(NotificationDuration::from_settings)

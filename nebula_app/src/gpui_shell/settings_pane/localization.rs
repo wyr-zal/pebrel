@@ -57,6 +57,20 @@ pub(super) fn localized_select_labels(
             language.text(crate::i18n::Message::SettingsNotificationsDurationNinety),
             language.text(crate::i18n::Message::SettingsNotificationsDurationPersistent),
         ],
+        "ai_auto_continue_attempts" => vec![
+            language.pick("3 次", "3 times"),
+            language.pick("5 次", "5 times"),
+            language.pick("10 次", "10 times"),
+            language.pick("20 次", "20 times"),
+            language.pick("30 次", "30 times"),
+        ],
+        "ai_auto_continue_interval" => vec![
+            language.pick("3 分钟", "3 min"),
+            language.pick("5 分钟", "5 min"),
+            language.pick("10 分钟", "10 min"),
+            language.pick("15 分钟", "15 min"),
+            language.pick("20 分钟", "20 min"),
+        ],
         "cursor_shape" => vec![
             language.pick("条形（│）", "Bar (│)"),
             language.pick("下划线（_）", "Underscore (_)"),

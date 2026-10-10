@@ -470,6 +470,8 @@ fn localized_select_labels_keep_stable_value_cardinality() {
         ("tabs_position", &["sidebar", "top"]),
         ("bell", &["off", "visual", "sound", "both"]),
         ("notification_duration", nebula_settings::NotificationDuration::VALUES),
+        ("ai_auto_continue_attempts", nebula_settings::AutoContinueAttempts::VALUES),
+        ("ai_auto_continue_interval", nebula_settings::AutoContinueInterval::VALUES),
         ("completion_style", &nebula_settings::CompletionStyleName::VALUES),
     ];
     for (key, values) in cases {
