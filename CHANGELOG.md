@@ -16,6 +16,8 @@ Every release entry is provided in English and Simplified Chinese.
 
 - Fixed: Duplicate stop-failure deliveries for the same Claude turn are rejected once the failure has been handled, so a redelivered failure does not re-enter the event pipeline.
 - Fixed: Auto-continue resends were blocked on Claude failures because the resend gate only accepted an idle agent. It now accepts the failure state, so a resend fires while the error stays visible.
+- Fixed tab tear-out being unreachable when the window filled the screen, most visibly with left-sidebar tabs. Holding Alt while dragging a tab and releasing now tears it into a standalone new window from anywhere inside the window. The sidebar tear-out previously only triggered when the cursor left the window bounds, which a maximized single-screen window never allows. Addresses [#572](https://github.com/Kuddev/pebrel/issues/572).
+- Fixed drag releases that land outside the source window being silently dropped: releasing a dragged tab over another Pebrel window now merges it there, with a live dock preview in the target window while hovering, and releasing past the window edge again tears the tab into a new window. Addresses [#572](https://github.com/Kuddev/pebrel/issues/572).
 
 ### 中文
 
@@ -27,12 +29,14 @@ Every release entry is provided in English and Simplified Chinese.
 
 - 修复：同一 Claude 回合的失败在消费一次后拒绝重复投递，重复送达的失败不会再进入事件流程。
 - 修复：Claude 失败后的自动续跑被拦截——重发校验此前只接受空闲状态；现在失败状态同样放行，错误界面保持可见的同时照常重发。
+- 修复窗口铺满屏幕时（尤其是左侧栏标签模式）标签无法撕出的问题。拖动标签时按住 Alt 再松手，现在可从窗口内任意位置把标签撕成独立新窗口。此前侧栏撕出只在光标移出窗口边界时触发，而最大化的单屏窗口无法让光标移出。对应 [#572](https://github.com/Kuddev/pebrel/issues/572)。
+- 修复落在源窗口之外的拖拽释放被静默丢弃的问题：把标签拖到另一个 Pebrel 窗口上松手现在会合并进该窗口，悬停期间目标窗口实时显示 dock 高亮预览；向窗口边缘外拖出松手也恢复为撕出新窗口。对应 [#572](https://github.com/Kuddev/pebrel/issues/572)。
 
 ### Contributors
 
 | Contributor | Contributions |
 | --- | --- |
-| [wyr-zal](https://github.com/wyr-zal) | Auto-continue retry count and interval settings |
+| [wyr-zal](https://github.com/wyr-zal) | Auto-continue retry count and interval settings; tab tear-out and cross-window merge fixes |
 
 ## 2.2.1 - 2026-10-10
 
