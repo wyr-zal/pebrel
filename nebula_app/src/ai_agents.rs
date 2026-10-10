@@ -359,6 +359,7 @@ pub enum AgentStatus {
     Working,
     Blocked,
     Done,
+    Failed,
     #[default]
     Unknown,
 }
@@ -451,6 +452,7 @@ enum RuleState {
     Idle,
     Working,
     Blocked,
+    Failed,
 }
 
 impl From<RuleState> for AgentStatus {
@@ -459,6 +461,7 @@ impl From<RuleState> for AgentStatus {
             RuleState::Idle => Self::Idle,
             RuleState::Working => Self::Working,
             RuleState::Blocked => Self::Blocked,
+            RuleState::Failed => Self::Failed,
         }
     }
 }
@@ -1077,6 +1080,41 @@ mod tests {
         }
         let quoted = "The log said Compacting context; Messages to be submitted after next tool call\n› Ask Codex to do anything\ngpt-6 max · /project";
         assert_eq!(detect("codex", quoted).unwrap().status, AgentStatus::Idle);
+    }
+
+    #[test]
+    fn codex_reconnecting_chrome_stays_working_above_error_and_tip() {
+        let footer =
+            "› Ask Codex to do anything\ngpt-6-astra medium · Context 4% used\n? for shortcuts";
+        for bullet in ["•", "◦"] {
+            for ellipsis in ["...", "…"] {
+                for attempt in [1, 5] {
+                    let chrome = format!(
+                        "{bullet} Reconnecting{ellipsis} {attempt}/5 (5m 03s • esc to interrupt)"
+                    );
+                    let frame = format!(
+                        "{chrome}\n  └ Rate limit exceeded: token rate limit.\n  └ Tip: Use /hooks to view and manage lifecycle hooks.\n{footer}"
+                    );
+                    let detection = detect("codex", &frame).unwrap();
+                    assert_eq!(detection.status, AgentStatus::Working, "{frame}");
+                    assert_eq!(detection.rule_id, "working_status");
+                    let stale = format!("{chrome}\n{}{footer}", "completed output\n".repeat(20));
+                    assert_eq!(detect("codex", &stale).unwrap().status, AgentStatus::Idle);
+                }
+            }
+        }
+        for prose in [
+            "The log says Reconnecting... 1/5 (5m 03s • esc to interrupt).",
+            "• Reconnecting... is mentioned in the provider documentation.",
+            "• Reconnecting... 1/5 without live interrupt controls",
+            "■ stream disconnected before completion: failed to send request",
+        ] {
+            let frame = format!("{prose}\n{footer}");
+            assert!(
+                !detect("codex", &frame).is_some_and(|d| d.status == AgentStatus::Working),
+                "{frame}"
+            );
+        }
     }
 
     #[test]

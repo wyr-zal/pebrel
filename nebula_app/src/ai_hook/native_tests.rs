@@ -44,9 +44,9 @@ fn pi_result_metadata_distinguishes_legacy_unknown_and_background_work() {
     for (metadata, outcome, status, notifies) in [
         ("", AiTurnOutcome::Unspecified, AgentStatus::Done, true),
         (",\"stop_reason\":\"stop\"", AiTurnOutcome::Succeeded, AgentStatus::Done, true),
-        (",\"stop_reason\":\"error\"", AiTurnOutcome::Failed, AgentStatus::Idle, true),
+        (",\"stop_reason\":\"error\"", AiTurnOutcome::Failed, AgentStatus::Failed, true),
         (",\"stop_reason\":\"aborted\"", AiTurnOutcome::Cancelled, AgentStatus::Idle, false),
-        (",\"stop_reason\":\"length\"", AiTurnOutcome::Incomplete, AgentStatus::Idle, true),
+        (",\"stop_reason\":\"length\"", AiTurnOutcome::Incomplete, AgentStatus::Failed, true),
         (",\"stop_reason\":\"toolUse\"", AiTurnOutcome::Succeeded, AgentStatus::Done, true),
         (",\"stop_reason\":\"future\"", AiTurnOutcome::Unknown, AgentStatus::Idle, true),
         (",\"stop_reason\":null", AiTurnOutcome::Unknown, AgentStatus::Idle, true),
@@ -363,7 +363,7 @@ fn claude_question_tool_failure_and_terminal_failure_have_distinct_effects() {
     );
     let failed = parse(json!({"hook_event_name":"StopFailure", "error":"rate_limit"}));
     activity.apply_hook(&failed);
-    assert_eq!(activity.status(), AgentStatus::Idle);
+    assert_eq!(activity.status(), AgentStatus::Failed);
     assert_eq!(failed.turn_outcome, AiTurnOutcome::Failed);
     let notification =
         crate::notify::Notification::from_ai_hook(&failed, failed.message.clone(), false).unwrap();

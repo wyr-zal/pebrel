@@ -3,7 +3,7 @@
 //! Hook events are facts; screen matches are observations with limited authority.
 //! Command ownership ends at the shell boundary, never because output goes quiet.
 
-use crate::ai_agents::{AgentStatus, AgentStatusSource, Detection};
+use crate::ai_agents::{AgentKind, AgentStatus, AgentStatusSource, Detection};
 
 use super::{AiHookEvent, AiHookKind};
 
@@ -298,11 +298,12 @@ impl AgentActivity {
                 self.screen_armed = false;
                 if matches!(
                     event.turn_outcome,
-                    super::AiTurnOutcome::Failed
-                        | super::AiTurnOutcome::Incomplete
-                        | super::AiTurnOutcome::Cancelled
-                ) || (matches!(event.source.as_str(), "pi" | "omp" | "cursor" | "copilot")
-                    && event.turn_outcome == super::AiTurnOutcome::Unknown)
+                    super::AiTurnOutcome::Failed | super::AiTurnOutcome::Incomplete
+                ) {
+                    AgentStatus::Failed
+                } else if event.turn_outcome == super::AiTurnOutcome::Cancelled
+                    || (matches!(event.source.as_str(), "pi" | "omp" | "cursor" | "copilot")
+                        && event.turn_outcome == super::AiTurnOutcome::Unknown)
                 {
                     AgentStatus::Idle
                 } else {
@@ -327,6 +328,12 @@ impl AgentActivity {
         };
         let next = match detection.status {
             AgentStatus::Idle => {
+                // Keep an explicit provider failure visible until a new turn
+                // starts; the error screen commonly remains above the prompt.
+                if self.status == AgentStatus::Failed {
+                    self.idle_samples = 0;
+                    return false;
+                }
                 if self.pending_submit {
                     self.idle_samples = 0;
                     return false;
@@ -341,7 +348,13 @@ impl AgentActivity {
                 if matches!(self.coverage, HookCoverage::Completion | HookCoverage::Turns) {
                     return false;
                 }
-                if self.turn_observed { AgentStatus::Done } else { AgentStatus::Idle }
+                // Codex returns to the same composer after success, provider
+                // failure and interruption. Without a hook, idle is not Done.
+                if self.turn_observed && detection.agent != AgentKind::Codex {
+                    AgentStatus::Done
+                } else {
+                    AgentStatus::Idle
+                }
             },
             status @ (AgentStatus::Working | AgentStatus::Blocked) => {
                 self.idle_samples = 0;
@@ -360,6 +373,18 @@ impl AgentActivity {
                 self.pending_submit = false;
                 self.turn_observed |= status == AgentStatus::Working;
                 status
+            },
+            AgentStatus::Failed => {
+                self.idle_samples = 0;
+                if detection.agent != AgentKind::Codex
+                    || !self.turn_observed
+                    || self.coverage != HookCoverage::None
+                    || !self.screen_armed
+                {
+                    return false;
+                }
+                self.pending_submit = false;
+                AgentStatus::Failed
             },
             AgentStatus::Unknown | AgentStatus::Done => {
                 self.idle_samples = 0;
@@ -387,6 +412,7 @@ pub(crate) fn screen_notification(
         AgentStatus::Done if matches!(previous, AgentStatus::Working | AgentStatus::Blocked) => {
             (!hooks).then_some(false)
         },
+        AgentStatus::Failed if previous != AgentStatus::Failed => Some(false),
         _ => None,
     }
 }

@@ -253,7 +253,7 @@ pub enum SidebarActivity {
     Completed,
     /// 上一条命令以非 0 退出（OSC 133;D）。与 [`Self::Failed`] 不是一件事：这条
     /// 说「最近那条命令失败了」，下一条命令起跑即清；`Failed` 说「这个 pane 本身
-    /// 坏了」（进程没了、SSH 连不上），不会自己好。
+    /// 表示 AI 回合或 pane 明确失败；会保留到下一回合开始，不会因空闲提示符清除。
     CommandFailed,
     /// 命令停在交互提示上等人打字（`[y/n]`、口令、Press ENTER）。
     ///

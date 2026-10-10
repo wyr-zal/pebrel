@@ -210,6 +210,140 @@ fn output_rule_source_does_not_turn_a_working_codex_into_attention(cx: &mut Test
 }
 
 #[gpui::test]
+fn codex_screen_retry_and_idle_do_not_emit_completion(cx: &mut TestAppContext) {
+    use crate::runtime_api::RuntimeTaskState;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let (view, window, _) = open(cx);
+    let notifications = Rc::new(RefCell::new(Vec::new()));
+    let observed = notifications.clone();
+    let _subscription = view.update(window, |_, cx| {
+        cx.subscribe(&view, move |_, _, event, _| {
+            if let TerminalViewEvent::Notification(notification) = event {
+                observed.borrow_mut().push(notification.clone());
+            }
+        })
+    });
+    let footer =
+        "› Ask Codex to do anything\ngpt-6-astra medium · Context 4% used\n? for shortcuts";
+    for (output, expected) in [
+        ("Completed answer.", AgentStatus::Idle),
+        ("■ stream disconnected before completion: failed to send request", AgentStatus::Failed),
+        ("■ Rate limit exceeded", AgentStatus::Failed),
+        ("■ Turn interrupted", AgentStatus::Idle),
+    ] {
+        notifications.borrow_mut().clear();
+        view.update(window, |view, cx| {
+            view.running_program = Some("codex".into());
+            screen(view, &format!("• Working (12s • esc to interrupt)\n{footer}"));
+            view.refresh_agent_screen_state(cx);
+            assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running);
+            for attempt in [1, 5] {
+                screen(view, &format!(
+                    "• Reconnecting… {attempt}/5 (5m 03s • esc to interrupt)\n  └ Rate limit exceeded.\n  └ Tip: Use /hooks to view and manage lifecycle hooks.\n{footer}"
+                ));
+                for _ in 0..4 {
+                    view.refresh_agent_screen_state(cx);
+                }
+                assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running);
+                assert_eq!(view.sidebar_activity(), SidebarActivity::Running);
+            }
+            screen(view, &format!("{output}\n{footer}"));
+            for _ in 0..4 {
+                view.refresh_agent_screen_state(cx);
+            }
+            assert_eq!(view.agent_activity.status(), expected, "{output}");
+            assert_eq!(view.agent_activity.source(), AgentStatusSource::Screen);
+            assert!(!view.agent_activity.hook_seen());
+            let expected_runtime = if expected == AgentStatus::Failed {
+                RuntimeTaskState::Failed
+            } else {
+                RuntimeTaskState::Idle
+            };
+            let expected_sidebar = if expected == AgentStatus::Failed {
+                SidebarActivity::Failed
+            } else {
+                SidebarActivity::Idle
+            };
+            assert_eq!(view.runtime_task_state(), expected_runtime);
+            assert_eq!(view.sidebar_activity(), expected_sidebar);
+        });
+        let notes = notifications.borrow();
+        if expected == AgentStatus::Failed {
+            assert_eq!(notes.len(), 1, "{output}: one failure notification");
+            assert!(matches!(
+                notes.first(),
+                Some(crate::notify::Notification::AiTurnIssue {
+                    outcome: crate::ai_hook::AiTurnOutcome::Failed,
+                    ..
+                })
+            ));
+        } else {
+            assert!(notes.is_empty(), "{output}: no unverified completion");
+        }
+    }
+}
+
+#[gpui::test]
+fn codex_hooks_still_complete_once_after_screen_only_idle(cx: &mut TestAppContext) {
+    use crate::runtime_api::RuntimeTaskState;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let (view, window, _) = open(cx);
+    let notifications = Rc::new(RefCell::new(Vec::new()));
+    let observed = notifications.clone();
+    let _subscription = view.update(window, |_, cx| {
+        cx.subscribe(&view, move |_, _, event, _| {
+            if let TerminalViewEvent::Notification(notification) = event {
+                observed.borrow_mut().push(notification.clone());
+            }
+        })
+    });
+    let native = |name: &str, turn: &str| {
+        let payload = serde_json::json!({
+            "hook_event_name": name, "session_id": "screen-hook-recovery", "turn_id": turn,
+        });
+        crate::ai_hook::parse_remote_envelope(
+            format!("nebula-hook/1 source=codex codex_hooks=full\n{payload}").as_bytes(),
+            Some(42),
+        )
+        .unwrap()
+    };
+    let done = native("Stop", "turn1");
+    view.update(window, |view, cx| {
+        view.running_program = Some("codex".into());
+        screen(view, "• Working (12s • esc to interrupt)");
+        view.refresh_agent_screen_state(cx);
+        screen(view, "› Ask Codex to do anything\ngpt-6-astra medium · Context 4% used");
+        for _ in 0..4 {
+            view.refresh_agent_screen_state(cx);
+        }
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Idle);
+        assert!(view.handle_ai_hook(&native("UserPromptSubmit", "turn1"), cx));
+        assert!(view.handle_ai_hook(&done, cx));
+        assert!(!view.agent_activity.accepts_hook(&done));
+        view.handle_ai_hook(&done, cx);
+        screen(view, "• Reconnecting… 1/5 (2s • esc to interrupt)");
+        view.refresh_agent_screen_state(cx);
+        assert_eq!(view.agent_activity.source(), AgentStatusSource::Hook);
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Finished);
+        assert_eq!(view.sidebar_activity(), SidebarActivity::Done);
+    });
+    assert_eq!(notifications.borrow().len(), 1);
+    view.update(window, |view, cx| {
+        assert!(view.handle_ai_hook(&native("UserPromptSubmit", "turn2"), cx));
+        assert!(!view.agent_activity.accepts_hook(&done));
+        view.handle_ai_hook(&done, cx);
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running);
+        assert!(view.handle_ai_hook(&native("Interrupt", "turn2"), cx));
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Idle);
+    });
+    assert_eq!(notifications.borrow().len(), 1, "interrupt must not notify completion");
+}
+
+#[gpui::test]
 fn ignored_idle_notification_does_not_reopen_the_hook_ordering_gate(cx: &mut TestAppContext) {
     let (view, window, _) = open(cx);
     view.update(window, |view, cx| {

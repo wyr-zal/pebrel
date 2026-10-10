@@ -216,11 +216,20 @@ impl TerminalView {
         if let Some(attention) =
             notifications::screen_notification(previous, next, self.agent_activity.hook_seen())
         {
-            cx.emit(TerminalViewEvent::Notification(crate::notify::Notification::AiTurn {
-                program: program.clone(),
-                message: None,
-                attention,
-            }));
+            let notification = if next == AgentStatus::Failed {
+                crate::notify::Notification::AiTurnIssue {
+                    program: program.clone(),
+                    message: None,
+                    outcome: crate::ai_hook::AiTurnOutcome::Failed,
+                }
+            } else {
+                crate::notify::Notification::AiTurn {
+                    program: program.clone(),
+                    message: None,
+                    attention,
+                }
+            };
+            cx.emit(TerminalViewEvent::Notification(notification));
         }
         log::debug!(
             "agent screen: pane={} {previous:?}->{next:?} rule={:?}",

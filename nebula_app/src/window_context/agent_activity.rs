@@ -197,11 +197,16 @@ impl WindowContext {
                 state.agent_activity.hook_seen(),
             ) && !self.display.window.has_focus()
             {
-                crate::notify::deliver(
-                    &self.display.window,
-                    &crate::notify::Notification::AiTurn { program, message: None, attention },
-                    Some(pane.id),
-                );
+                let notification = if state.agent_activity.status() == AgentStatus::Failed {
+                    crate::notify::Notification::AiTurnIssue {
+                        program: program.clone(),
+                        message: None,
+                        outcome: crate::ai_hook::AiTurnOutcome::Failed,
+                    }
+                } else {
+                    crate::notify::Notification::AiTurn { program, message: None, attention }
+                };
+                crate::notify::deliver(&self.display.window, &notification, Some(pane.id));
             }
         }
         self.sync_chrome_tabs();

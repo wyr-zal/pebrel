@@ -199,6 +199,7 @@ impl TerminalView {
         match self.agent_activity.status() {
             AgentStatus::Working => return RuntimeTaskState::Running,
             AgentStatus::Done => return RuntimeTaskState::Finished,
+            AgentStatus::Failed => return RuntimeTaskState::Failed,
             AgentStatus::Idle => return RuntimeTaskState::Idle,
             AgentStatus::Blocked => unreachable!("handled above"),
             AgentStatus::Unknown => {},

@@ -1098,6 +1098,9 @@ fn completed_run_cache_closes_the_waiter_registration_race() {
 
 #[test]
 fn settled_wait_excludes_only_running() {
+    assert!(wait_state_matches(RuntimeTaskState::Idle, RuntimeWaitState::Settled));
+    assert!(!wait_state_matches(RuntimeTaskState::Idle, RuntimeWaitState::Finished));
+    assert!(wait_state_matches(RuntimeTaskState::Finished, RuntimeWaitState::Finished));
     assert!(!wait_state_matches(RuntimeTaskState::Running, RuntimeWaitState::Settled));
     assert!(wait_state_matches(RuntimeTaskState::WaitingInput, RuntimeWaitState::Settled));
     assert!(wait_state_matches(RuntimeTaskState::Failed, RuntimeWaitState::Settled));

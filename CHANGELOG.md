@@ -4,6 +4,26 @@ Every release entry is provided in English and Simplified Chinese.
 
 每个版本条目均同时提供英文和简体中文说明。
 
+## 2.2.1 - 2026-10-10
+
+### English
+
+#### Fixed
+
+- Fixed: Codex reconnection retries stay marked as working. Without a valid Codex Hook, a screen-only idle prompt no longer marks a turn as finished or sends a completion notification.
+
+### 中文
+
+#### 修复
+
+- 修复：Codex 自动重连期间继续保持运行状态；未收到有效 Codex Hook 时，屏幕回到空闲提示符不再被当作回合完成，也不会发送完成通知。
+
+### Contributors
+
+| Contributor | Contributions |
+| --- | --- |
+| [wyr-zal](https://github.com/wyr-zal) | Codex reconnect and completion-state fix |
+
 ## 2.2.0 - 2026-10-08
 
 ### English
