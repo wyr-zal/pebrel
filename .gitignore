@@ -39,6 +39,8 @@ tocodex-docs/
 # this private tree and must never be allowlisted — tracked files bypass these
 # rules until `git rm --cached`.
 /docs/**
+# User-approved, sanitized Claude handoff record; keep every other docs path private.
+!/docs/claude-session-handoff-tracker-2026-10-10.md
 !/docs/AGENTS.md
 !/docs/lua-configuration.md
 !/docs/math-rendering-test.md
