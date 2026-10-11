@@ -274,6 +274,8 @@ mod tests {
             "notifications",
             "自动续跑",
             "auto continue",
+            "错误短语",
+            "error phrases",
         ] {
             for language in [crate::display::UiLanguage::ZhCn, crate::display::UiLanguage::EnUs] {
                 assert_eq!(matching_sections(query, language), vec![2], "{query}");

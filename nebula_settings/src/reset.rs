@@ -48,6 +48,7 @@ const RESET_KEYS: &[&str] = &[
     "ai_auto_continue",
     "ai_auto_continue_attempts",
     "ai_auto_continue_interval",
+    "ai_auto_continue_error_patterns",
     "notification_duration",
     "fetch",
     "auto_check_updates",

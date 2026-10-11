@@ -37,7 +37,10 @@ mod language;
 mod ligatures;
 pub use ligatures::Ligatures;
 mod notifications;
-pub use notifications::{AutoContinueAttempts, AutoContinueInterval, NotificationDuration};
+pub use notifications::{
+    AutoContinueAttempts, AutoContinueInterval, DEFAULT_AUTO_CONTINUE_ERROR_PATTERNS,
+    NotificationDuration,
+};
 mod quick_terminal;
 mod scrolling;
 pub use scrolling::{
@@ -1053,6 +1056,8 @@ pub struct RuntimeSettings {
     pub ai_auto_continue_attempts: AutoContinueAttempts,
     /// Minimum spacing between auto-continue sends (default 3 minutes).
     pub ai_auto_continue_interval: AutoContinueInterval,
+    /// Semicolon-separated screen error phrases shared by Claude and Codex.
+    pub ai_auto_continue_error_patterns: String,
     /// Display lifetime for in-app cards; default mode retains each kind's lifetime.
     pub notification_duration: NotificationDuration,
     /// 新会话欢迎屏 fastfetch（默认关：启动速度优先于观感，旧壳裁定）。
@@ -1262,6 +1267,11 @@ impl RuntimeSettings {
                 .value("ai_auto_continue_interval")
                 .and_then(AutoContinueInterval::from_settings)
                 .unwrap_or_default(),
+            ai_auto_continue_error_patterns: raw
+                .values
+                .get("ai_auto_continue_error_patterns")
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_AUTO_CONTINUE_ERROR_PATTERNS.to_owned()),
             notification_duration: raw
                 .value("notification_duration")
                 .and_then(NotificationDuration::from_settings)

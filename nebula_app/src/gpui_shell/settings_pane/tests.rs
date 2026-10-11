@@ -390,6 +390,81 @@ fn ai_auto_continue_setting_is_searchable_and_has_a_visible_switch(cx: &mut gpui
     });
 }
 
+#[cfg(feature = "gpui-test-support")]
+#[gpui::test]
+fn shared_auto_continue_error_phrases_are_searchable_editable_and_persisted(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::gpui_shell::settings_fixture::{SettingsBytesGuard, lock_theme_studio};
+
+    let _fixture_guard = lock_theme_studio();
+    let _guard = SettingsBytesGuard::capture();
+    nebula_settings::persist_keys(&[
+        ("ai_auto_continue", "1".into()),
+        (
+            "ai_auto_continue_error_patterns",
+            nebula_settings::DEFAULT_AUTO_CONTINUE_ERROR_PATTERNS.to_owned(),
+        ),
+    ])
+    .unwrap();
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        cx.set_global(crate::gpui_shell::config::Settings::load(ThemeName::Nord));
+    });
+    let mut pane_out = None;
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|cx| SettingsPane::new(window, cx));
+        pane_out = Some(view.clone());
+        gpui_component::Root::new(view, window, cx)
+    });
+    let pane = pane_out.unwrap();
+    cx.simulate_resize(gpui::size(px(1280.0), px(1200.0)));
+    cx.update(|window, cx| {
+        pane.update(cx, |pane, cx| {
+            pane.settings_search_input
+                .update(cx, |input, cx| input.replace_all("错误短语", window, cx));
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(pane.read_with(cx, |pane, _| pane.active_section), 2);
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let field = cx
+        .debug_bounds("settings-input-ai_auto_continue_error_patterns")
+        .expect("共享错误短语输入框已渲染");
+    assert!(field.size.width >= px(440.0));
+    assert!(field.origin.y >= px(0.0) && field.bottom() <= px(1200.0));
+    cx.simulate_click(field.center(), gpui::Modifiers::default());
+    cx.update(|window, cx| {
+        pane.update(cx, |pane, cx| {
+            pane.ai_auto_continue_error_patterns_input.update(cx, |input, cx| {
+                input.replace_all("CUSTOM PROBLEM;another failure", window, cx)
+            });
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let save = cx
+        .debug_bounds("nebula-btn-save-ai_auto_continue_error_patterns")
+        .expect("共享错误短语保存按钮已渲染");
+    cx.simulate_click(save.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    assert_eq!(
+        RuntimeSettings::load().ai_auto_continue_error_patterns,
+        "CUSTOM PROBLEM;another failure"
+    );
+    cx.update(|_, cx| {
+        assert_eq!(
+            cx.global::<crate::gpui_shell::config::Settings>().ai_auto_continue_error_patterns,
+            vec!["custom problem", "another failure"]
+        );
+    });
+}
+
 #[test]
 fn settings_nav_visibility_hides_providers_and_keeps_stable_routes() {
     let visibility: Vec<_> = (0..SECTION_IDS.len()).map(is_nav_section_visible).collect();
@@ -479,6 +554,22 @@ fn localized_select_labels_keep_stable_value_cardinality() {
             assert_eq!(localized_select_labels(key, values, *language).len(), values.len());
         }
     }
+    assert_eq!(
+        localized_select_labels(
+            "ai_auto_continue_interval",
+            nebula_settings::AutoContinueInterval::VALUES,
+            crate::display::UiLanguage::EnUs,
+        )[0],
+        SharedString::from("1 min")
+    );
+    assert_eq!(
+        localized_select_labels(
+            "ai_auto_continue_interval",
+            nebula_settings::AutoContinueInterval::VALUES,
+            crate::display::UiLanguage::ZhCn,
+        )[0],
+        SharedString::from("1 分钟")
+    );
     assert_eq!(
         localized_select_labels("tabs_position", cases[2].1, crate::display::UiLanguage::EnUs),
         vec![SharedString::from("Left sidebar"), SharedString::from("Top")]

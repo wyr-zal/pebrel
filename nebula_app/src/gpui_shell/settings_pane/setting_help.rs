@@ -95,6 +95,10 @@ pub(super) fn help(key: &str, language: UiLanguage) -> SettingHelp {
             language.text(crate::i18n::Message::SettingsNotificationsAutoContinueDescription),
             Some(language.text(crate::i18n::Message::SettingsNotificationsAutoContinueDetails)),
         ),
+        "ai_auto_continue_error_patterns" => (
+            language.text(crate::i18n::Message::SettingsNotificationsAutoContinuePatternsDescription),
+            Some(language.text(crate::i18n::Message::SettingsNotificationsAutoContinuePatternsDetails)),
+        ),
         "ai_auto_continue_attempts" => (
             language.pick("单轮失败后自动重发的最大次数。", "Maximum automatic resends after a failed turn."),
             Some(language.pick("达到上限仍失败就停下，等你手动处理。", "Once the limit is reached it stops and waits for you.")),
@@ -205,6 +209,7 @@ mod tests {
             "bell",
             "ai_toasts",
             "ai_auto_continue",
+            "ai_auto_continue_error_patterns",
             "ai_auto_continue_attempts",
             "ai_auto_continue_interval",
             "notification_duration",

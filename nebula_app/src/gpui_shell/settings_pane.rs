@@ -135,6 +135,7 @@ pub struct SettingsPane {
     /// 首页「项目与支持」→ 赞助商：独立页面，不是外链行。切换分区时清掉。
     about_sponsor_open: bool,
     settings_search_input: Entity<InputState>,
+    ai_auto_continue_error_patterns_input: Entity<InputState>,
     settings_search_focus: search_header::SearchFocus,
     search_origin_section: Option<usize>,
     /// 每项还带着自己的 `values` 表：`SelectState` 只认索引，而从代码侧
@@ -994,19 +995,25 @@ impl SettingsPane {
     fn input_row(
         &self,
         label: &'static str,
-        desc: &'static str,
+        desc: impl Into<SettingHelp>,
         key: &'static str,
         input: &Entity<InputState>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let state = input.clone();
+        let input_width = if key == "ai_auto_continue_error_patterns" { 440.0 } else { 280.0 };
         self.row(
             label,
             desc,
             h_flex()
                 .gap_2()
                 .items_center()
-                .child(div().w(px(280.0)).child(Input::new(input)))
+                .child(
+                    div()
+                        .debug_selector(move || format!("settings-input-{key}"))
+                        .w(px(input_width))
+                        .child(Input::new(input)),
+                )
                 .child(
                     NebulaButton::new(SharedString::from(format!("save-{key}")))
                         .label(crate::gpui_shell::config::ui_language(cx).pick("保存", "Save"))
@@ -1297,49 +1304,58 @@ impl SettingsPane {
                     ))
                 },
             );
-        let alerts = self
-            .group(language.pick("提醒", "Alerts"), cx)
-            .child(self.switch_row(
-                "ai_toasts",
-                language.text(crate::i18n::Message::SettingsNotificationsAiMessages),
-                help("ai_toasts", language),
-                self.runtime.ai_toasts,
-                cx,
-            ))
-            .child(self.switch_row(
-                "ai_auto_continue",
-                language.text(crate::i18n::Message::SettingsNotificationsAutoContinue),
-                help("ai_auto_continue", language),
-                self.runtime.ai_auto_continue,
-                cx,
-            ))
-            .when(self.runtime.ai_auto_continue, |group| {
-                group
-                    .child(self.select_row(
-                        "ai_auto_continue_attempts",
-                        language.pick("自动续跑次数", "Auto-continue attempts"),
-                        help("ai_auto_continue_attempts", language),
-                        cx,
-                    ))
-                    .child(self.select_row(
-                        "ai_auto_continue_interval",
-                        language.pick("自动续跑间隔", "Auto-continue interval"),
-                        help("ai_auto_continue_interval", language),
-                        cx,
-                    ))
-            })
-            .child(self.select_row(
-                "notification_duration",
-                language.text(crate::i18n::Message::SettingsNotificationsDuration),
-                help("notification_duration", language),
-                cx,
-            ))
-            .child(self.select_row(
-                "bell",
-                language.pick("终端铃声", "Terminal bell"),
-                help("bell", language),
-                cx,
-            ));
+        let alerts =
+            self.group(language.pick("提醒", "Alerts"), cx)
+                .child(self.switch_row(
+                    "ai_toasts",
+                    language.text(crate::i18n::Message::SettingsNotificationsAiMessages),
+                    help("ai_toasts", language),
+                    self.runtime.ai_toasts,
+                    cx,
+                ))
+                .child(self.switch_row(
+                    "ai_auto_continue",
+                    language.text(crate::i18n::Message::SettingsNotificationsAutoContinue),
+                    help("ai_auto_continue", language),
+                    self.runtime.ai_auto_continue,
+                    cx,
+                ))
+                .when(self.runtime.ai_auto_continue, |group| {
+                    group
+                        .child(self.select_row(
+                            "ai_auto_continue_attempts",
+                            language.pick("自动续跑次数", "Auto-continue attempts"),
+                            help("ai_auto_continue_attempts", language),
+                            cx,
+                        ))
+                        .child(self.select_row(
+                            "ai_auto_continue_interval",
+                            language.pick("自动续跑间隔", "Auto-continue interval"),
+                            help("ai_auto_continue_interval", language),
+                            cx,
+                        ))
+                        .child(self.input_row(
+                            language.text(
+                                crate::i18n::Message::SettingsNotificationsAutoContinuePatterns,
+                            ),
+                            help("ai_auto_continue_error_patterns", language),
+                            "ai_auto_continue_error_patterns",
+                            &self.ai_auto_continue_error_patterns_input,
+                            cx,
+                        ))
+                })
+                .child(self.select_row(
+                    "notification_duration",
+                    language.text(crate::i18n::Message::SettingsNotificationsDuration),
+                    help("notification_duration", language),
+                    cx,
+                ))
+                .child(self.select_row(
+                    "bell",
+                    language.pick("终端铃声", "Terminal bell"),
+                    help("bell", language),
+                    cx,
+                ));
         let completion = self
             .group(language.pick("补全", "Completion"), cx)
             .child(self.switch_row(

@@ -154,6 +154,21 @@ impl TerminalView {
         self.reconcile_shell_activity(cx);
         self.on_native_cmd_prompt(cx);
         self.probe_missing_codex_session(cx);
+        let retry_source = self
+            .running_program
+            .as_deref()
+            .filter(|program| matches!(*program, "claude" | "codex"))
+            .map(str::to_owned);
+        let retry_screen_enabled =
+            cx.try_global::<crate::gpui_shell::config::Settings>().is_some_and(|settings| {
+                settings.ai_auto_continue
+                    && retry_source.as_deref().is_some_and(|program| {
+                        self.ai_session.as_ref().is_some_and(|identity| {
+                            identity.source == program && !identity.session_id.is_empty()
+                        })
+                    })
+            });
+        let allows_screen = self.agent_activity.allows_screen();
         let Some(session) = &self.session else { return };
         let (prompt_restored, screen) = {
             let term = session.term.lock();
@@ -170,7 +185,7 @@ impl TerminalView {
                         &self.suggest.suggest_env,
                     )
                 });
-            let screen = self.agent_activity.allows_screen().then(|| {
+            let screen = (allows_screen || retry_screen_enabled).then(|| {
                 let start = Point::new(Line((lines - lines.min(24)) as i32), Column(0));
                 let end =
                     Point::new(Line(lines as i32 - 1), Column(term.columns().saturating_sub(1)));
@@ -192,6 +207,12 @@ impl TerminalView {
             return;
         }
         let Some(screen) = screen else { return };
+        if retry_screen_enabled && let Some(program) = retry_source.as_deref() {
+            self.schedule_auto_continue_screen_failure(program, &screen, cx);
+        }
+        if !allows_screen {
+            return;
+        }
         let detected = notifications::screen_identity_allowed(self.running_program.as_deref())
             .then(|| crate::ai_agents::identify(&screen))
             .flatten();

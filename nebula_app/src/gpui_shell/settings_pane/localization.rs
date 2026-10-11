@@ -65,6 +65,7 @@ pub(super) fn localized_select_labels(
             language.pick("30 次", "30 times"),
         ],
         "ai_auto_continue_interval" => vec![
+            language.pick("1 分钟", "1 min"),
             language.pick("3 分钟", "3 min"),
             language.pick("5 分钟", "5 min"),
             language.pick("10 分钟", "10 min"),

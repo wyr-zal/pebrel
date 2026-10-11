@@ -631,6 +631,101 @@ pub fn detect(program: &str, screen: &str) -> Option<Detection> {
     best.map(|(rule, _)| Detection { agent, status: rule.state.into(), rule_id: rule.id.clone() })
 }
 
+const MAX_AUTO_CONTINUE_ERROR_PATTERNS: usize = 16;
+const MAX_AUTO_CONTINUE_ERROR_PATTERN_CHARS: usize = 256;
+
+pub fn parse_auto_continue_error_patterns(raw: &str) -> Vec<String> {
+    raw.split(';')
+        .take(MAX_AUTO_CONTINUE_ERROR_PATTERNS)
+        .filter_map(|pattern| {
+            let normalized =
+                pattern.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+            (!normalized.is_empty()
+                && normalized.chars().count() <= MAX_AUTO_CONTINUE_ERROR_PATTERN_CHARS)
+                .then_some(normalized)
+        })
+        .collect()
+}
+
+/// Current input controls veto automatic input independently of rule priorities.
+pub fn auto_continue_screen_is_safe(program: &str, screen: &str) -> bool {
+    let Some(agent) = AgentKind::parse(program) else { return false };
+    if !matches!(agent, AgentKind::Claude | AgentKind::Codex)
+        || screen_context::has_live_input_controls(screen_context::attention_region(agent, screen))
+        || region(screen, "bottom_non_empty_lines(12)").to_lowercase().contains("esc to interrupt")
+    {
+        return false;
+    }
+    !detect(program, screen).is_some_and(|detection| {
+        matches!(detection.status, AgentStatus::Working | AgentStatus::Blocked)
+    })
+}
+
+/// Read a bounded error row even while input is unsafe; this is not permission to retry.
+pub fn auto_continue_error_text(
+    program: &str,
+    screen: &str,
+    patterns: &[String],
+) -> Option<String> {
+    let agent = AgentKind::parse(program)?;
+    if !matches!(agent, AgentKind::Claude | AgentKind::Codex) {
+        return None;
+    }
+    let mut fenced = false;
+    let mut evidence = None;
+    for row in region(screen, "bottom_non_empty_lines(12)").lines().map(str::trim) {
+        if row.starts_with("```") || row.starts_with("~~~") {
+            fenced = !fenced;
+            evidence = None;
+            continue;
+        }
+        if fenced || row.is_empty() {
+            continue;
+        }
+        // Term::bounds_to_string already joins VT soft wraps. Never join prose rows.
+        let normalized = row.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+        let error_marker = ["api error:", "error:", "fatal:", "[error]", "■ "]
+            .iter()
+            .any(|marker| normalized.starts_with(marker));
+        let custom_match = patterns.iter().take(MAX_AUTO_CONTINUE_ERROR_PATTERNS).any(|pattern| {
+            !pattern.is_empty()
+                && pattern.chars().count() <= MAX_AUTO_CONTINUE_ERROR_PATTERN_CHARS
+                && (error_marker || normalized.starts_with(pattern))
+                && normalized.contains(pattern)
+        });
+        let bundled = agent == AgentKind::Codex && {
+            let (rule, gate) = bundled_codex_failure_rule();
+            rule.state == RuleState::Failed && gate.matches(row)
+        };
+        if custom_match || bundled {
+            evidence = Some(normalized.chars().take(512).collect());
+        }
+    }
+    evidence
+}
+
+fn bundled_codex_failure_rule() -> &'static (Rule, CompiledGate) {
+    static RULE: OnceLock<(Rule, CompiledGate)> = OnceLock::new();
+    RULE.get_or_init(|| {
+        let source = BUNDLED
+            .iter()
+            .find(|(agent, _)| *agent == AgentKind::Codex)
+            .map(|(_, source)| *source)
+            .expect("Codex detection rules are bundled");
+        let compiled = compile_manifest(source, None)
+            .unwrap_or_else(|error| panic!("bundled Codex agent rules are invalid: {error}"));
+        let index = compiled
+            .manifest
+            .rules
+            .iter()
+            .position(|rule| rule.id == "request_failed")
+            .expect("Codex bundled failure rule is present");
+        let rule = compiled.manifest.rules.into_iter().nth(index).unwrap();
+        let gate = compiled.rules.into_iter().nth(index).unwrap();
+        (rule, gate)
+    })
+}
+
 /// Establish an agent identity from brand-specific terminal chrome.
 ///
 /// This is deliberately separate from [`detect`]: generic status chrome such
@@ -844,6 +939,104 @@ mod tests {
         assert_eq!(AgentKind::parse("cursor-agent"), Some(AgentKind::Cursor));
         assert_eq!(AgentKind::parse("grok-cli.cmd"), Some(AgentKind::Grok));
         assert_eq!(AgentKind::parse("cargo"), None);
+    }
+
+    fn auto_continue_error_matches(program: &str, screen: &str, patterns: &[String]) -> bool {
+        auto_continue_screen_is_safe(program, screen)
+            && auto_continue_error_text(program, screen, patterns).is_some()
+    }
+
+    #[test]
+    fn auto_continue_error_phrases_are_shared_and_screen_bounded() {
+        let patterns = parse_auto_continue_error_patterns(
+            nebula_settings::DEFAULT_AUTO_CONTINUE_ERROR_PATTERNS,
+        );
+        let codex = "■ We’re currently experiencing high demand, which may cause temporary errors.\n› Ask Codex to do anything\ngpt-6-astra medium · Context 0% used";
+        let claude = "API Error: stream error: stream disconnected before completion: stream closed before response.completed\n❯ \n? for shortcuts";
+        assert!(auto_continue_error_matches("codex", codex, &patterns));
+        assert!(auto_continue_error_matches("claude", claude, &patterns));
+        assert!(!auto_continue_error_matches("gemini", claude, &patterns));
+        let prose = "The guide mentions currently experiencing high demand, which may cause temporary errors.\n› Ask Codex to do anything\ngpt-6-astra medium · Context 0% used";
+        assert!(!auto_continue_error_matches("codex", prose, &patterns));
+
+        let working = format!("• Working (12s · esc to interrupt)\n{codex}");
+        assert!(!auto_continue_error_matches("codex", &working, &patterns));
+        let blocked = format!("{claude}\nAllow command?\nPress enter to confirm or esc to cancel");
+        assert!(!auto_continue_error_matches("claude", &blocked, &patterns));
+        let stale = format!("{codex}\n{}", "completed output\n".repeat(12));
+        assert!(!auto_continue_error_matches("codex", &stale, &patterns));
+    }
+
+    #[test]
+    fn auto_continue_defaults_reject_quoted_error_messages() {
+        let patterns = parse_auto_continue_error_patterns(
+            nebula_settings::DEFAULT_AUTO_CONTINUE_ERROR_PATTERNS,
+        );
+        let footer = "› Ask Codex to do anything\ngpt-6 medium · Context 2% used";
+        for body in [
+            "The log says “■ We’re currently experiencing high demand, which may cause temporary errors”.",
+            "Here is a sample:\n```text\n■ 503 Service Unavailable\n```",
+            "The message is `API Error: stream error: stream disconnected before completion`.",
+        ] {
+            for program in ["claude", "codex"] {
+                assert!(
+                    !auto_continue_error_matches(program, &format!("{body}\n{footer}"), &patterns),
+                    "{program}: {body}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn auto_continue_custom_phrases_match_substrings_in_error_rows() {
+        let patterns = parse_auto_continue_error_patterns("upstream timeout");
+        let footer = "› Ask Codex to do anything\ngpt-6 medium · Context 2% used";
+        assert!(auto_continue_error_matches(
+            "codex",
+            &format!("Error: upstream timeout\n{footer}"),
+            &patterns
+        ));
+        assert!(!auto_continue_error_matches(
+            "codex",
+            &format!("The log says ‘Error: upstream timeout’.\n{footer}"),
+            &patterns
+        ));
+    }
+
+    #[test]
+    fn auto_continue_live_permission_controls_override_failure_rules() {
+        let frame = "■ 503 Service Unavailable\nAllow command?\n› 1. Yes\n2. No\nPress enter to confirm or esc to cancel";
+        assert_eq!(detect("codex", frame).unwrap().status, AgentStatus::Failed);
+        assert!(!auto_continue_error_matches("codex", frame, &[]));
+    }
+
+    #[test]
+    fn auto_continue_pattern_parser_normalizes_and_bounds_user_values() {
+        let long = "x".repeat(MAX_AUTO_CONTINUE_ERROR_PATTERN_CHARS + 1);
+        let raw = format!("  STREAM   CLOSED ;{long};third;fourth");
+        let patterns = parse_auto_continue_error_patterns(&raw);
+        assert_eq!(patterns[0], "stream closed");
+        assert_eq!(patterns, vec!["stream closed", "third", "fourth"]);
+        let excessive = (0..MAX_AUTO_CONTINUE_ERROR_PATTERNS + 2)
+            .map(|index| format!("pattern{index}"))
+            .collect::<Vec<_>>()
+            .join(";");
+        assert_eq!(
+            parse_auto_continue_error_patterns(&excessive).len(),
+            MAX_AUTO_CONTINUE_ERROR_PATTERNS
+        );
+    }
+
+    #[test]
+    fn bundled_codex_failure_rule_remains_retry_evidence() {
+        let footer = "› Ask Codex to do anything\ngpt-6 medium · Context 2% used";
+        for error in [
+            "■ stream disconnected before completion: connection reset",
+            "■ Rate limit exceeded",
+            "■ 503 Service Unavailable",
+        ] {
+            assert!(auto_continue_error_matches("codex", &format!("{error}\n{footer}"), &[]));
+        }
     }
 
     #[test]

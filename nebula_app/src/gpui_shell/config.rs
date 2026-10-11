@@ -90,6 +90,7 @@ pub struct Settings {
     /// Resolved auto-continue retry bound and spacing, read by the pane timer.
     pub ai_auto_continue_attempts: u8,
     pub ai_auto_continue_interval: std::time::Duration,
+    pub ai_auto_continue_error_patterns: Vec<String>,
     /// Cached display lifetime; toast delivery and native notifications are independent.
     pub notification_duration: nebula_settings::NotificationDuration,
     /// 标签关闭按钮与标签插入动画都在渲染热路径读取，必须随全局设置驻留内存。
@@ -308,6 +309,9 @@ impl Settings {
             ai_auto_continue: runtime.ai_auto_continue,
             ai_auto_continue_attempts: runtime.ai_auto_continue_attempts.count(),
             ai_auto_continue_interval: runtime.ai_auto_continue_interval.interval(),
+            ai_auto_continue_error_patterns: crate::ai_agents::parse_auto_continue_error_patterns(
+                &runtime.ai_auto_continue_error_patterns,
+            ),
             notification_duration: runtime.notification_duration,
             tab_close_visible: runtime.tab_close_visible,
             tab_reveal: runtime.tab_reveal,
