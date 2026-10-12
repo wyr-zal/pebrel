@@ -111,9 +111,7 @@ pub fn try_open_window_existing(dir: Option<&std::path::Path>, shell: Option<&st
     if legacy_request("ATTACH").is_none() {
         return false;
     }
-    cli::request_once("window.create", handover_params(dir, shell), IO_TIMEOUT)
-        .map(|response| response.ok)
-        .unwrap_or(false)
+    request_handover("window.create", handover_params(dir, shell))
 }
 
 /// 交接请求的参数：目录与 shell 都可缺省。
@@ -136,36 +134,94 @@ fn try_open_tab_existing(dir: Option<&std::path::Path>, shell: Option<&str>) -> 
         return false;
     }
     // ATTACH 与 tab.new 落到同一事件队列，窗口先恢复，新标签随后创建。
-    cli::request_once("tab.new", handover_params(dir, shell), IO_TIMEOUT)
-        .map(|response| response.ok)
-        .unwrap_or(false)
+    request_handover("tab.new", handover_params(dir, shell))
+}
+
+fn request_handover(method: &str, params: serde_json::Value) -> bool {
+    let cwd = params.get("cwd").and_then(serde_json::Value::as_str).map(str::to_owned);
+    let shell_override = params.get("shell").is_some();
+    match cli::request_once(method, params, IO_TIMEOUT) {
+        Ok(response) if response.ok => {
+            crate::logging::startup_diagnostic(format!(
+                "event=handover_request method={method} result=accepted cwd={cwd:?} shell_override_present={shell_override}"
+            ));
+            true
+        },
+        Ok(response) => {
+            let error_code = response.error.as_ref().map_or("missing", |error| error.code.as_str());
+            crate::logging::startup_diagnostic(format!(
+                "event=handover_request method={method} result=rejected error_code={error_code} cwd={cwd:?} shell_override_present={shell_override}"
+            ));
+            false
+        },
+        Err(error) => {
+            crate::logging::startup_diagnostic(format!(
+                "event=handover_request method={method} result=transport_error error={error} cwd={cwd:?} shell_override_present={shell_override}"
+            ));
+            false
+        },
+    }
 }
 
 fn legacy_request(verb: &str) -> Option<()> {
     let local = CHILD_ENDPOINT.lock().unwrap_or_else(|error| error.into_inner()).clone();
-    if let Some(endpoint) = local {
-        return legacy_request_to(verb, &endpoint);
-    }
-    if std::env::var_os(ENDPOINT_ENV).is_some() {
-        return read_endpoint().and_then(|endpoint| legacy_request_to(verb, &endpoint));
-    }
-    read_endpoint()
-        .and_then(|endpoint| legacy_request_to(verb, &endpoint))
+    let (endpoint, source) = if local.is_some() {
+        (local, "inherited")
+    } else if std::env::var_os(ENDPOINT_ENV).is_some() {
+        (read_endpoint(), "environment")
+    } else if let Some(endpoint) = read_endpoint() {
+        (Some(endpoint), "runtime_port")
+    } else {
         // 已运行的 pre-v1 版本只发布 mux.port；升级期间仍允许普通启动交接。
-        .or_else(|| {
-            read_endpoint_from(legacy_port_file())
-                .and_then(|endpoint| legacy_request_to(verb, &endpoint))
-        })
+        (read_endpoint_from(legacy_port_file()), "legacy_port")
+    };
+    let Some(endpoint) = endpoint else {
+        crate::logging::startup_diagnostic(format!(
+            "event=handover_attach verb={verb} result=failed stage=endpoint source={source}"
+        ));
+        return None;
+    };
+    match legacy_request_result(verb, &endpoint) {
+        Ok(()) => {
+            crate::logging::startup_diagnostic(format!(
+                "event=handover_attach verb={verb} result=accepted source={source}"
+            ));
+            Some(())
+        },
+        Err(error) => {
+            crate::logging::startup_diagnostic(format!(
+                "event=handover_attach verb={verb} result=failed source={source} {error}"
+            ));
+            None
+        },
+    }
 }
 
 fn legacy_request_to(verb: &str, endpoint: &Endpoint) -> Option<()> {
-    let mut stream = TcpStream::connect_timeout(&endpoint_addr(endpoint), CONNECT_TIMEOUT).ok()?;
-    stream.set_read_timeout(Some(IO_TIMEOUT)).ok()?;
-    stream.set_write_timeout(Some(IO_TIMEOUT)).ok()?;
-    stream.write_all(format!("{verb} {}\n", endpoint.token).as_bytes()).ok()?;
+    legacy_request_result(verb, endpoint).ok()
+}
+
+fn legacy_request_result(verb: &str, endpoint: &Endpoint) -> Result<(), String> {
+    let mut stream = TcpStream::connect_timeout(&endpoint_addr(endpoint), CONNECT_TIMEOUT)
+        .map_err(|error| format!("stage=connect kind={:?}", error.kind()))?;
+    stream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .map_err(|error| format!("stage=read_timeout kind={:?}", error.kind()))?;
+    stream
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .map_err(|error| format!("stage=write_timeout kind={:?}", error.kind()))?;
+    stream
+        .write_all(format!("{verb} {}\n", endpoint.token).as_bytes())
+        .map_err(|error| format!("stage=write kind={:?}", error.kind()))?;
     let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).ok()?;
-    (line.trim() == "OK").then_some(())
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .map_err(|error| format!("stage=read_response kind={:?}", error.kind()))?;
+    if line.trim() == "OK" {
+        Ok(())
+    } else {
+        Err("stage=validate_response result=not_ok".to_owned())
+    }
 }
 
 /// Resident versioned runtime API server.
@@ -306,5 +362,26 @@ mod tests {
         drop(server);
         apply_child_endpoint(&mut env);
         assert!(!env.contains_key(ENDPOINT_ENV));
+    }
+
+    #[test]
+    fn rejected_legacy_handover_reply_does_not_log_response_contents() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap()).read_line(&mut request).unwrap();
+            assert!(request.starts_with("ATTACH "));
+            stream.write_all(b"DENIED private response\n").unwrap();
+        });
+        let endpoint =
+            Endpoint { port: address.port(), token: "0123456789abcdef0123456789abcdef".into() };
+
+        assert_eq!(
+            legacy_request_result("ATTACH", &endpoint),
+            Err("stage=validate_response result=not_ok".to_owned()),
+        );
+        server.join().unwrap();
     }
 }

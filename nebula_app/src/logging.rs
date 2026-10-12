@@ -62,6 +62,17 @@ pub(crate) fn debug_log(message: impl AsRef<str>) {
     }
 }
 
+/// Write sanitized startup events even when the ordinary log level is Warn.
+pub(crate) fn startup_diagnostic(message: impl AsRef<str>) {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let Ok(_guard) = LOCK.lock() else { return };
+    let path = env::temp_dir().join(format!("Pebrel-startup-{}.log", process::id()));
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let record = startup_diagnostic_record(process::id(), message.as_ref());
+        let _ = file.write_all(record.as_bytes());
+    }
+}
+
 /// User configurable extra log targets to include.
 fn extra_log_targets() -> &'static [String] {
     static EXTRA_LOG_TARGETS: OnceLock<Vec<String>> = OnceLock::new();
@@ -75,6 +86,7 @@ fn extra_log_targets() -> &'static [String] {
 
 /// List of targets which will be logged by Pebrel.
 const ALLOWED_TARGETS: &[&str] = &[
+    "pebrel",
     LOG_TARGET_IPC_CONFIG,
     LOG_TARGET_CONFIG,
     LOG_TARGET_WINIT,
@@ -307,5 +319,38 @@ impl Write for OnDemandLogFile {
 
     fn flush(&mut self) -> Result<(), io::Error> {
         self.file()?.flush()
+    }
+}
+
+fn startup_diagnostic_record(pid: u32, message: &str) -> String {
+    format!("[STARTUP pid={pid}] {message}\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn product_binary_log_target_is_allowed_by_default() {
+        let target = "pebrel";
+        assert!(ALLOWED_TARGETS.contains(&target), "missing product log target: {target}");
+        assert!(is_allowed_target(Level::Info, target));
+    }
+
+    #[test]
+    fn startup_diagnostic_record_is_marked_separately_from_filtered_logs() {
+        assert_eq!(
+            startup_diagnostic_record(42, "event=launch_begin"),
+            "[STARTUP pid=42] event=launch_begin\n",
+        );
+    }
+
+    #[test]
+    fn log_allowlist_preserves_legacy_targets_without_matching_prefixes() {
+        for target in ["nebula", "nebula_terminal", "nebula_config_derive"] {
+            assert!(ALLOWED_TARGETS.contains(&target));
+        }
+        assert!(!ALLOWED_TARGETS.contains(&"pebrel_unrelated"));
+        assert!(!ALLOWED_TARGETS.contains(&"nebula_unrelated"));
     }
 }

@@ -231,6 +231,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         let shell_id = terminal_options.shell_id();
         platform::startup::prepare_gui();
         let _log_file = logging::initialize(&options).expect("Unable to initialize logger");
+        let requested_dir = terminal_options.resolved_working_directory();
+        logging::startup_diagnostic(format!(
+            "event=launch_begin exe={:?} process_cwd={:?} explicit_cwd={:?} explicit_cwd_is_dir={} shell_override_present={} command_present={} argument_count={}",
+            env::current_exe().ok(),
+            env::current_dir().ok(),
+            requested_dir.as_deref(),
+            requested_dir.as_deref().is_some_and(std::path::Path::is_dir),
+            shell_id.is_some(),
+            terminal_options.command().is_some(),
+            env::args_os().len().saturating_sub(1),
+        ));
         // 显式点名的 shell 解析不了就别开窗：悄悄换回默认 shell 是这条路径最该
         // 避免的失败（用户点的是 Ubuntu，拿到的却是 PowerShell）。校验排在交接
         // 之前，坏 id 不会被丢给驻留实例。
@@ -550,20 +561,39 @@ fn wants_gpui_shell(options: &Options) -> bool {
 #[cfg(windows)]
 fn try_hand_over_to_resident(options: &Options) -> bool {
     if platform::elevation::requires_isolation() {
+        logging::startup_diagnostic("event=handover_decision result=standalone reason=elevated");
         return false;
     }
     let terminal_options = &options.window_options.terminal_options;
     // 这些入口从不交接；提前返回，避免为独立命令启动新增设置读取和目录检查。
     if options.daemon || terminal_options.command().is_some() {
+        logging::startup_diagnostic(format!(
+            "event=handover_decision result=standalone reason={} command_present={}",
+            if options.daemon { "daemon" } else { "shell_command" },
+            terminal_options.command().is_some(),
+        ));
         return false;
     }
     let shell_id = terminal_options.shell_id();
     let settings = nebula_settings::RuntimeSettings::load();
     let launch_dir = resident_launch_directory(terminal_options, &settings);
+    logging::startup_diagnostic(format!(
+        "event=handover_plan behavior={} cwd={:?} shell_override_present={}",
+        settings.windowing_behavior.settings_value(),
+        launch_dir,
+        shell_id.is_some(),
+    ));
     if settings.windowing_behavior == nebula_settings::WindowingBehaviorName::UseNew {
-        return runtime_api::try_open_window_existing(launch_dir.as_deref(), shell_id.as_deref());
+        let handed_over =
+            runtime_api::try_open_window_existing(launch_dir.as_deref(), shell_id.as_deref());
+        logging::startup_diagnostic(format!(
+            "event=handover_decision strategy=new_window result={}",
+            if handed_over { "accepted" } else { "standalone_fallback" },
+        ));
+        return handed_over;
     }
     if launch_dir.is_none() && runtime_api::try_open_default_tab_existing(shell_id.as_deref()) {
+        logging::startup_diagnostic("event=handover_decision strategy=default_tab result=accepted");
         return true;
     }
     // Explorer 右键「在 Nebula 中打开」带着 --working-directory 走到这里。
@@ -572,8 +602,12 @@ fn try_hand_over_to_resident(options: &Options) -> bool {
     if let Some(dir) = launch_dir
         && runtime_api::try_open_directory_existing(&dir, shell_id.as_deref())
     {
+        logging::startup_diagnostic(
+            "event=handover_decision strategy=directory_tab result=accepted",
+        );
         return true;
     }
+    logging::startup_diagnostic("event=handover_decision result=standalone_fallback");
     false
 }
 
