@@ -332,6 +332,7 @@ pub struct TerminalView {
     agent_activity: crate::ai_hook::lifecycle::AgentActivity,
     auto_continue: crate::ai_hook::auto_continue::AutoContinue,
     auto_continue_task: Option<gpui::Task<()>>,
+    screen_error_indicator: bool,
     _auto_continue_subscription: gpui::Subscription,
     /// 程序上报的任务进度（OSC 9;4）。存在 pane 上、由宿主投到任务栏：一个
     /// 窗口只有一个任务栏按钮，谁被看着只有宿主知道。

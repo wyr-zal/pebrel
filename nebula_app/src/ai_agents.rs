@@ -661,6 +661,36 @@ pub fn auto_continue_screen_is_safe(program: &str, screen: &str) -> bool {
     })
 }
 
+fn contains_unquoted(haystack: &str, needle: &str) -> bool {
+    let mut quote_end = None;
+    for (index, character) in haystack.char_indices() {
+        let previous = haystack[..index].chars().next_back();
+        let next = haystack[index + character.len_utf8()..].chars().next();
+        if let Some(end) = quote_end {
+            let apostrophe_inside_word = matches!(end, '\'' | '’')
+                && previous.is_some_and(char::is_alphanumeric)
+                && next.is_some_and(char::is_alphanumeric);
+            if character == end && !apostrophe_inside_word {
+                quote_end = None;
+            }
+            continue;
+        }
+        let closing = match character {
+            '"' | '`' => Some(character),
+            '\'' if previous.is_none_or(|previous| !previous.is_alphanumeric()) => Some('\''),
+            '“' => Some('”'),
+            '‘' => Some('’'),
+            _ => None,
+        };
+        if let Some(end) = closing {
+            quote_end = Some(end);
+        } else if haystack[index..].starts_with(needle) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Read a bounded error row even while input is unsafe; this is not permission to retry.
 pub fn auto_continue_error_text(
     program: &str,
@@ -691,7 +721,7 @@ pub fn auto_continue_error_text(
             !pattern.is_empty()
                 && pattern.chars().count() <= MAX_AUTO_CONTINUE_ERROR_PATTERN_CHARS
                 && (error_marker || normalized.starts_with(pattern))
-                && normalized.contains(pattern)
+                && contains_unquoted(&normalized, pattern)
         });
         let bundled = agent == AgentKind::Codex && {
             let (rule, gate) = bundled_codex_failure_rule();
@@ -975,6 +1005,7 @@ mod tests {
         let footer = "› Ask Codex to do anything\ngpt-6 medium · Context 2% used";
         for body in [
             "The log says “■ We’re currently experiencing high demand, which may cause temporary errors”.",
+            "API Error: copied text “API Error: stream error: stream disconnected before completion”",
             "Here is a sample:\n```text\n■ 503 Service Unavailable\n```",
             "The message is `API Error: stream error: stream disconnected before completion`.",
         ] {
@@ -999,6 +1030,22 @@ mod tests {
         assert!(!auto_continue_error_matches(
             "codex",
             &format!("The log says ‘Error: upstream timeout’.\n{footer}"),
+            &patterns
+        ));
+        assert!(auto_continue_error_matches(
+            "codex",
+            &format!("■ We're experiencing upstream timeout\n{footer}"),
+            &parse_auto_continue_error_patterns("upstream timeout")
+        ));
+        let patterns = parse_auto_continue_error_patterns("upstream timeout");
+        assert!(!auto_continue_error_matches(
+            "codex",
+            &format!("Error: copied text 'we're experiencing upstream timeout'\n{footer}"),
+            &patterns
+        ));
+        assert!(!auto_continue_error_matches(
+            "codex",
+            &format!("Error: copied text ‘we’re experiencing upstream timeout’\n{footer}"),
             &patterns
         ));
     }

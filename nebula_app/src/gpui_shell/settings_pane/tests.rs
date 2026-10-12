@@ -392,7 +392,7 @@ fn ai_auto_continue_setting_is_searchable_and_has_a_visible_switch(cx: &mut gpui
 
 #[cfg(feature = "gpui-test-support")]
 #[gpui::test]
-fn shared_auto_continue_error_phrases_are_searchable_editable_and_persisted(
+fn shared_auto_continue_error_phrase_manager_saves_entries_and_cancel_discards(
     cx: &mut gpui::TestAppContext,
 ) {
     use crate::gpui_shell::settings_fixture::{SettingsBytesGuard, lock_theme_studio};
@@ -401,10 +401,7 @@ fn shared_auto_continue_error_phrases_are_searchable_editable_and_persisted(
     let _guard = SettingsBytesGuard::capture();
     nebula_settings::persist_keys(&[
         ("ai_auto_continue", "1".into()),
-        (
-            "ai_auto_continue_error_patterns",
-            nebula_settings::DEFAULT_AUTO_CONTINUE_ERROR_PATTERNS.to_owned(),
-        ),
+        ("ai_auto_continue_error_patterns", "FIRST;SECOND".into()),
     ])
     .unwrap();
     cx.update(|cx| {
@@ -430,39 +427,203 @@ fn shared_auto_continue_error_phrases_are_searchable_editable_and_persisted(
     cx.update(|window, cx| {
         let _ = window.draw(cx);
     });
-    let field = cx
-        .debug_bounds("settings-input-ai_auto_continue_error_patterns")
-        .expect("共享错误短语输入框已渲染");
-    assert!(field.size.width >= px(440.0));
-    assert!(field.origin.y >= px(0.0) && field.bottom() <= px(1200.0));
-    cx.simulate_click(field.center(), gpui::Modifiers::default());
-    cx.update(|window, cx| {
-        pane.update(cx, |pane, cx| {
-            pane.ai_auto_continue_error_patterns_input.update(cx, |input, cx| {
-                input.replace_all("CUSTOM PROBLEM;another failure", window, cx)
-            });
-        });
-    });
+    let manage = cx
+        .debug_bounds("nebula-btn-manage-ai-auto-continue-error-patterns")
+        .expect("错误短语管理按钮已渲染");
+    cx.simulate_click(manage.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     cx.update(|window, cx| {
         let _ = window.draw(cx);
     });
+    assert!(cx.debug_bounds("auto-continue-patterns-dialog").is_some());
+    assert!(cx.debug_bounds("auto-continue-pattern-input-0").is_some());
+
+    let first = pane.read_with(cx, |pane, _| {
+        pane.auto_continue_patterns_editor.as_ref().unwrap().rows[0].clone()
+    });
+    cx.update(|window, cx| {
+        first.update(cx, |input, cx| input.replace_all("CUSTOM PROBLEM", window, cx));
+    });
+    let add = cx
+        .debug_bounds("add-auto-continue-pattern")
+        .expect("添加短语按钮已渲染");
+    cx.simulate_click(add.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let added = pane.read_with(cx, |pane, _| {
+        pane.auto_continue_patterns_editor.as_ref().unwrap().rows[2].clone()
+    });
+    cx.update(|window, cx| {
+        added.update(cx, |input, cx| input.replace_all("another failure", window, cx));
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let remove = cx
+        .debug_bounds("auto-continue-pattern-remove-1")
+        .expect("单条删除按钮已渲染");
+    let input = cx
+        .debug_bounds("auto-continue-pattern-input-1")
+        .expect("第二条短语输入框已渲染");
+    let dialog = cx
+        .debug_bounds("auto-continue-patterns-dialog")
+        .expect("短语弹窗已渲染");
+    let save_area = cx
+        .debug_bounds("save-auto-continue-patterns")
+        .expect("短语保存按钮已渲染");
+    assert!(
+        !input.contains(&remove.center()),
+        "remove button {remove:?} overlaps input {input:?} in dialog {dialog:?}"
+    );
+    assert!(
+        !save_area.contains(&remove.center()),
+        "remove button {remove:?} overlaps save button {save_area:?}"
+    );
+    cx.simulate_mouse_move(
+        remove.center(),
+        None::<gpui::MouseButton>,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    cx.simulate_click(remove.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        pane.read_with(cx, |pane, _| pane.auto_continue_patterns_editor.as_ref().unwrap().rows.len()),
+        2,
+        "remove action must delete exactly one entry; button={remove:?}, input={input:?}, dialog={dialog:?}",
+    );
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
     let save = cx
-        .debug_bounds("nebula-btn-save-ai_auto_continue_error_patterns")
-        .expect("共享错误短语保存按钮已渲染");
+        .debug_bounds("save-auto-continue-patterns")
+        .expect("短语保存按钮已渲染");
     cx.simulate_click(save.center(), gpui::Modifiers::default());
     cx.run_until_parked();
 
-    assert_eq!(
-        RuntimeSettings::load().ai_auto_continue_error_patterns,
-        "CUSTOM PROBLEM;another failure"
-    );
+    assert_eq!(RuntimeSettings::load().ai_auto_continue_error_patterns, "CUSTOM PROBLEM;another failure");
     cx.update(|_, cx| {
         assert_eq!(
             cx.global::<crate::gpui_shell::config::Settings>().ai_auto_continue_error_patterns,
             vec!["custom problem", "another failure"]
         );
     });
+
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let manage = cx
+        .debug_bounds("nebula-btn-manage-ai-auto-continue-error-patterns")
+        .expect("错误短语管理按钮仍可用");
+    cx.simulate_click(manage.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let first = pane.read_with(cx, |pane, _| {
+        pane.auto_continue_patterns_editor.as_ref().unwrap().rows[0].clone()
+    });
+    cx.update(|window, cx| {
+        first.update(cx, |input, cx| input.replace_all("UNSAVED", window, cx));
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let cancel = cx
+        .debug_bounds("cancel-auto-continue-patterns")
+        .expect("短语取消按钮已渲染");
+    cx.simulate_click(cancel.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(RuntimeSettings::load().ai_auto_continue_error_patterns, "CUSTOM PROBLEM;another failure");
+
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let manage = cx
+        .debug_bounds("nebula-btn-manage-ai-auto-continue-error-patterns")
+        .expect("短语管理按钮仍可用");
+    cx.simulate_click(manage.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    for _ in 0..2 {
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let remove = cx
+            .debug_bounds("auto-continue-pattern-remove-0")
+            .expect("首条短语删除按钮已渲染");
+        cx.simulate_mouse_move(
+            remove.center(),
+            None::<gpui::MouseButton>,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        cx.simulate_click(remove.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    assert!(cx.debug_bounds("auto-continue-patterns-empty").is_some());
+    let save = cx
+        .debug_bounds("save-auto-continue-patterns")
+        .expect("空列表保存按钮已渲染");
+    cx.simulate_click(save.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(RuntimeSettings::load().ai_auto_continue_error_patterns, "");
+    cx.update(|_, cx| {
+        assert!(cx.global::<crate::gpui_shell::config::Settings>().ai_auto_continue_error_patterns.is_empty());
+    });
+}
+
+#[cfg(feature = "gpui-test-support")]
+#[gpui::test]
+fn shared_auto_continue_error_phrase_manager_rejects_delimiters_without_saving(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::gpui_shell::settings_fixture::{SettingsBytesGuard, lock_theme_studio};
+
+    let _fixture_guard = lock_theme_studio();
+    let _guard = SettingsBytesGuard::capture();
+    nebula_settings::persist_keys(&[
+        ("ai_auto_continue", "1".into()),
+        ("ai_auto_continue_error_patterns", "ORIGINAL".into()),
+    ])
+    .unwrap();
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        cx.set_global(crate::gpui_shell::config::Settings::load(ThemeName::Nord));
+    });
+    let mut pane_out = None;
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|cx| SettingsPane::new(window, cx));
+        pane_out = Some(view.clone());
+        gpui_component::Root::new(view, window, cx)
+    });
+    let pane = pane_out.unwrap();
+    pane.update(cx, |pane, _| pane.active_section = 2);
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let manage = cx
+        .debug_bounds("nebula-btn-manage-ai-auto-continue-error-patterns")
+        .expect("错误短语管理按钮已渲染");
+    cx.simulate_click(manage.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let first = pane.read_with(cx, |pane, _| {
+        pane.auto_continue_patterns_editor.as_ref().unwrap().rows[0].clone()
+    });
+    cx.update(|window, cx| {
+        first.update(cx, |input, cx| input.replace_all("BAD;ENTRY", window, cx));
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let save = cx
+        .debug_bounds("save-auto-continue-patterns")
+        .expect("短语保存按钮已渲染");
+    cx.simulate_click(save.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    assert!(cx.debug_bounds("auto-continue-patterns-error").is_some());
+    assert_eq!(RuntimeSettings::load().ai_auto_continue_error_patterns, "ORIGINAL");
 }
 
 #[test]

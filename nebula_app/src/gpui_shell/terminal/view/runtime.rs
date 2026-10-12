@@ -63,6 +63,7 @@ impl TerminalView {
             if identity != self.running_program {
                 self.running_program = identity;
                 self.ai_session = None;
+                self.set_screen_error_indicator(false, cx);
                 cx.emit(TerminalViewEvent::TitleChanged);
             }
             let agent = self
@@ -861,6 +862,7 @@ impl TerminalView {
                         return;
                     }
                     if previous != view.recovery.target {
+                        view.set_screen_error_indicator(false, cx);
                         cx.emit(TerminalViewEvent::SessionIdentityChanged);
                     }
                     view.ai_session = Some(crate::display::AiSessionIdentity {

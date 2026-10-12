@@ -2,7 +2,7 @@ use super::startup_tests::{feed, open};
 use super::*;
 use crate::ai_agents::{AgentStatus, AgentStatusSource};
 use crate::ai_hook::AiHookEvent;
-use gpui::TestAppContext;
+use gpui::{BorrowAppContext as _, TestAppContext};
 
 fn hook(session: &str, name: &str, sequence: u64) -> AiHookEvent {
     let payload = serde_json::json!({
@@ -283,6 +283,45 @@ fn codex_screen_retry_and_idle_do_not_emit_completion(cx: &mut TestAppContext) {
             assert!(notes.is_empty(), "{output}: no unverified completion");
         }
     }
+}
+
+#[gpui::test]
+fn configured_screen_error_badge_preserves_hook_owned_activity(cx: &mut TestAppContext) {
+    let (view, window, _) = open(cx);
+    window.update(|_, cx| {
+        cx.update_global::<crate::gpui_shell::config::Settings, _>(|settings, _| {
+            settings.ai_auto_continue = false;
+            settings.ai_auto_continue_error_patterns =
+                crate::ai_agents::parse_auto_continue_error_patterns(
+                    nebula_settings::DEFAULT_AUTO_CONTINUE_ERROR_PATTERNS,
+                );
+        })
+    });
+    let codex_prompt = crate::ai_hook::parse_remote_envelope(
+        br#"nebula-hook/1 source=codex codex_hooks=full pane=42
+{"hook_event_name":"UserPromptSubmit","session_id":"badge-session","turn_id":"badge-turn"}"#,
+        Some(42),
+    )
+    .unwrap();
+    view.update(window, |view, cx| {
+        assert!(view.handle_ai_hook(&codex_prompt, cx));
+        let hook_status = view.agent_activity.status();
+        screen(
+            view,
+            "■ We’re currently experiencing high demand, which may cause temporary errors.\n› Ask Codex to do anything",
+        );
+        view.refresh_agent_screen_state(cx);
+        assert!(view.screen_error_indicator());
+        assert_eq!(view.agent_activity.status(), hook_status);
+        assert_eq!(view.agent_activity.status(), AgentStatus::Working);
+        assert_eq!(view.agent_activity.source(), AgentStatusSource::Hook);
+
+        screen(view, "Working on the request...\n› Ask Codex to do anything");
+        view.refresh_agent_screen_state(cx);
+        assert!(!view.screen_error_indicator());
+        assert_eq!(view.agent_activity.status(), AgentStatus::Working);
+        assert_eq!(view.agent_activity.source(), AgentStatusSource::Hook);
+    });
 }
 
 #[gpui::test]

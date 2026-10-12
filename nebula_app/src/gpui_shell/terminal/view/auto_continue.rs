@@ -54,6 +54,7 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         let settings = cx.try_global::<Settings>();
+        let enabled = settings.is_some_and(|settings| settings.ai_auto_continue);
         let max_attempts = settings
             .map(|settings| settings.ai_auto_continue_attempts)
             .unwrap_or_else(|| nebula_settings::AutoContinueAttempts::default().count());
@@ -68,24 +69,31 @@ impl TerminalView {
         let failure = settings
             .and_then(|settings| self.auto_continue_screen_error(program, screen, settings));
         let eligible = self.auto_continue_screen_can_retry(program, screen);
-        let delay = self.auto_continue.observe_screen_failure(
+        let observation = self.auto_continue.observe_screen_failure_diagnostic(
             program,
             session_id.as_deref(),
             failure.as_deref(),
             eligible,
+            enabled,
             Instant::now(),
             max_attempts,
             interval,
         );
-        if !cx.try_global::<Settings>().is_some_and(|settings| settings.ai_auto_continue) {
+        if observation.should_log {
+            log::debug!("auto_continue: screen_retry reason={}", observation.reason.code());
+        }
+        if !enabled {
             self.cancel_auto_continue();
             return;
         }
         if self.auto_continue.pending().is_none() {
             self.auto_continue_task = None;
         }
-        let Some(delay) = delay else { return };
-        let Some(session_id) = session_id else { return };
+        let Some(delay) = observation.delay else { return };
+        let Some(session_id) = session_id else {
+            log::debug!("auto_continue: screen_retry reason=missing_session");
+            return;
+        };
         self.schedule_auto_continue_send(program.to_owned(), session_id, delay, cx);
     }
 
@@ -101,47 +109,90 @@ impl TerminalView {
         self.auto_continue_task = Some(cx.spawn(async move |this, cx| {
             executor.timer(delay).await;
             let _ = this.update(cx, |view, cx| {
-                let Some(settings) = cx.try_global::<Settings>() else { return };
+                let Some(settings) = cx.try_global::<Settings>() else {
+                    log::debug!("auto_continue: send_cancelled reason=settings_unavailable");
+                    return;
+                };
+                let pending_screen_failure =
+                    view.auto_continue.pending_screen_failure().map(str::to_owned);
                 let Some(evidence) =
                     view.auto_continue.take_pending(settings.ai_auto_continue_attempts)
                 else {
+                    log::debug!("auto_continue: send_cancelled reason=pending_missing_or_limit");
                     return;
                 };
-                if !settings.ai_auto_continue
-                    || view.prompt_input_epoch != input_epoch
-                    || view.exited.is_some()
-                    || view.error.is_some()
-                    || view.marked_text.is_some()
-                    || view.pending_runtime_submit.is_some()
-                    || view.running_program.as_deref() != Some(program.as_str())
-                    || !view.ai_session.as_ref().is_some_and(|identity| {
-                        identity.source == program && identity.session_id == session_id
-                    })
-                {
+                let identity_changed = !view.ai_session.as_ref().is_some_and(|identity| {
+                    identity.source == program && identity.session_id == session_id
+                });
+                let guard_reason = if !settings.ai_auto_continue {
+                    Some("disabled")
+                } else if view.prompt_input_epoch != input_epoch {
+                    Some("input_changed")
+                } else if view.exited.is_some() {
+                    Some("pane_exited")
+                } else if view.error.is_some() {
+                    Some("pane_error")
+                } else if view.marked_text.is_some() {
+                    Some("marked_text")
+                } else if view.pending_runtime_submit.is_some() {
+                    Some("runtime_submit_pending")
+                } else if view.running_program.as_deref() != Some(program.as_str()) {
+                    Some("program_changed")
+                } else if identity_changed {
+                    Some("session_changed")
+                } else {
+                    None
+                };
+                if let Some(reason) = guard_reason {
+                    log::debug!("auto_continue: send_cancelled reason={reason}");
                     return;
                 }
                 let status = view.agent_activity.status();
-                let Some(screen) = view.auto_continue_screen_snapshot() else { return };
-                match evidence {
+                let Some(screen) = view.auto_continue_screen_snapshot() else {
+                    log::debug!("auto_continue: send_cancelled reason=screen_unavailable");
+                    return;
+                };
+                let current_screen_failure =
+                    view.auto_continue_screen_error(&program, &screen, settings);
+                let evidence_reason = match evidence {
                     RetryEvidence::HookFailure
-                        if !matches!(status, AgentStatus::Idle | AgentStatus::Failed)
-                            || !view.last_command_failed
-                            || !crate::ai_agents::auto_continue_screen_is_safe(
-                                &program, &screen,
-                            ) =>
+                        if !matches!(status, AgentStatus::Idle | AgentStatus::Failed) =>
                     {
-                        return;
+                        Some("hook_status_changed")
+                    },
+                    RetryEvidence::HookFailure if !view.last_command_failed => {
+                        Some("hook_failure_cleared")
+                    },
+                    RetryEvidence::HookFailure
+                        if !crate::ai_agents::auto_continue_screen_is_safe(&program, &screen) =>
+                    {
+                        Some("screen_unsafe")
                     },
                     RetryEvidence::ScreenFailure
-                        if matches!(status, AgentStatus::Blocked | AgentStatus::Unknown)
-                            || !view.auto_continue_screen_can_retry(&program, &screen)
-                            || view
-                                .auto_continue_screen_error(&program, &screen, settings)
-                                .is_none() =>
+                        if matches!(status, AgentStatus::Blocked | AgentStatus::Unknown) =>
                     {
-                        return;
+                        Some("blocked_or_unknown")
                     },
-                    _ => {},
+                    RetryEvidence::ScreenFailure
+                        if !view.auto_continue_screen_can_retry(&program, &screen) =>
+                    {
+                        Some("screen_not_retryable")
+                    },
+                    RetryEvidence::ScreenFailure if current_screen_failure.is_none() => {
+                        Some("error_disappeared")
+                    },
+                    RetryEvidence::ScreenFailure
+                        if pending_screen_failure.as_deref().is_some_and(|failure| {
+                            current_screen_failure.as_deref() != Some(failure)
+                        }) =>
+                    {
+                        Some("error_changed")
+                    },
+                    _ => None,
+                };
+                if let Some(reason) = evidence_reason {
+                    log::debug!("auto_continue: send_cancelled reason={reason}");
+                    return;
                 }
                 let bytes = if program == "codex" {
                     crate::input::terminal_input::build_runtime_codex_submission(
@@ -154,16 +205,22 @@ impl TerminalView {
                         crate::runtime_api::RuntimeKeyModifiers::default(),
                         1,
                     ) else {
+                        log::debug!("auto_continue: send_cancelled reason=enter_encoding_failed");
                         return;
                     };
                     let mut bytes = b"continue".to_vec();
                     bytes.extend(enter);
                     bytes
                 };
-                let Some(session) = &view.session else { return };
+                let Some(session) = &view.session else {
+                    log::debug!("auto_continue: send_cancelled reason=pty_unavailable");
+                    return;
+                };
                 if session.notifier.0.send(Msg::Input(bytes.into())).is_err() {
+                    log::debug!("auto_continue: send_failed reason=pty_channel_closed");
                     return;
                 }
+                log::debug!("auto_continue: send_result=accepted");
                 view.auto_continue.sent(Instant::now());
                 view.agent_activity.submitted();
                 view.last_command_failed = false;
@@ -195,9 +252,6 @@ impl TerminalView {
     fn auto_continue_screen_can_retry(&self, program: &str, screen: &str) -> bool {
         let status = self.agent_activity.status();
         if matches!(status, AgentStatus::Blocked | AgentStatus::Unknown) {
-            return false;
-        }
-        if status == AgentStatus::Working && crate::ai_agents::detect(program, screen).is_none() {
             return false;
         }
         crate::ai_agents::auto_continue_screen_is_safe(program, screen)

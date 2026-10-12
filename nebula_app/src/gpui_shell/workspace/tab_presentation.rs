@@ -33,6 +33,7 @@ pub(super) struct TabPresentation {
     pub(super) tooltip: Option<SharedString>,
     pub(super) is_settings: bool,
     pub(super) activity: SidebarActivity,
+    pub(super) screen_error_label: Option<SharedString>,
     pub(super) logo_image: Option<Arc<RenderImage>>,
     pub(super) logo_pending: bool,
     pub(super) program_glyph: Option<&'static str>,
@@ -86,7 +87,7 @@ impl NebulaWorkspace {
             WorkspaceTab::Terminal { panes, .. } => panes.len(),
             _ => 0,
         };
-        let (program, activity) = self.tabs[ix]
+        let (program, activity, screen_error) = self.tabs[ix]
             .focused_view()
             .map(|entity| {
                 let view = entity.read(cx);
@@ -95,9 +96,9 @@ impl NebulaWorkspace {
                     .clone()
                     .or_else(|| view.ai_session.as_ref().map(|identity| identity.source.clone()))
                     .or_else(|| view.ssh_destination.as_ref().map(|_| "ssh".to_owned()));
-                (program, view.sidebar_activity())
+                (program, view.sidebar_activity(), view.screen_error_indicator())
             })
-            .unwrap_or((None, SidebarActivity::Idle));
+            .unwrap_or((None, SidebarActivity::Idle, false));
         // 事件 vs 状态的唯一裁定处（侧栏与顶栏共用这份 presentation），规则与
         // 理由见 [`sidebar::resting_activity`]。
         let activity = sidebar::resting_activity(activity, active, self.meta(ix).has_bell);
@@ -133,13 +134,25 @@ impl NebulaWorkspace {
             .as_ref()
             .filter(|rename| rename.ix == ix)
             .map(|rename| rename.input.clone());
-        let tooltip =
-            self.tabs[ix].focused_view().map(|view| view.read(cx).tab_tooltip(&title).into());
+        let screen_error_label: Option<SharedString> = screen_error.then(|| {
+            crate::gpui_shell::config::ui_language(cx)
+                .text(crate::i18n::Message::SettingsNotificationsScreenErrorBadge)
+                .into()
+        });
+        let tooltip = self.tabs[ix]
+            .focused_view()
+            .map(|view| view.read(cx).tab_tooltip(&title).into());
+        let tooltip = match (tooltip, screen_error_label.as_ref()) {
+            (Some(tooltip), Some(label)) => Some(format!("{tooltip}\n{label}").into()),
+            (None, Some(label)) => Some(label.clone()),
+            (tooltip, None) => tooltip,
+        };
         TabPresentation {
             title,
             tooltip,
             is_settings,
             activity,
+            screen_error_label,
             logo_image,
             logo_pending,
             program_glyph,
@@ -157,6 +170,29 @@ pub(super) fn tooltip(text: SharedString, window: &mut Window, cx: &mut App) -> 
         div().max_w(px(560.0)).whitespace_normal().child(text.clone())
     })
     .build(window, cx)
+}
+
+pub(super) fn screen_error_badge(
+    selector: SharedString,
+    label: SharedString,
+    cx: &App,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(selector.clone())
+        .debug_selector(move || selector.to_string())
+        .role(gpui::accesskit::Role::Image)
+        .aria_label(label.clone())
+        .flex_shrink_0()
+        .size(px(TAB_LABEL_ICON_SIZE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            Icon::new(IconName::TriangleAlert)
+                .size(px(TAB_LABEL_ICON_SIZE * 0.82))
+                .text_color(cx.theme().danger),
+        )
+        .tooltip(move |window, cx| tooltip(label.clone(), window, cx))
 }
 
 pub(super) fn administrator_badge(selector: SharedString, cx: &App) -> gpui::Stateful<gpui::Div> {
@@ -203,6 +239,11 @@ mod tests {
                         .flex_shrink_0()
                         .child(Icon::new(IconName::SquareTerminal).size(px(TAB_LABEL_ICON_SIZE))),
                 )
+                .child(screen_error_badge(
+                    "test-screen-error".into(),
+                    "Screen text matches a configured error phrase".into(),
+                    cx,
+                ))
                 .child(div().debug_selector(|| "test-admin-title".into()).child("pwsh"))
         }
     }
@@ -233,11 +274,14 @@ mod tests {
             });
             let badge = window.debug_bounds("test-administrator").unwrap();
             let task = window.debug_bounds("test-task-icon").unwrap();
+            let screen_error = window.debug_bounds("test-screen-error").unwrap();
             let title = window.debug_bounds("test-admin-title").unwrap();
             assert_eq!(badge.size, gpui::size(px(TAB_LABEL_ICON_SIZE), px(TAB_LABEL_ICON_SIZE)));
             assert_eq!(badge.size, task.size);
+            assert_eq!(screen_error.size, badge.size);
             assert!(badge.right() <= task.left());
-            assert!(task.right() <= title.left());
+            assert!(task.right() <= screen_error.left());
+            assert!(screen_error.right() <= title.left());
             if let Some(previous) = previous {
                 assert_eq!(badge, previous);
             }

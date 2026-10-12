@@ -336,6 +336,7 @@ impl TerminalView {
             // Submission is not a provider acknowledgement. Keep the recovery
             // target durable, and publish live identity only after a hook/probe.
             self.ai_session = None;
+            self.set_screen_error_indicator(false, cx);
             self.agent_activity.begin_command(true);
         }
         cx.emit(TerminalViewEvent::TitleChanged);

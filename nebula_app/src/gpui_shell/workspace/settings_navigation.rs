@@ -162,6 +162,7 @@ impl NebulaWorkspace {
             tooltip: None,
             is_settings: true,
             activity: SidebarActivity::Idle,
+            screen_error_label: None,
             logo_image: None,
             logo_pending: false,
             program_glyph: None,

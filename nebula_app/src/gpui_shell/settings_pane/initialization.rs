@@ -577,10 +577,6 @@ impl SettingsPane {
             InputState::new(window, cx)
                 .placeholder(language.text(crate::i18n::Message::CommonSearchSettings))
         });
-        let ai_auto_continue_error_patterns_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value(runtime.ai_auto_continue_error_patterns.clone())
-        });
         subscriptions.push(cx.subscribe_in(
             &settings_search_input,
             window,
@@ -666,7 +662,7 @@ impl SettingsPane {
             about_last_checked: None,
             about_sponsor_open: false,
             settings_search_input,
-            ai_auto_continue_error_patterns_input,
+            auto_continue_patterns_editor: None,
             settings_search_focus: search_header::SearchFocus::default(),
             search_origin_section: None,
             selects,

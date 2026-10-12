@@ -186,6 +186,7 @@ impl NebulaWorkspace {
                     tooltip,
                     is_settings,
                     activity,
+                    screen_error_label,
                     logo_image,
                     logo_pending,
                     program_glyph,
@@ -407,6 +408,13 @@ impl NebulaWorkspace {
                                 .text_color(if active { active_fg } else { muted })
                                 .child(glyph),
                         )
+                    })
+                    .when_some(screen_error_label.clone(), |row, label| {
+                        row.child(super::tab_presentation::screen_error_badge(
+                            format!("top-tab-screen-error-{ix}").into(),
+                            label,
+                            cx,
+                        ))
                     })
                     .when(
                         pane_count > 1

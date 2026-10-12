@@ -307,6 +307,7 @@ impl TerminalView {
             agent_activity: Default::default(),
             auto_continue: Default::default(),
             auto_continue_task: None,
+            screen_error_indicator: false,
             _auto_continue_subscription: cx.observe_global::<Settings>(|view, cx| {
                 if !cx.global::<Settings>().ai_auto_continue {
                     view.cancel_auto_continue();

@@ -172,6 +172,10 @@ fn screen_before_terminal_hook_preserves_one_retry_and_its_deadline(cx: &mut Tes
             cx.update_global::<Settings, _>(|settings, _| {
                 settings.ai_auto_continue = true;
                 settings.ai_auto_continue_interval = Duration::from_secs(60);
+                settings.ai_auto_continue_error_patterns =
+                    crate::ai_agents::parse_auto_continue_error_patterns(
+                        nebula_settings::DEFAULT_AUTO_CONTINUE_ERROR_PATTERNS,
+                    );
             })
         });
         view.update(window, |view, cx| {
@@ -187,6 +191,16 @@ fn screen_before_terminal_hook_preserves_one_retry_and_its_deadline(cx: &mut Tes
                 "■ We’re currently experiencing high demand, which may cause temporary errors.\n› Ask Codex to do anything\ngpt-6 medium · Context 2% used"
             };
             screen(view, frame);
+            let snapshot = view.auto_continue_screen_snapshot().unwrap();
+            assert!(
+                view.auto_continue_screen_error(program, &snapshot, cx.global::<Settings>()).is_some(),
+                "{program}: screen error phrase should match"
+            );
+            assert!(
+                view.auto_continue_screen_can_retry(program, &snapshot),
+                "{program}: status={:?}",
+                view.agent_activity.status()
+            );
             view.refresh_agent_screen_state(cx);
             assert!(view.auto_continue_task.is_some(), "{program}");
         });
@@ -356,6 +370,10 @@ fn revoked_screen_candidate_does_not_consume_the_later_claude_hook(cx: &mut Test
         cx.update_global::<Settings, _>(|settings, _| {
             settings.ai_auto_continue = true;
             settings.ai_auto_continue_interval = Duration::from_secs(1);
+            settings.ai_auto_continue_error_patterns =
+                crate::ai_agents::parse_auto_continue_error_patterns(
+                    nebula_settings::DEFAULT_AUTO_CONTINUE_ERROR_PATTERNS,
+                );
         })
     });
     view.update(window, |view, cx| {
@@ -364,6 +382,9 @@ fn revoked_screen_candidate_does_not_consume_the_later_claude_hook(cx: &mut Test
             view,
             "API Error: stream error: stream disconnected before completion\n❯ \n? for shortcuts",
         );
+        let snapshot = view.auto_continue_screen_snapshot().unwrap();
+        assert!(view.auto_continue_screen_error("claude", &snapshot, cx.global::<Settings>()).is_some());
+        assert!(view.auto_continue_screen_can_retry("claude", &snapshot));
         view.refresh_agent_screen_state(cx);
         assert!(view.auto_continue_task.is_some());
         screen(view, "Clean redraw.\n❯ \n? for shortcuts");
@@ -391,6 +412,10 @@ fn next_turn_new_error_retries_without_an_intermediate_clear_frame(cx: &mut Test
         cx.update_global::<Settings, _>(|settings, _| {
             settings.ai_auto_continue = true;
             settings.ai_auto_continue_interval = Duration::from_secs(1);
+            settings.ai_auto_continue_error_patterns =
+                crate::ai_agents::parse_auto_continue_error_patterns(
+                    nebula_settings::DEFAULT_AUTO_CONTINUE_ERROR_PATTERNS,
+                );
         })
     });
     let first = "■ We’re currently experiencing high demand, which may cause temporary errors.\n› Ask Codex to do anything\ngpt-6 medium · Context 2% used";
@@ -398,6 +423,9 @@ fn next_turn_new_error_retries_without_an_intermediate_clear_frame(cx: &mut Test
         view.handle_ai_hook(&codex_hook("next-error", "UserPromptSubmit", "first"), cx);
         view.handle_ai_hook(&codex_hook("next-error", "Stop", "first"), cx);
         screen(view, first);
+        let snapshot = view.auto_continue_screen_snapshot().unwrap();
+        assert!(view.auto_continue_screen_error("codex", &snapshot, cx.global::<Settings>()).is_some());
+        assert!(view.auto_continue_screen_can_retry("codex", &snapshot));
         view.refresh_agent_screen_state(cx);
     });
     window.run_until_parked();
@@ -424,7 +452,7 @@ fn next_turn_new_error_retries_without_an_intermediate_clear_frame(cx: &mut Test
 
 #[gpui::test]
 fn codex_screen_retry_cancels_when_the_error_clears_or_user_types(cx: &mut TestAppContext) {
-    for action in ["clear", "input", "permission"] {
+    for action in ["clear", "replace", "input", "permission"] {
         let owner = format!("screen-cancel-{action}");
         let turn = format!("turn-{action}");
         let (view, window, receiver) = open(cx);
@@ -450,6 +478,10 @@ fn codex_screen_retry_cancels_when_the_error_clears_or_user_types(cx: &mut TestA
             match action {
                 "clear" => {
                     screen(view, "Completed answer.\n› Ask Codex to do anything\ngpt-6-astra medium · Context 0% used");
+                    view.refresh_agent_screen_state(cx);
+                },
+                "replace" => {
+                    screen(view, "■ 503 Service Unavailable\n› Ask Codex to do anything\ngpt-6-astra medium · Context 0% used");
                     view.refresh_agent_screen_state(cx);
                 },
                 "input" => view.write_input(b"manual".to_vec(), cx),

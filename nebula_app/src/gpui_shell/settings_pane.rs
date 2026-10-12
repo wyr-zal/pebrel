@@ -41,6 +41,7 @@ mod app_icon;
 mod appearance;
 mod appearance_advanced;
 mod appearance_picker;
+mod auto_continue_patterns;
 #[path = "background_color.rs"]
 mod background_color;
 mod background_shader;
@@ -135,7 +136,7 @@ pub struct SettingsPane {
     /// 首页「项目与支持」→ 赞助商：独立页面，不是外链行。切换分区时清掉。
     about_sponsor_open: bool,
     settings_search_input: Entity<InputState>,
-    ai_auto_continue_error_patterns_input: Entity<InputState>,
+    auto_continue_patterns_editor: Option<auto_continue_patterns::PatternEditor>,
     settings_search_focus: search_header::SearchFocus,
     search_origin_section: Option<usize>,
     /// 每项还带着自己的 `values` 表：`SelectState` 只认索引，而从代码侧
@@ -991,41 +992,6 @@ impl SettingsPane {
         self.persist(&[("startup_directory", String::new())], cx);
     }
 
-    /// 文本输入 + 保存按钮（保存时读值写盘）。
-    fn input_row(
-        &self,
-        label: &'static str,
-        desc: impl Into<SettingHelp>,
-        key: &'static str,
-        input: &Entity<InputState>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let state = input.clone();
-        let input_width = if key == "ai_auto_continue_error_patterns" { 440.0 } else { 280.0 };
-        self.row(
-            label,
-            desc,
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(
-                    div()
-                        .debug_selector(move || format!("settings-input-{key}"))
-                        .w(px(input_width))
-                        .child(Input::new(input)),
-                )
-                .child(
-                    NebulaButton::new(SharedString::from(format!("save-{key}")))
-                        .label(crate::gpui_shell::config::ui_language(cx).pick("保存", "Save"))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let value = state.read(cx).value().to_string();
-                            this.persist(&[(key, value)], cx);
-                        })),
-                ),
-            cx,
-        )
-    }
-
     /// 旧壳连续量使用轨道而不是加减按钮；数值和轨道共享同一个
     /// `SliderState`，拖动时由订阅统一写盘并热应用。
     fn slider_row(
@@ -1334,15 +1300,7 @@ impl SettingsPane {
                             help("ai_auto_continue_interval", language),
                             cx,
                         ))
-                        .child(self.input_row(
-                            language.text(
-                                crate::i18n::Message::SettingsNotificationsAutoContinuePatterns,
-                            ),
-                            help("ai_auto_continue_error_patterns", language),
-                            "ai_auto_continue_error_patterns",
-                            &self.ai_auto_continue_error_patterns_input,
-                            cx,
-                        ))
+                        .child(self.auto_continue_patterns_row(language, cx))
                 })
                 .child(self.select_row(
                     "notification_duration",
@@ -1683,6 +1641,7 @@ impl Render for SettingsPane {
         let bg_dragging = self.bg_picker_drag.is_some();
         let ssh_editor_modal = self.ssh_editor_modal(window, cx);
         let appearance_picker_modal = self.appearance_picker_modal(window, cx);
+        let auto_continue_patterns_modal = self.auto_continue_patterns_modal(window, cx);
         let theme_editor_modal = self.theme_editor_modal(window, cx);
         let theme_transfer_modal = self.theme_transfer_modal(window, cx);
         let theme_package_modal = self.theme_package_modal(window, cx);
@@ -1806,6 +1765,7 @@ impl Render for SettingsPane {
             .when_some(backup_drawer, |root, drawer| root.child(drawer))
             .when_some(ssh_editor_modal, |root, modal| root.child(modal))
             .when_some(appearance_picker_modal, |root, modal| root.child(modal))
+            .when_some(auto_continue_patterns_modal, |root, modal| root.child(modal))
             .when_some(theme_editor_modal, |root, modal| root.child(modal))
             .when_some(theme_transfer_modal, |root, modal| root.child(modal))
             .when_some(theme_package_modal, |root, modal| root.child(modal))

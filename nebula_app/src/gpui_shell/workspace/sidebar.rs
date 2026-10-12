@@ -234,6 +234,7 @@ impl NebulaWorkspace {
                     tooltip,
                     is_settings,
                     activity,
+                    screen_error_label,
                     logo_image,
                     logo_pending,
                     program_glyph,
@@ -466,6 +467,13 @@ impl NebulaWorkspace {
                             .text_color(if active { active_fg } else { muted })
                             .child(glyph),
                     )
+                })
+                .when_some(screen_error_label.clone(), |row, label| {
+                    row.child(tab_presentation::screen_error_badge(
+                        format!("sidebar-screen-error-{ix}").into(),
+                        label,
+                        cx,
+                    ))
                 })
                 .when(
                     pane_count > 1 && !is_settings && logo_image.is_none() && !has_program_glyph,
@@ -980,6 +988,7 @@ impl NebulaWorkspace {
             logo_image,
             logo_pending,
             program_glyph,
+            screen_error_label,
             pane_count,
             local_administrator,
             ..
@@ -1017,6 +1026,13 @@ impl NebulaWorkspace {
                             .text_color(dim)
                             .child(glyph),
                     )
+                })
+                .when_some(screen_error_label, |row, label| {
+                    row.child(tab_presentation::screen_error_badge(
+                        "collapsed-screen-error".into(),
+                        label,
+                        cx,
+                    ))
                 })
                 .child(
                     div()

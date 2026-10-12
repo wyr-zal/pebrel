@@ -9,6 +9,46 @@ pub(crate) enum RetryEvidence {
     ScreenFailure,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScreenRetryReason {
+    UnsupportedProvider,
+    NoError,
+    Disabled,
+    MissingSession,
+    PromptNotArmed,
+    InactiveTurn,
+    AttemptLimit,
+    RetryPending,
+    ExistingError,
+    UnsafeScreen,
+    Scheduled,
+}
+
+impl ScreenRetryReason {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::UnsupportedProvider => "unsupported_provider",
+            Self::NoError => "no_match",
+            Self::Disabled => "disabled",
+            Self::MissingSession => "missing_session",
+            Self::PromptNotArmed => "prompt_not_armed",
+            Self::InactiveTurn => "inactive_turn",
+            Self::AttemptLimit => "attempt_limit",
+            Self::RetryPending => "retry_pending",
+            Self::ExistingError => "existing_error",
+            Self::UnsafeScreen => "unsafe_screen",
+            Self::Scheduled => "scheduled",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScreenRetryObservation {
+    pub(crate) delay: Option<Duration>,
+    pub(crate) reason: ScreenRetryReason,
+    pub(crate) should_log: bool,
+}
+
 #[derive(Default)]
 pub(crate) struct AutoContinue {
     attempts: u8,
@@ -16,6 +56,7 @@ pub(crate) struct AutoContinue {
     armed: bool,
     screen_turn_active: bool,
     screen_failure_latched: Option<String>,
+    last_screen_retry_log: Option<(u64, ScreenRetryReason)>,
     pending: Option<RetryEvidence>,
 }
 
@@ -30,10 +71,17 @@ impl AutoContinue {
         self.cancel();
         self.attempts = 0;
         self.screen_failure_latched = None;
+        self.last_screen_retry_log = None;
     }
 
     pub fn pending(&self) -> Option<RetryEvidence> {
         self.pending
+    }
+
+    pub fn pending_screen_failure(&self) -> Option<&str> {
+        (self.pending == Some(RetryEvidence::ScreenFailure))
+            .then_some(self.screen_failure_latched.as_deref())
+            .flatten()
     }
 
     pub fn take_pending(&mut self, max_attempts: u8) -> Option<RetryEvidence> {
@@ -43,6 +91,7 @@ impl AutoContinue {
     /// A newly accepted prompt cannot authorize an error already on its screen.
     pub fn remember_screen_at_prompt(&mut self, error: Option<String>) {
         self.screen_failure_latched = error;
+        self.last_screen_retry_log = None;
     }
 
     /// Both evidence sources share one pending retry and never restart its deadline.
@@ -125,30 +174,91 @@ impl AutoContinue {
         max_attempts: u8,
         interval: Duration,
     ) -> Option<Duration> {
+        self.observe_screen_failure_diagnostic(
+            program,
+            session_id,
+            failure,
+            eligible,
+            true,
+            now,
+            max_attempts,
+            interval,
+        )
+        .delay
+    }
+
+    pub fn observe_screen_failure_diagnostic(
+        &mut self,
+        program: &str,
+        session_id: Option<&str>,
+        failure: Option<&str>,
+        eligible: bool,
+        enabled: bool,
+        now: Instant,
+        max_attempts: u8,
+        interval: Duration,
+    ) -> ScreenRetryObservation {
         if !matches!(program, "claude" | "codex") {
-            return None;
+            return ScreenRetryObservation {
+                delay: None,
+                reason: ScreenRetryReason::UnsupportedProvider,
+                should_log: false,
+            };
         }
-        if failure.is_none() {
+        let Some(failure) = failure else {
             self.screen_failure_latched = None;
+            self.last_screen_retry_log = None;
             if self.pending == Some(RetryEvidence::ScreenFailure) {
                 self.pending = None;
             }
-            return None;
+            return ScreenRetryObservation {
+                delay: None,
+                reason: ScreenRetryReason::NoError,
+                should_log: false,
+            };
+        };
+        let reason = if !enabled {
+            ScreenRetryReason::Disabled
+        } else if session_id.is_none() {
+            ScreenRetryReason::MissingSession
+        } else if !self.armed {
+            ScreenRetryReason::PromptNotArmed
+        } else if !self.screen_turn_active {
+            ScreenRetryReason::InactiveTurn
+        } else if self.attempts >= max_attempts {
+            ScreenRetryReason::AttemptLimit
+        } else if self.pending.is_some() {
+            ScreenRetryReason::RetryPending
+        } else if self.screen_failure_latched.as_deref() == Some(failure) {
+            ScreenRetryReason::ExistingError
+        } else if !eligible {
+            ScreenRetryReason::UnsafeScreen
+        } else {
+            ScreenRetryReason::Scheduled
+        };
+        let delay = if reason == ScreenRetryReason::Scheduled {
+            // A revocable screen candidate has not consumed the accepted Hook opportunity.
+            self.screen_failure_latched = Some(failure.to_owned());
+            self.pending = Some(RetryEvidence::ScreenFailure);
+            Some(self.next_delay(now, interval))
+        } else {
+            None
+        };
+        let should_log = self.should_log_screen_retry(failure, reason);
+        ScreenRetryObservation { delay, reason, should_log }
+    }
+
+    fn should_log_screen_retry(&mut self, failure: &str, reason: ScreenRetryReason) -> bool {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        failure.hash(&mut hasher);
+        let key = (hasher.finish(), reason);
+        if self.last_screen_retry_log == Some(key) {
+            return false;
         }
-        if !eligible
-            || self.screen_failure_latched.as_deref() == failure
-            || self.pending.is_some()
-            || !self.armed
-            || !self.screen_turn_active
-            || self.attempts >= max_attempts
-            || session_id.is_none()
-        {
-            return None;
-        }
-        // A revocable screen candidate has not consumed the accepted Hook opportunity.
-        self.screen_failure_latched = failure.map(str::to_owned);
-        self.pending = Some(RetryEvidence::ScreenFailure);
-        Some(self.next_delay(now, interval))
+        self.last_screen_retry_log = Some(key);
+        true
     }
 
     fn next_delay(&self, now: Instant, interval: Duration) -> Duration {
@@ -172,6 +282,87 @@ mod tests {
         super::super::parse_remote_envelope(
             format!("nebula-hook/1 source=claude\n{{\"hook_event_name\":\"{name}\",\"session_id\":\"retry\",\"error\":\"{error}\"}}").as_bytes(), Some(42),
         ).unwrap()
+    }
+
+    #[test]
+    fn screen_retry_diagnostics_are_reason_only_and_deduplicated() {
+        let now = Instant::now();
+        let interval = Duration::from_secs(60);
+        let mut state = AutoContinue::default();
+        let rejected = state.observe_screen_failure_diagnostic(
+            "codex",
+            Some("session"),
+            Some("high-demand error identity"),
+            true,
+            true,
+            now,
+            3,
+            interval,
+        );
+        assert_eq!(rejected.reason, ScreenRetryReason::PromptNotArmed);
+        assert_eq!(rejected.reason.code(), "prompt_not_armed");
+        assert!(rejected.should_log);
+        assert!(!state
+            .observe_screen_failure_diagnostic(
+                "codex",
+                Some("session"),
+                Some("high-demand error identity"),
+                true,
+                true,
+                now,
+                3,
+                interval,
+            )
+            .should_log);
+
+        let scheduled = state
+            .observe(&event("SessionStart", ""), now, 3, interval);
+        assert_eq!(scheduled, None);
+        state.observe(&event("UserPromptSubmit", ""), now, 3, interval);
+        let scheduled = state.observe_screen_failure_diagnostic(
+            "codex",
+            Some("session"),
+            Some("high-demand error identity"),
+            true,
+            true,
+            now,
+            3,
+            interval,
+        );
+        assert_eq!(scheduled.reason, ScreenRetryReason::Scheduled);
+        assert_eq!(scheduled.delay, Some(interval));
+        assert!(scheduled.should_log);
+
+        let pending = state.observe_screen_failure_diagnostic(
+            "codex",
+            Some("session"),
+            Some("high-demand error identity"),
+            true,
+            true,
+            now,
+            3,
+            interval,
+        );
+        assert_eq!(pending.reason, ScreenRetryReason::RetryPending);
+        assert!(pending.should_log);
+        assert!(!state
+            .observe_screen_failure_diagnostic(
+                "codex",
+                Some("session"),
+                Some("high-demand error identity"),
+                true,
+                true,
+                now,
+                3,
+                interval,
+            )
+            .should_log);
+
+        let cleared = state.observe_screen_failure_diagnostic(
+            "codex", Some("session"), None, true, true, now, 3, interval,
+        );
+        assert_eq!(cleared.reason, ScreenRetryReason::NoError);
+        assert!(!cleared.should_log);
     }
 
     #[test]
