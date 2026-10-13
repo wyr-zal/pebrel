@@ -20,6 +20,9 @@ pub(crate) const CODEX_FULL_EVENTS: &[&str] = &[
     "SessionEnd",
 ];
 
+// The helper bounds forwarding to two seconds; leave margin for shell and process startup.
+const CODEX_HOOK_TIMEOUT_SECONDS: u64 = 8;
+
 /// 0.154.0 is the locally verified full contract, not a guessed historical
 /// introduction version. Older clients advertising hooks use the three-event
 /// contract; clients without that feature retain notify only.
@@ -64,7 +67,11 @@ pub(crate) fn codex_groups(
 ) -> Value {
     let mut groups = serde_json::Map::new();
     for &event in mode.events() {
-        let mut handler = json!({"type":"command", "command":command, "timeout":3});
+        let mut handler = json!({
+            "type": "command",
+            "command": command,
+            "timeout": CODEX_HOOK_TIMEOUT_SECONDS,
+        });
         if let Some(windows) = windows_command {
             handler["commandWindows"] = json!(windows);
         }
@@ -192,6 +199,19 @@ mod tests {
         );
         assert_eq!(codex_mode("codex-cli 0.154.0", "other stable true"), None);
         assert_eq!(codex_mode("invalid", "hooks stable true"), None);
+    }
+
+    #[test]
+    fn codex_hook_deadline_leaves_headroom_over_bounded_helper_forwarding() {
+        let groups = codex_groups(
+            "pebrel-hook codex --hooks=full",
+            Some("windows-command"),
+            CodexHookMode::Full,
+        );
+        for event in CODEX_FULL_EVENTS {
+            let hook = &groups[*event][0]["hooks"][0];
+            assert_eq!(hook["timeout"], json!(8), "{event}");
+        }
     }
 
     #[test]

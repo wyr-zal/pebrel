@@ -201,6 +201,46 @@ class RemoteHooksTests(unittest.TestCase):
         self.assertEqual(payloads[-1]["transcript_path"], payloads[0]["transcript_path"])
         self.assertNotIn("last_assistant_message", payloads[-1])
 
+    def test_codex_hook_without_controlling_tty_uses_owning_provider_pty(self):
+        import pty
+        provider = self.root / "codex"
+        bridge = ASSETS / "remote_bridge.py"
+        provider.write_text(
+            "import json, subprocess, sys\n"
+            f"bridge={str(bridge)!r}\n"
+            "payload={'hook_event_name':'UserPromptSubmit','session_id':'main'}\n"
+            "result=subprocess.run([sys.executable,bridge,'codex','--hooks=full'],\n"
+            " input=json.dumps(payload).encode(),stdout=subprocess.PIPE,stderr=subprocess.PIPE,\n"
+            " start_new_session=True,check=True)\n"
+            "assert result.stdout == b'', result.stdout\n"
+            "assert result.stderr == b'', result.stderr\n"
+        )
+        pid, master = pty.fork()
+        if pid == 0:
+            os.execv(sys.executable, [sys.executable, str(provider)])
+        output = b""
+        try:
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], 0.1)[0]:
+                    try:
+                        part = os.read(master, 65536)
+                    except OSError:
+                        break
+                    if not part:
+                        break
+                    output += part
+            waited, status = os.waitpid(pid, 0)
+            self.assertEqual(status, 0, output.decode(errors="replace"))
+        finally:
+            os.close(master)
+        envelopes = re.findall(rb"\x1b\]777;nebula-hook;" + TOKEN.encode() + rb";([^\x07]+)\x07", output)
+        self.assertEqual(len(envelopes), 1, output[:2000])
+        header, payload = base64.b64decode(envelopes[0]).split(b"\n", 1)
+        self.assertIn(f"process={pid}:".encode(), header)
+        self.assertIn(b"codex_hooks=full", header)
+        self.assertEqual(json.loads(payload)["hook_event_name"], "UserPromptSubmit")
+
     def test_large_claude_failure_keeps_prompt_identity_and_error(self):
         bridge = module("remote_bridge")
         payload = {"hook_event_name": "StopFailure", "session_id": "main",
@@ -208,7 +248,7 @@ class RemoteHooksTests(unittest.TestCase):
                    "last_assistant_message": "x" * 70000}
         with patch.object(bridge, "write_terminal") as write:
             bridge.send("claude", False, "", payload, TOKEN)
-        frame, source = write.call_args.args
+        frame, source, _owner = write.call_args.args
         self.assertEqual(source, "claude")
         encoded = frame.split(b";", 3)[3].removesuffix(b"\x07")
         body = json.loads(base64.b64decode(encoded).split(b"\n", 1)[1])

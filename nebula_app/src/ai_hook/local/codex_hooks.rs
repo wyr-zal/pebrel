@@ -417,7 +417,8 @@ mod tests {
         std::fs::write(root.path().join("config.toml"), "# original\n").unwrap();
         install(root.path(), "helper", CodexHookMode::Full).unwrap();
         let path = root.path().join("hooks.json");
-        let edited = read(&path).unwrap().unwrap().replace("\"timeout\": 3", "\"timeout\": 9");
+        let hooks = read(&path).unwrap().unwrap();
+        let edited = hooks.replace("\"timeout\": 8", "\"timeout\": 9");
         std::fs::write(&path, &edited).unwrap();
         assert!(remove(root.path()).is_err());
         assert_eq!(read(&path).unwrap().unwrap(), edited);

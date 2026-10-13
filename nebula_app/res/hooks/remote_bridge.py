@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import select
 import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -64,6 +65,41 @@ def process_identity(source):
         except (OSError, ValueError, subprocess.SubprocessError):
             break
     return None
+
+
+def open_codex_terminal(identity):
+    """Open only the verified Codex ancestor's interactive PTY, never hook stdout."""
+    match = re.fullmatch(r"([1-9][0-9]*):([0-9]+)", identity or "")
+    if match is None:
+        return None
+    pid, expected_start = match.groups()
+
+    def process_start_time():
+        raw = Path(f"/proc/{pid}/stat").read_text()
+        return raw[raw.rfind(")") + 2:].split()[19]
+
+    fd = None
+    try:
+        if process_start_time() != expected_start:
+            return None
+        fd = os.open(f"/proc/{pid}/fd/1", os.O_WRONLY | os.O_NONBLOCK)
+        if not stat.S_ISCHR(os.fstat(fd).st_mode) or not os.isatty(fd):
+            return None
+        if not re.fullmatch(r"/dev/pts/[0-9]+", os.ttyname(fd)):
+            return None
+        if process_start_time() != expected_start:
+            return None
+        terminal_fd = fd
+        fd = None
+        return terminal_fd
+    except (OSError, ValueError, IndexError):
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def bounded_payload(args):
@@ -158,20 +194,24 @@ def send(source, native, mode, payload, token):
         if len(envelope) > MAX_ENVELOPE:
             return
         osc = b"\x1b]777;nebula-hook;" + token.encode() + b";" + base64.b64encode(envelope) + b"\x07"
-        write_terminal(osc, source)
+        write_terminal(osc, source, owner)
 
 
-def write_terminal(osc, source=None):
+def write_terminal(osc, source=None, owner=None):
     try:
         fd = os.open("/dev/tty", os.O_WRONLY | os.O_NONBLOCK)
     except OSError as error:
-        if source != "claude" or error.errno != errno.ENXIO:
+        if source == "codex" and error.errno == errno.ENXIO:
+            fd = open_codex_terminal(owner)
+            if fd is None:
+                raise
+        elif source == "claude" and error.errno == errno.ENXIO:
+            # Claude's hook contract transports this allowlisted OSC through its
+            # terminalSequence output. Codex captures detached-hook stdout instead.
+            print(json.dumps({"terminalSequence": osc.decode("ascii")}), flush=True)
+            return
+        else:
             raise
-        # Claude runs hooks without a controlling terminal. Its interactive
-        # output path accepts allowlisted OSC 777, including on StopFailure.
-        # Only fall back before writing any bytes, never after a partial frame.
-        print(json.dumps({"terminalSequence": osc.decode("ascii")}), flush=True)
-        return
     offset = 0
     deadline = time.monotonic() + 0.5
     try:
