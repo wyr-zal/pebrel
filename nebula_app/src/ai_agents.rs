@@ -240,6 +240,25 @@ impl AgentKind {
             .find_map(|token| token.split(['/', '\\']).find_map(Self::parse))
     }
 
+    /// Resolve identity from a process image and only its executable arguments.
+    /// Unlike a submitted command line, process arguments must not be searched
+    /// for arbitrary aliases in payload text or unrelated parent directories.
+    pub(crate) fn parse_process_argv(
+        executable: &str,
+        argv0: &str,
+        argv1: Option<&str>,
+    ) -> Option<Self> {
+        Self::parse(executable)
+            .or_else(|| Self::parse(argv0))
+            .or_else(|| {
+                if !is_agent_interpreter(argv0) {
+                    return None;
+                }
+                let entrypoint = argv1?;
+                Self::parse(entrypoint).or_else(|| is_claude_node_entrypoint(entrypoint).then_some(Self::Claude))
+            })
+    }
+
     /// Shell-safe resume command. Session ids are untrusted hook/file input,
     /// so an unsupported shape returns `None` instead of being quoted.
     pub fn resume_command(self, session_id: &str) -> Option<String> {
@@ -350,6 +369,11 @@ fn is_agent_interpreter(token: &str) -> bool {
             | "uv"
             | "uvx"
     )
+}
+
+fn is_claude_node_entrypoint(entrypoint: &str) -> bool {
+    let normalized = entrypoint.replace('\\', "/").to_ascii_lowercase();
+    normalized.ends_with("/node_modules/@anthropic-ai/claude-code/cli.js")
 }
 
 /// Semantic Agent state shared by lifecycle hooks and fallback observations.
@@ -1150,6 +1174,38 @@ mod tests {
             assert_eq!(identify(text), None, "{text}");
         }
         assert!(detect("codebuddy", &format!("{screen}\nuser@host:~$ ")).is_none());
+    }
+
+    #[test]
+    fn process_argv_recovers_real_aliases_without_scanning_payload_arguments() {
+        assert_eq!(
+            AgentKind::parse_process_argv(
+                "/home/wyr/.local/share/claude/versions/2.1.294",
+                "claude",
+                Some("--dangerously-skip-permissions"),
+            ),
+            Some(AgentKind::Claude),
+        );
+        assert_eq!(
+            AgentKind::parse_process_argv(
+                "/usr/bin/node",
+                "/usr/bin/node",
+                Some("/opt/node_modules/@anthropic-ai/claude-code/cli.js"),
+            ),
+            Some(AgentKind::Claude),
+        );
+        assert_eq!(
+            AgentKind::parse_process_argv("/usr/bin/cc", "cc", Some("claude.md")),
+            None,
+        );
+        assert_eq!(
+            AgentKind::parse_process_argv("/usr/bin/node", "node", Some("server.js")),
+            None,
+        );
+        assert_eq!(
+            AgentKind::parse_process_argv("/usr/bin/node", "node", Some("/home/claude/server.js")),
+            None,
+        );
     }
 
     #[test]

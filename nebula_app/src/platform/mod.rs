@@ -12,6 +12,7 @@
 #[cfg(feature = "gpui-shell")]
 pub(crate) mod acrylic;
 pub(crate) mod ai_session_identity;
+pub(crate) mod agent_process_identity;
 #[cfg(all(feature = "gpui-shell", feature = "video-background"))]
 pub(crate) mod background_media;
 pub mod capabilities;

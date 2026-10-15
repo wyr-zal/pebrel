@@ -4,6 +4,20 @@ Every release entry is provided in English and Simplified Chinese.
 
 每个版本条目均同时提供英文和简体中文说明。
 
+## 2.2.4 - 2026-10-15
+
+### English
+
+#### Fixed
+
+- Fixed: AI CLI sessions started through a shell alias, function, or wrapper script (for example a `cc` alias that launches Claude Code) now get the correct agent identity once the real agent process is visible, instead of staying unidentified. Direct launches are unchanged.
+
+### 中文
+
+#### 修复
+
+- 修复：通过 shell 别名、函数或包装脚本（例如用 `cc` 别名启动 Claude Code）启动的 AI CLI 会话，在真实 Agent 进程可见后现在能得到正确的 Agent 身份，不再一直未识别。直接启动的行为不变。
+
 ## 2.2.3 - 2026-10-10
 
 ### English

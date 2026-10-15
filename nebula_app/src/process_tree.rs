@@ -233,17 +233,13 @@ pub(crate) fn activity_evidence(
 
 fn activity_from_snapshot(rows: &[ProcessEntry], primary_pid: Option<u32>) -> ActivityEvidence {
     let mut evidence = ActivityEvidence {
-        agent: None,
+        agent: nearest_agent(rows),
         primary_present: primary_pid.map(|pid| rows.iter().any(|row| row.pid == pid)),
         child_present: false,
         busy: false,
     };
     for (index, row) in rows.iter().enumerate() {
         let name = display_name(&row.executable).to_ascii_lowercase();
-        if evidence.agent.is_none() {
-            evidence.agent =
-                crate::ai_agents::AgentKind::parse(&name).map(|agent| agent.slug().to_owned());
-        }
         if index == 0 {
             continue;
         }
@@ -254,6 +250,23 @@ fn activity_from_snapshot(rows: &[ProcessEntry], primary_pid: Option<u32>) -> Ac
         evidence.busy |= !is_shell_executable(&row.executable);
     }
     evidence
+}
+
+fn nearest_agent(rows: &[ProcessEntry]) -> Option<String> {
+    let mut nearest_depth = u32::MAX;
+    let mut selected = None;
+    for row in rows.iter().filter(|row| row.depth > 0) {
+        let Some(agent) = crate::ai_agents::AgentKind::parse(&display_name(&row.executable)) else {
+            continue;
+        };
+        if row.depth < nearest_depth {
+            nearest_depth = row.depth;
+            selected = Some(agent);
+        } else if row.depth == nearest_depth && selected != Some(agent) {
+            return None;
+        }
+    }
+    selected.map(|agent| agent.slug().to_owned())
 }
 
 fn busy_descendant(processes: Vec<ProcessEntry>) -> Option<String> {
@@ -481,6 +494,23 @@ mod tests {
         let evidence = super::activity_from_snapshot(&tree[..2], Some(3));
         assert_eq!(evidence.primary_present, Some(false));
         assert!(evidence.child_present, "a wrapper can outlive the agent");
+
+        let evidence = super::activity_from_snapshot(
+            &rows(&["pwsh.exe", "cc.exe", "claude.exe"]),
+            None,
+        );
+        assert_eq!(evidence.agent.as_deref(), Some("claude"));
+        let evidence = super::activity_from_snapshot(
+            &rows(&["pwsh.exe", "claude.exe", "codex.exe"]),
+            None,
+        );
+        assert_eq!(evidence.agent.as_deref(), Some("claude"));
+        let ambiguous = vec![
+            ProcessEntry { pid: 1, parent_pid: 0, executable: "pwsh.exe".into(), depth: 0 },
+            ProcessEntry { pid: 2, parent_pid: 1, executable: "claude.exe".into(), depth: 1 },
+            ProcessEntry { pid: 3, parent_pid: 1, executable: "codex.exe".into(), depth: 1 },
+        ];
+        assert_eq!(super::nearest_agent(&ambiguous), None);
 
         let evidence = super::activity_from_snapshot(&rows(&["pwsh.exe", "openconsole.exe"]), None);
         assert!(!evidence.child_present);

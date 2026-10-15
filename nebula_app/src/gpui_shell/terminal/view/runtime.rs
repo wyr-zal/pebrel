@@ -52,6 +52,7 @@ impl TerminalView {
     }
 
     pub(super) fn on_command_start(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_agent_identity_probe();
         if !self.agent_activity.hook_seen() {
             self.answers.begin_command();
             // Shell capture covers wrappers/WSL until a hook owns the session.
@@ -130,6 +131,7 @@ impl TerminalView {
     /// the primary edge; the cached-prompt path calls the same reset so the two
     /// lifecycle routes cannot drift apart.
     pub(super) fn clear_foreground_agent_state(&mut self, cx: &mut Context<Self>) -> bool {
+        self.invalidate_agent_identity_probe();
         self.cancel_auto_continue();
         self.auto_continue.reset();
         if let Some(session) = &self.session {
@@ -1022,6 +1024,7 @@ impl TerminalView {
     pub(super) fn mark_command_running(&mut self) {
         self.consume_native_prompt();
         if !self.command_running {
+            self.invalidate_agent_identity_probe();
             self.prompt_process_probe = None;
             self.last_prompt_process_probe = None;
             self.command_started = Some(std::time::Instant::now());
@@ -1046,6 +1049,7 @@ impl TerminalView {
     /// 落空。进程树是客观事实，只是慢一拍——而慢一拍在 1 Hz 看门狗里无所谓。
     pub(super) fn reconcile_shell_activity(&mut self, cx: &mut Context<Self>) {
         if !self.suggest.suggest_env.is_this_machine() {
+            self.probe_agent_identity(cx);
             return;
         }
         if !self.command_running && !self.agent_activity.hook_seen() {
@@ -1089,11 +1093,14 @@ impl TerminalView {
             self.finish_foreground_command(None, cx);
             return;
         }
-        if self.running_program.is_none()
-            && let Some(agent) = evidence.agent
+        if super::agent_identity::may_refine_process_identity(
+            self.agent_activity.hook_seen(),
+            self.running_program.as_deref(),
+        ) && let Some(agent) = evidence.agent
         {
             log::debug!("agent identity from process tree: pane={} program={agent}", self.pane_id);
             self.running_program = Some(agent);
+            self.agent_activity.identify(crate::ai_agents::AgentStatusSource::Process);
             cx.emit(TerminalViewEvent::TitleChanged);
             cx.notify();
             return;

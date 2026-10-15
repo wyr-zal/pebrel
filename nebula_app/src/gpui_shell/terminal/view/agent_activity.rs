@@ -51,6 +51,7 @@ impl TerminalView {
             return false;
         }
         self.agent_activity.apply_hook(event);
+        self.invalidate_agent_identity_probe();
         if matches!(
             event.kind,
             AiHookKind::SessionStart

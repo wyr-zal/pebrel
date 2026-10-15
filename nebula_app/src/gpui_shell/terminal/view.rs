@@ -3,6 +3,7 @@
 #[cfg(all(test, feature = "gpui-test-support"))]
 mod activity_tests;
 mod agent_activity;
+mod agent_identity;
 mod auto_continue;
 mod broadcast;
 mod completion;
@@ -321,6 +322,10 @@ pub struct TerminalView {
     command_started: Option<std::time::Instant>,
     /// 上次跑进程树探测的时刻，用于节流。
     last_process_probe: Option<std::time::Instant>,
+    agent_identity_probe_pending: bool,
+    agent_identity_probe_epoch: u64,
+    last_agent_identity_probe: Option<std::time::Instant>,
+    agent_identity_probe_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     prompt_process_probe: Option<gpui::Task<()>>,
     prompt_input_epoch: u64,
     native_prompt_seen: bool,
