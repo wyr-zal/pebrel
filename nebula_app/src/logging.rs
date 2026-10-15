@@ -5,8 +5,8 @@
 //! log-level is sufficient for the level configured in `cli::Options`.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, LineWriter, Stdout, Write};
-use std::path::PathBuf;
+use std::io::{self, LineWriter, Read, Seek, SeekFrom, Stdout, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -39,9 +39,69 @@ pub const LOG_TARGET_WINIT: &str = "nebula_winit_event";
 /// The targets are semicolon separated.
 const EXTRA_LOG_TARGETS_ENV: &str = "PEBREL_EXTRA_LOG_TARGETS";
 
-pub(crate) fn debug_log(message: impl AsRef<str>) {
-    use std::io::Write as _;
+const MAX_LOG_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const RETAIN_LOG_FILE_BYTES: u64 = 6 * 1024 * 1024;
 
+static APPEND_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub(crate) fn append_bounded_log(path: &Path, message: &[u8]) {
+    let Ok(_lock) = APPEND_LOG_LOCK.get_or_init(|| Mutex::new(())).lock() else { return };
+    let Ok(mut file) = OpenOptions::new().create(true).read(true).write(true).open(path) else {
+        return;
+    };
+    if file.seek(SeekFrom::End(0)).is_err() || file.write_all(message).is_err() {
+        return;
+    }
+    let _ = trim_log_file_tail(&mut file, MAX_LOG_FILE_BYTES, RETAIN_LOG_FILE_BYTES);
+}
+
+#[cfg(windows)]
+fn cleanup_inactive_temp_logs(temp_dir: &Path, current_log: &Path) {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let Ok(entries) = std::fs::read_dir(temp_dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else { continue };
+        if &path == current_log || !name.starts_with("Pebrel-") || !name.ends_with(".log") {
+            continue;
+        }
+
+        // Skip files that are currently open by a Pebrel process.
+        let Ok(file) = OpenOptions::new().read(true).write(true).share_mode(0).open(&path) else {
+            continue;
+        };
+        drop(file);
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn trim_log_file_tail(file: &mut File, max_bytes: u64, retain_bytes: u64) -> io::Result<()> {
+    if retain_bytes == 0 || retain_bytes >= max_bytes {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid log retention limits"));
+    }
+
+    let length = file.metadata()?.len();
+    if length <= max_bytes {
+        file.seek(SeekFrom::End(0))?;
+        return Ok(());
+    }
+
+    file.seek(SeekFrom::Start(length - retain_bytes))?;
+    let mut tail = Vec::with_capacity(retain_bytes as usize);
+    file.read_to_end(&mut tail)?;
+    if let Some(line_end) = tail.iter().position(|byte| *byte == b'\n') {
+        tail.drain(..=line_end);
+    }
+
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&tail)?;
+    file.set_len(tail.len() as u64)?;
+    file.seek(SeekFrom::End(0))?;
+    Ok(())
+}
+
+pub(crate) fn debug_log(message: impl AsRef<str>) {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     if !*ENABLED.get_or_init(|| {
         env::var("PEBREL_DEBUG_LOG").or_else(|_| env::var("NEBULA_DEBUG_LOG")).is_ok_and(|value| {
@@ -57,20 +117,15 @@ pub(crate) fn debug_log(message: impl AsRef<str>) {
         .map(|duration| format!("{}.{:03}", duration.as_secs(), duration.subsec_millis()))
         .unwrap_or_else(|_| "0.000".to_owned());
     let path = crate::platform::dirs::data_dir().join("pebrel_debug.log");
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "[{timestamp} pid={}] {}", process::id(), message.as_ref());
-    }
+    let record = format!("[{timestamp} pid={}] {}\n", process::id(), message.as_ref());
+    append_bounded_log(&path, record.as_bytes());
 }
 
 /// Write sanitized startup events even when the ordinary log level is Warn.
 pub(crate) fn startup_diagnostic(message: impl AsRef<str>) {
-    static LOCK: Mutex<()> = Mutex::new(());
-    let Ok(_guard) = LOCK.lock() else { return };
     let path = env::temp_dir().join(format!("Pebrel-startup-{}.log", process::id()));
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let record = startup_diagnostic_record(process::id(), message.as_ref());
-        let _ = file.write_all(record.as_bytes());
-    }
+    let record = startup_diagnostic_record(process::id(), message.as_ref());
+    append_bounded_log(&path, record.as_bytes());
 }
 
 /// User configurable extra log targets to include.
@@ -271,6 +326,9 @@ impl OnDemandLogFile {
         let mut path = env::temp_dir();
         path.push(format!("Pebrel-{}.log", process::id()));
 
+        #[cfg(windows)]
+        cleanup_inactive_temp_logs(&env::temp_dir(), &path);
+
         // Set log path as an environment variable.
         unsafe {
             env::set_var(LOG_PATH_ENV, path.as_os_str());
@@ -288,7 +346,7 @@ impl OnDemandLogFile {
 
         // Create the file if it doesn't exist yet.
         if self.file.is_none() {
-            let file = OpenOptions::new().append(true).create_new(true).open(&self.path);
+            let file = OpenOptions::new().read(true).write(true).create_new(true).open(&self.path);
 
             match file {
                 Ok(file) => {
@@ -314,7 +372,11 @@ impl OnDemandLogFile {
 
 impl Write for OnDemandLogFile {
     fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
-        self.file()?.write(buf)
+        let file = self.file()?;
+        let written = file.write(buf)?;
+        file.flush()?;
+        trim_log_file_tail(file.get_mut(), MAX_LOG_FILE_BYTES, RETAIN_LOG_FILE_BYTES)?;
+        Ok(written)
     }
 
     fn flush(&mut self) -> Result<(), io::Error> {
@@ -329,6 +391,45 @@ fn startup_diagnostic_record(pid: u32, message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{self, OpenOptions};
+
+    #[test]
+    fn trim_log_file_tail_keeps_recent_complete_lines() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pebrel.log");
+        fs::write(&path, b"one\ntwo\nthree\nfour\n").unwrap();
+        let mut file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+
+        trim_log_file_tail(&mut file, 12, 8).unwrap();
+
+        assert_eq!(fs::read(path).unwrap(), b"four\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_removes_inactive_pebrel_temp_logs_but_preserves_active_and_current() {
+        let directory = tempfile::tempdir().unwrap();
+        let old_log = directory.path().join("Pebrel-101.log");
+        let active_log = directory.path().join("Pebrel-202.log");
+        let current_log = directory.path().join("Pebrel-303.log");
+        let unrelated = directory.path().join("other.log");
+        fs::write(&old_log, b"old\n").unwrap();
+        fs::write(&active_log, b"active\n").unwrap();
+        fs::write(&current_log, b"current\n").unwrap();
+        fs::write(&unrelated, b"other\n").unwrap();
+        let active_file = OpenOptions::new().write(true).open(&active_log).unwrap();
+
+        cleanup_inactive_temp_logs(directory.path(), &current_log);
+
+        assert!(!old_log.exists());
+        assert!(active_log.exists());
+        assert!(current_log.exists());
+        assert!(unrelated.exists());
+
+        drop(active_file);
+        cleanup_inactive_temp_logs(directory.path(), &current_log);
+        assert!(!active_log.exists());
+    }
 
     #[test]
     fn product_binary_log_target_is_allowed_by_default() {

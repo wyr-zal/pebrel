@@ -267,9 +267,8 @@ fn history_debug_log(message: impl AsRef<str>) {
         .map(|duration| format!("{}.{:03}", duration.as_secs(), duration.subsec_millis()))
         .unwrap_or_else(|_| "0.000".to_owned());
     let path = history_path(LOCAL_HISTORY_FILE).with_file_name("pebrel_debug.log");
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "[{ts}] {}", message.as_ref());
-    }
+    let record = format!("[{ts}] {}\n", message.as_ref());
+    crate::logging::append_bounded_log(&path, record.as_bytes());
 }
 
 fn append(scope: &HistoryScope, cmd: &str, cwd: &str) {

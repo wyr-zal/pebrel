@@ -1,4 +1,3 @@
-use std::fs::OpenOptions;
 use std::io::Write;
 use std::{io, panic, ptr, thread};
 
@@ -39,9 +38,8 @@ pub fn attach_handler() {
     panic::set_hook(Box::new(move |panic_info| {
         let message = panic_info.to_string();
         let _ = writeln!(io::stderr(), "{message}");
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&panic_log) {
-            let _ = writeln!(file, "{message}\n");
-        }
+        let record = format!("{message}\n\n");
+        crate::logging::append_bounded_log(&panic_log, record.as_bytes());
 
         let dialog_message = win32_string(&format!("{message}\n\nPress Ctrl-C to Copy"));
         let dialog_title = win32_string("Pebrel: Runtime Error");

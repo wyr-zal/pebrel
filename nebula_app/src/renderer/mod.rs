@@ -599,14 +599,10 @@ impl Renderer {
             terminal.as_px(),
             ui_role.as_px(),
         );
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(crate::display::nebula_data_dir().join("ui_anchor.log"))
-        {
-            use std::io::Write as _;
-            let _ = file.write_all(line.as_bytes());
-        }
+        crate::logging::append_bounded_log(
+            &crate::display::nebula_data_dir().join("ui_anchor.log"),
+            line.as_bytes(),
+        );
     }
 
     /// Chrome text at the glyph cache's CURRENT font size, stepped by the

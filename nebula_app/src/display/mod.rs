@@ -571,16 +571,13 @@ pub(crate) fn nebula_debug_log(message: impl AsRef<str>) {
 /// NEBULA_DEBUG_LOG=1 would double every remote-debug round-trip. Remove or
 /// downgrade to the gated logger once the link path is verified.
 pub(crate) fn nebula_link_log(message: impl AsRef<str>) {
-    use std::io::Write as _;
-
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| format!("{}.{:03}", d.as_secs(), d.subsec_millis()))
         .unwrap_or_else(|_| "0.000".to_owned());
     let path = nebula_data_dir().join("pebrel_debug.log");
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "[{ts}] {}", message.as_ref());
-    }
+    let record = format!("[{ts}] {}\n", message.as_ref());
+    crate::logging::append_bounded_log(&path, record.as_bytes());
 }
 
 /// Directory holding Nebula's persistent state, created on demand. Settings
