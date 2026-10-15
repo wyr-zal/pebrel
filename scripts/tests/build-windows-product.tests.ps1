@@ -4,9 +4,11 @@ $builder = Join-Path $PSScriptRoot '../build-windows-product.ps1'
 $originalTarget = $env:CARGO_TARGET_DIR
 $originalDirectory = (Get-Location).Path
 $global:ProductBuildCalls = @()
+$global:ProductBuildTargets = @()
 $global:ProductBuildExit = 0
 function global:cargo {
     $global:ProductBuildCalls += ,@($args)
+    $global:ProductBuildTargets += ,$env:CARGO_TARGET_DIR
     $global:LASTEXITCODE = $global:ProductBuildExit
 }
 try {
@@ -36,6 +38,11 @@ try {
     if (-not $failed) { throw 'Cargo failure must fail packaging' }
     if ($env:CARGO_TARGET_DIR -ne 'preserve-caller-target') { throw 'Failure changed caller target' }
     if ((Get-Location).Path -ne $originalDirectory) { throw 'Failure changed caller directory' }
+    Remove-Item Env:CARGO_TARGET_DIR
+    $global:ProductBuildExit = 0
+    & $builder -Configuration debug
+    if ($null -ne $global:ProductBuildTargets[3]) { throw 'Default build must defer to Cargo config' }
+    if ($env:CARGO_TARGET_DIR) { throw 'Default build must not set CARGO_TARGET_DIR' }
     # 本地调试仍允许构建；分发入口必须在执行构建或收集文件之前拒绝调试包。
     foreach ($name in @('package-release.ps1', 'build-installer.ps1')) {
         $packager = Join-Path $PSScriptRoot "../$name"
@@ -49,5 +56,5 @@ try {
 } finally {
     $env:CARGO_TARGET_DIR = $originalTarget
     Remove-Item Function:\cargo
-    Remove-Variable ProductBuildCalls,ProductBuildExit -Scope Global
+    Remove-Variable ProductBuildCalls,ProductBuildTargets,ProductBuildExit -Scope Global
 }
