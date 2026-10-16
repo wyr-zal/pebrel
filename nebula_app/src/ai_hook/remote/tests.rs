@@ -109,6 +109,30 @@ fn install_repeat_upgrade_remove_restores_foreign_configuration() {
 }
 
 #[test]
+fn claude_compaction_install_preserves_custom_remote_hooks() {
+    let mut snapshot = snapshot().for_wsl();
+    let custom = json!({"hooks":[{"type":"command","command":"user-compact-hook"}]});
+    let root = json!({"model":"kept", "hooks":{"PreCompact":[custom.clone()], "PostCompact":[custom.clone()]}});
+    put(&mut snapshot, "claude", &root.to_string());
+    let edits = snapshot.plan(Action::Install).unwrap().unwrap();
+    apply(&mut snapshot, edits);
+    let installed: Value = serde_json::from_str(snapshot.raw("claude").unwrap().unwrap()).unwrap();
+    for event in ["PreCompact", "PostCompact"] {
+        assert_eq!(installed["hooks"][event].as_array().map(Vec::len), Some(2));
+        assert_eq!(installed["hooks"][event][0], custom);
+        assert!(installed["hooks"][event][1].to_string().contains("pebrel-hook"));
+    }
+    assert!(snapshot.plan(Action::Automatic).unwrap().unwrap().is_empty());
+    let edits = snapshot.plan(Action::Remove).unwrap().unwrap();
+    apply(&mut snapshot, edits);
+    let removed: Value = serde_json::from_str(snapshot.raw("claude").unwrap().unwrap()).unwrap();
+    for event in ["PreCompact", "PostCompact"] {
+        assert_eq!(removed["hooks"][event], json!([custom.clone()]));
+    }
+    assert_eq!(removed["model"], "kept");
+}
+
+#[test]
 fn edited_assets_commands_and_notify_are_preserved_without_partial_plan() {
     for target in ["bridge.py", "codex_config", "codex"] {
         let mut snapshot = snapshot();

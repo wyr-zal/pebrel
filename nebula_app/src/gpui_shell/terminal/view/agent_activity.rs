@@ -245,6 +245,14 @@ impl TerminalView {
             self.schedule_auto_continue_screen_failure(program, &screen, cx);
         }
         if !allows_screen {
+            if self.agent_activity.awaiting_compaction_cancel()
+                && self
+                    .agent_activity
+                    .observe_compaction_cancel(crate::ai_agents::detect("claude", &screen))
+            {
+                cx.emit(TerminalViewEvent::TitleChanged);
+                cx.notify();
+            }
             return;
         }
         let detected = notifications::screen_identity_allowed(self.running_program.as_deref())

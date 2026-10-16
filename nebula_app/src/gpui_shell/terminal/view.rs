@@ -772,6 +772,21 @@ impl TerminalView {
 
     /// 输入后回到底部并请求重绘。
     fn write_input(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        if self.session.is_some() && self.agent_activity.compacting() {
+            let escape = gpui::Keystroke::parse("escape").expect("constant key");
+            let physical_escape = super::keymap::encode(&escape, &self.term_mode());
+            if physical_escape.as_deref() == Some(bytes.as_slice())
+                || self
+                    .runtime_key_sequence(
+                        crate::runtime_api::RuntimeKey::Escape,
+                        Default::default(),
+                        1,
+                    )
+                    .is_ok_and(|encoded| encoded == bytes)
+            {
+                self.agent_activity.request_compaction_cancel();
+            }
+        }
         self.cancel_auto_continue();
         self.completion_editor.invalidate();
         self.editor_query_task = None;

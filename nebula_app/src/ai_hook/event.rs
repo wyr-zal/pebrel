@@ -11,6 +11,10 @@ pub enum AiHookKind {
     PromptSubmit,
     /// A tool completed; clears a stale permission/question wait.
     ToolComplete,
+    /// A bounded compaction phase within the same owning session.
+    CompactionStart,
+    /// Compaction ended, not the user's task.
+    CompactionEnd,
     /// The turn finished; the CLI waits for the next instruction.
     TurnDone,
     /// An explicit permission request or input question is blocking the CLI.
@@ -258,6 +262,7 @@ pub struct AiHookEvent {
     pub(crate) turn_id: Option<String>,
     /// Compaction starts hooks inside an existing turn; it is not an idle edge.
     pub(crate) session_compacted: bool,
+    pub(crate) compaction_auto: bool,
     pub answer: Option<crate::assistant_answer::AssistantAnswer>,
     pub answer_cwd: Option<std::path::PathBuf>,
     /// Pane hosting the CLI (from `NEBULA_PANE_ID`); `None` falls back to the

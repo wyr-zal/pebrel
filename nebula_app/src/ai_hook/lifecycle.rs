@@ -25,6 +25,13 @@ struct Owner {
     bridge_instance: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct Compaction {
+    prompt_id: Option<String>,
+    resume_status: AgentStatus,
+    cancel_requested: bool,
+}
+
 /// Owns status and arbitration. Adapters may submit facts but cannot set fields.
 #[derive(Debug, Clone)]
 pub(crate) struct AgentActivity {
@@ -43,6 +50,8 @@ pub(crate) struct AgentActivity {
     native_codex: bool,
     turn_id: Option<String>,
     last_remote_sequence: Option<u64>,
+    compaction: Option<Compaction>,
+    retired_compaction: Option<String>,
 }
 
 impl Default for AgentActivity {
@@ -61,6 +70,8 @@ impl Default for AgentActivity {
             native_codex: false,
             turn_id: None,
             last_remote_sequence: None,
+            compaction: None,
+            retired_compaction: None,
         }
     }
 }
@@ -113,6 +124,7 @@ impl AgentActivity {
     /// A concrete runtime submission or accepted confirmation starts work. The
     /// previous input frame must not manufacture a completion before work starts.
     pub fn submitted(&mut self) {
+        self.end_compaction();
         self.status = AgentStatus::Working;
         self.source = AgentStatusSource::Process;
         self.rule = None;
@@ -122,9 +134,11 @@ impl AgentActivity {
     }
 
     pub fn submitted_text(&mut self, program: &str, text: &str) {
-        // Codex /plan 只切换交互模式，不触发任务 hook；若先制造 Running，
-        // 对话输入会一直等一个不存在的完成事件。普通任务仍保留提交屏障。
-        if program == "codex" && text.trim() == "/plan" {
+        // Local commands are not assistant submissions. Claude's compact hooks
+        // own the phase; ordinary prompts still need the submission barrier.
+        if (program == "codex" && text.trim() == "/plan")
+            || (program == "claude" && text.split_whitespace().next() == Some("/compact"))
+        {
             self.input_sent();
         } else {
             self.submitted();
@@ -141,7 +155,8 @@ impl AgentActivity {
     /// Check ownership before the ordering gate records this event. An ignored
     /// legacy notification must not reopen the gate's already completed stream.
     pub fn accepts_hook(&self, event: &AiHookEvent) -> bool {
-        if self.command_ended && event.kind != AiHookKind::SessionStart {
+        if self.command_ended && (event.kind != AiHookKind::SessionStart || event.session_compacted)
+        {
             return false;
         }
         if event.legacy_attention
@@ -155,15 +170,19 @@ impl AgentActivity {
         if self.native_codex && event.source == "codex" && event.codex_hooks.is_none() {
             return false;
         }
+        if !self.accepts_compaction(event) {
+            return false;
+        }
+        let active_turn = self.compaction.as_ref().map_or(&self.turn_id, |phase| &phase.prompt_id);
         if (event.codex_hooks.is_some()
             || event.source == "claude"
                 && matches!(
                     event.kind,
                     AiHookKind::TurnDone | AiHookKind::NeedsAttention | AiHookKind::ToolComplete
                 ))
-            && self.turn_id.is_some()
+            && active_turn.is_some()
             && event.turn_id.is_some()
-            && self.turn_id != event.turn_id
+            && *active_turn != event.turn_id
             && !matches!(event.kind, AiHookKind::SessionStart | AiHookKind::PromptSubmit)
         {
             return false;
@@ -209,13 +228,96 @@ impl AgentActivity {
                 _ if owner.session.is_some()
                     && event.session_id.is_some()
                     && owner.session != event.session_id
-                    && !(same_process && event.kind == AiHookKind::SessionStart) =>
+                    && !(same_process
+                        && event.kind == AiHookKind::SessionStart
+                        && !event.session_compacted) =>
                 {
                     return false;
                 },
                 _ => {},
             }
         }
+        true
+    }
+
+    fn accepts_compaction(&self, event: &AiHookEvent) -> bool {
+        if event.source != "claude" {
+            return true;
+        }
+        if event.kind == AiHookKind::CompactionStart {
+            if event.compaction_auto
+                && self.hook_seen()
+                && self.turn_observed
+                && (!matches!(self.status, AgentStatus::Working | AgentStatus::Blocked)
+                    || event.turn_id != self.turn_id)
+            {
+                return false;
+            }
+            return self.compaction.is_none()
+                && (event.compaction_auto
+                    || event.turn_id.is_none()
+                    || event.turn_id != self.retired_compaction)
+                && (self.status != AgentStatus::Working
+                    || !self.hook_seen()
+                    || !self.turn_observed
+                    || (event.compaction_auto && event.turn_id == self.turn_id));
+        }
+        if event.kind == AiHookKind::CompactionEnd || event.session_compacted {
+            if let Some(phase) = &self.compaction {
+                return phase.prompt_id == event.turn_id;
+            }
+            return event.session_compacted
+                && (event.turn_id.is_none()
+                    || (event.turn_id != self.retired_compaction
+                        && (self.turn_id.is_none() || event.turn_id == self.turn_id)));
+        }
+        true
+    }
+
+    fn end_compaction(&mut self) -> Option<AgentStatus> {
+        let phase = self.compaction.take()?;
+        self.retired_compaction = phase.prompt_id;
+        Some(phase.resume_status)
+    }
+
+    pub fn compacting(&self) -> bool {
+        self.compaction.is_some()
+    }
+
+    pub fn request_compaction_cancel(&mut self) {
+        if let Some(phase) = &mut self.compaction {
+            phase.cancel_requested = true;
+            self.idle_samples = 0;
+        }
+    }
+
+    pub fn awaiting_compaction_cancel(&self) -> bool {
+        self.compaction.as_ref().is_some_and(|phase| phase.cancel_requested)
+    }
+
+    /// Claude 2.1.294 emits no hook for an Esc-cancelled compact. Only explicit
+    /// owner input followed by idle chrome may retire that phase, never Done.
+    pub fn observe_compaction_cancel(&mut self, detection: Option<Detection>) -> bool {
+        if !self.awaiting_compaction_cancel() {
+            return false;
+        }
+        if !detection
+            .as_ref()
+            .is_some_and(|d| d.agent == AgentKind::Claude && d.status == AgentStatus::Idle)
+        {
+            self.idle_samples = 0;
+            return false;
+        }
+        self.idle_samples = self.idle_samples.saturating_add(1);
+        if self.idle_samples < 2 {
+            return false;
+        }
+        self.end_compaction();
+        self.pending_submit = false;
+        self.screen_armed = false;
+        self.status = AgentStatus::Idle;
+        self.source = AgentStatusSource::Screen;
+        self.rule = Some("compaction_cancelled_after_input".into());
         true
     }
 
@@ -253,10 +355,17 @@ impl AgentActivity {
         if event.remote_process.is_some() && event.bridge_sequence.is_some() {
             self.last_remote_sequence = event.bridge_sequence;
         }
-        if event.turn_id.is_some()
-            || (event.kind == AiHookKind::SessionStart && !event.session_compacted)
+        let compaction_event =
+            matches!(event.kind, AiHookKind::CompactionStart | AiHookKind::CompactionEnd)
+                || event.session_compacted;
+        if !compaction_event
+            && (event.turn_id.is_some()
+                || (event.kind == AiHookKind::SessionStart && !event.session_compacted))
         {
             self.turn_id = event.turn_id.clone();
+        }
+        if !compaction_event {
+            self.end_compaction();
         }
         self.command_ended = false;
         if event.kind == AiHookKind::SessionEnd {
@@ -277,11 +386,31 @@ impl AgentActivity {
         self.source = AgentStatusSource::Hook;
         self.rule = None;
         self.idle_samples = 0;
-        if event.kind != AiHookKind::SessionStart {
+        if event.kind != AiHookKind::SessionStart && !compaction_event {
             self.pending_submit = false;
         }
         self.status = match event.kind {
-            AiHookKind::SessionStart if event.session_compacted => self.status,
+            AiHookKind::SessionStart if event.session_compacted => {
+                self.end_compaction().unwrap_or(self.status)
+            },
+            AiHookKind::CompactionStart => {
+                self.compaction = Some(Compaction {
+                    prompt_id: event.turn_id.clone(),
+                    cancel_requested: false,
+                    resume_status: if self.status == AgentStatus::Blocked
+                        || (event.compaction_auto
+                            && self.turn_observed
+                            && self.status == AgentStatus::Working)
+                    {
+                        self.status
+                    } else {
+                        AgentStatus::Idle
+                    },
+                });
+                self.rule = Some("hook.compaction".into());
+                AgentStatus::Working
+            },
+            AiHookKind::CompactionEnd => self.end_compaction().unwrap_or(self.status),
             AiHookKind::SessionStart => {
                 self.turn_observed = false;
                 AgentStatus::Idle
@@ -352,9 +481,11 @@ impl AgentActivity {
                 if matches!(self.coverage, HookCoverage::Completion | HookCoverage::Turns) {
                     return false;
                 }
-                // Codex returns to the same composer after success, provider
-                // failure and interruption. Without a hook, idle is not Done.
-                if self.turn_observed && detection.agent != AgentKind::Codex {
+                // Claude and Codex show the composer during work as well as
+                // after success, failure or interruption. Idle is not Done.
+                if self.turn_observed
+                    && !matches!(detection.agent, AgentKind::Claude | AgentKind::Codex)
+                {
                     AgentStatus::Done
                 } else {
                     AgentStatus::Idle

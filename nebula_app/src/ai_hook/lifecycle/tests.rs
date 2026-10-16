@@ -26,6 +26,135 @@ fn screen(status: AgentStatus) -> Option<Detection> {
     Some(Detection { agent: AgentKind::Codex, status, rule_id: "test.chrome".into() })
 }
 
+fn claude_turn_event(name: &str, prompt: &str, sequence: u64, trigger: &str) -> AiHookEvent {
+    let payload = serde_json::json!({
+        "hook_event_name": name, "session_id": "compact-session", "prompt_id": prompt,
+        "source": "compact", "trigger": trigger, "bridge_sequence": sequence,
+    });
+    let wire = format!("nebula-hook/1 source=claude process=4100:70\n{payload}");
+    parse_remote_envelope(wire.as_bytes(), Some(1)).expect("supported Claude lifecycle event")
+}
+
+#[test]
+fn claude_compaction_is_a_phase_not_a_new_or_completed_turn() {
+    for trigger in ["manual", "auto"] {
+        let mut activity = AgentActivity::default();
+        assert!(activity.apply_hook(&claude_turn_event("UserPromptSubmit", "task", 1, "")));
+        let (prompt, restored) = if trigger == "manual" {
+            assert!(activity.apply_hook(&claude_turn_event("Stop", "task", 2, "")));
+            ("manual-compact", AgentStatus::Idle)
+        } else {
+            ("task", AgentStatus::Working)
+        };
+        let start = claude_turn_event("PreCompact", prompt, 3, trigger);
+        assert!(activity.apply_hook(&start));
+        assert_eq!(activity.status(), AgentStatus::Working);
+        assert_eq!(activity.turn_id.as_deref(), Some("task"), "no synthetic prompt");
+        assert!(!activity.allows_screen());
+        assert!(!activity.apply_hook(&start), "duplicate start");
+        if trigger == "manual" {
+            assert!(!activity.apply_hook(&claude_turn_event("Stop", "task", 4, "")));
+        }
+        assert!(activity.apply_hook(&claude_turn_event("SessionStart", prompt, 5, "")));
+        assert_eq!(activity.status(), restored);
+        assert_eq!(activity.turn_id.as_deref(), Some("task"));
+        assert!(!activity.apply_hook(&claude_turn_event("PostCompact", prompt, 6, trigger)));
+        assert_eq!(activity.status(), restored, "two end hooks cannot complete a task");
+        assert!(activity.apply_hook(&claude_turn_event("UserPromptSubmit", "continue", 7, "")));
+        for event in [
+            claude_turn_event("Stop", "task", 8, ""),
+            claude_turn_event("SessionStart", prompt, 9, ""),
+            claude_turn_event("PostCompact", prompt, 10, trigger),
+            claude_turn_event("PreCompact", prompt, 11, trigger),
+        ] {
+            assert!(!activity.apply_hook(&event), "old event {:?}", event.kind);
+            assert_eq!(activity.status(), AgentStatus::Working);
+            assert_eq!(activity.turn_id.as_deref(), Some("continue"));
+        }
+    }
+}
+
+#[test]
+fn claude_compaction_failure_and_new_turn_retire_the_old_phase() {
+    for trigger in ["manual", "auto"] {
+        let mut activity = AgentActivity::default();
+        activity.apply_hook(&claude_turn_event("UserPromptSubmit", "task", 1, ""));
+        let prompt = if trigger == "manual" {
+            activity.apply_hook(&claude_turn_event("Stop", "task", 2, ""));
+            "compact"
+        } else {
+            "task"
+        };
+        assert!(activity.apply_hook(&claude_turn_event("PreCompact", prompt, 3, trigger)));
+        assert!(activity.apply_hook(&claude_turn_event("StopFailure", prompt, 4, "")));
+        assert_eq!(activity.status(), AgentStatus::Failed);
+        assert!(!activity.compacting());
+        assert!(activity.apply_hook(&claude_turn_event("UserPromptSubmit", "continue", 5, "")));
+        assert!(!activity.apply_hook(&claude_turn_event("StopFailure", prompt, 6, "")));
+        assert_eq!(activity.status(), AgentStatus::Working);
+    }
+}
+
+#[test]
+fn claude_compaction_cannot_resurrect_after_shell_exit() {
+    let mut activity = AgentActivity::default();
+    activity.apply_hook(&claude_turn_event("UserPromptSubmit", "task", 1, ""));
+    activity.apply_hook(&claude_turn_event("PreCompact", "task", 2, "auto"));
+    activity.command_finished();
+    assert!(!activity.apply_hook(&claude_turn_event("SessionStart", "task", 3, "")));
+    assert!(!activity.hook_seen());
+    assert_eq!(activity.status(), AgentStatus::Unknown);
+}
+
+#[test]
+fn claude_compact_submission_waits_for_the_real_phase_without_a_synthetic_turn() {
+    for command in ["/compact", " /compact keep the constraints "] {
+        let mut activity = AgentActivity::default();
+        activity.apply_hook(&event("claude", "compact-session", "SessionStart"));
+        activity.submitted_text("claude", command);
+        assert_eq!(activity.status(), AgentStatus::Idle);
+        assert!(!activity.pending_submit);
+        assert!(activity.apply_hook(&claude_turn_event("PreCompact", "compact", 1, "manual")));
+        assert_eq!(activity.status(), AgentStatus::Working);
+        assert!(activity.turn_id.is_none());
+        assert!(activity.apply_hook(&claude_turn_event("PostCompact", "compact", 2, "manual")));
+        assert_eq!(activity.status(), AgentStatus::Idle);
+        activity.submitted_text("claude", "/compactly explain this name");
+        assert_eq!(activity.status(), AgentStatus::Working);
+        assert!(activity.pending_submit);
+    }
+}
+
+#[test]
+fn claude_compact_first_hook_does_not_treat_process_start_as_a_running_turn() {
+    for trigger in ["manual", "auto"] {
+        let mut activity = AgentActivity::default();
+        activity.begin_command(true);
+        assert!(activity.apply_hook(&claude_turn_event("PreCompact", "compact", 1, trigger)));
+        assert!(activity.hook_seen());
+        assert_eq!(activity.status(), AgentStatus::Working);
+        assert!(activity.apply_hook(&claude_turn_event("PostCompact", "compact", 2, trigger)));
+        assert_eq!(activity.status(), AgentStatus::Idle);
+    }
+}
+
+#[test]
+fn claude_auto_compact_cannot_reopen_a_finished_or_superseded_turn() {
+    for outcome in ["Stop", "StopFailure"] {
+        let mut activity = AgentActivity::default();
+        assert!(activity.apply_hook(&claude_turn_event("UserPromptSubmit", "task", 1, "")));
+        assert!(activity.apply_hook(&claude_turn_event(outcome, "task", 2, "")));
+        let status = activity.status();
+        assert!(!activity.apply_hook(&claude_turn_event("PreCompact", "task", 3, "auto")));
+        assert_eq!(activity.status(), status);
+        assert!(!activity.compacting());
+        assert!(activity.apply_hook(&claude_turn_event("UserPromptSubmit", "continue", 4, "")));
+        assert!(!activity.apply_hook(&claude_turn_event("PreCompact", "task", 5, "auto")));
+        assert_eq!(activity.status(), AgentStatus::Working);
+        assert!(activity.apply_hook(&claude_turn_event("PreCompact", "continue", 6, "auto")));
+    }
+}
+
 #[test]
 fn complete_hooks_own_every_state_even_when_screen_disagrees() {
     for provider in ["claude", "opencode"] {
@@ -116,6 +245,26 @@ fn codex_capabilities_follow_the_installed_notify_bridge() {
 }
 
 #[test]
+fn claude_screen_idle_is_not_a_success_signal() {
+    for preceding in [AgentStatus::Working, AgentStatus::Blocked] {
+        let mut activity = AgentActivity::default();
+        activity.begin_command(true);
+        let observation = |status| {
+            Some(Detection { agent: AgentKind::Claude, status, rule_id: "prompt_idle".into() })
+        };
+        activity.observe_screen(observation(AgentStatus::Working));
+        activity.observe_screen(observation(preceding));
+        for _ in 0..4 {
+            let previous = activity.status();
+            activity.observe_screen(observation(AgentStatus::Idle));
+            assert_eq!(screen_notification(previous, activity.status(), false), None);
+        }
+        assert_eq!(activity.status(), AgentStatus::Idle);
+        assert!(!activity.hook_seen());
+    }
+}
+
+#[test]
 fn fallback_requires_consecutive_idle_and_work_before_a_completion() {
     for agent in AgentKind::ALL {
         let screen = |status| Some(Detection { agent, status, rule_id: "test.chrome".into() });
@@ -131,7 +280,7 @@ fn fallback_requires_consecutive_idle_and_work_before_a_completion() {
         activity.observe_screen(screen(AgentStatus::Idle));
         assert_eq!(activity.status(), AgentStatus::Working);
         assert!(activity.observe_screen(screen(AgentStatus::Idle)));
-        let (expected, notification) = if agent == AgentKind::Codex {
+        let (expected, notification) = if matches!(agent, AgentKind::Claude | AgentKind::Codex) {
             (AgentStatus::Idle, None)
         } else {
             (AgentStatus::Done, Some(false))
@@ -160,8 +309,11 @@ fn runtime_submission_does_not_finish_on_the_previous_idle_frame() {
         for _ in 0..2 {
             activity.observe_screen(screen(AgentStatus::Idle));
         }
-        let expected =
-            if agent == AgentKind::Codex { AgentStatus::Idle } else { AgentStatus::Done };
+        let expected = if matches!(agent, AgentKind::Claude | AgentKind::Codex) {
+            AgentStatus::Idle
+        } else {
+            AgentStatus::Done
+        };
         assert_eq!(activity.status(), expected, "{agent:?}");
     }
 }

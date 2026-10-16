@@ -123,6 +123,19 @@ pub(super) fn parse_envelope(bytes: &[u8]) -> Option<AiHookEvent> {
         "claude" => match payload.get("hook_event_name").and_then(Value::as_str) {
             Some("SessionStart") => (AiHookKind::SessionStart, None),
             Some("UserPromptSubmit") => (AiHookKind::PromptSubmit, None),
+            Some("PreCompact" | "PostCompact")
+                if matches!(
+                    payload.get("trigger").and_then(Value::as_str),
+                    Some("manual" | "auto")
+                ) =>
+            {
+                let kind = if payload["hook_event_name"] == "PreCompact" {
+                    AiHookKind::CompactionStart
+                } else {
+                    AiHookKind::CompactionEnd
+                };
+                (kind, None)
+            },
             Some("PreToolUse")
                 if payload.get("tool_name").and_then(Value::as_str) == Some("AskUserQuestion") =>
             {
@@ -303,6 +316,7 @@ pub(super) fn parse_envelope(bytes: &[u8]) -> Option<AiHookEvent> {
         turn_id,
         session_compacted: kind == AiHookKind::SessionStart
             && payload.get("source").and_then(Value::as_str) == Some("compact"),
+        compaction_auto: payload.get("trigger").and_then(Value::as_str) == Some("auto"),
         legacy_attention: source == "claude"
             && payload.get("hook_event_name").and_then(Value::as_str) == Some("Notification")
             && context_string(&payload, &["notificationType", "notification_type"]).is_none(),

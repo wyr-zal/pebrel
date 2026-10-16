@@ -939,6 +939,44 @@ fn native_acknowledgements_keep_known_files_when_a_bridge_omits_the_path() {
     }
 }
 
+#[test]
+fn claude_relocated_transcript_requires_matching_native_id_and_filenames() {
+    use super::startup_command::SessionRecovery;
+    let id = "832ce477-f0e1-42d7-a438-32693bb51d6b";
+    for root in ["/home/test/.claude/projects", r"C:\Users\test\.claude\projects"] {
+        let saved = crate::session::AgentSession {
+            source: "claude".into(),
+            session_id: Some(id.into()),
+            session_file: Some(format!("{root}/old/{id}.jsonl")),
+        };
+        let mut recovery = SessionRecovery::default();
+        recovery.target = Some(saved.clone());
+        recovery.awaiting_confirmation = true;
+        let relocated = crate::session::AgentSession {
+            session_file: Some(format!("{root}/new/{id}.jsonl")),
+            ..saved.clone()
+        };
+        for foreign in [
+            crate::session::AgentSession { session_id: None, ..relocated.clone() },
+            crate::session::AgentSession {
+                session_id: Some("another-session".into()),
+                ..relocated.clone()
+            },
+            crate::session::AgentSession {
+                session_file: Some(format!("{root}/new/another-session.jsonl")),
+                ..relocated.clone()
+            },
+            crate::session::AgentSession { source: "codex".into(), ..relocated.clone() },
+        ] {
+            assert!(!recovery.confirm(foreign));
+            assert_eq!(recovery.target, Some(saved.clone()));
+            assert!(recovery.awaiting_confirmation);
+        }
+        assert!(recovery.confirm(relocated.clone()));
+        assert_eq!(recovery.target, Some(relocated));
+    }
+}
+
 #[gpui::test]
 fn cold_resume_normalizes_codex_identity_before_waiting_for_native_confirmation(
     cx: &mut TestAppContext,

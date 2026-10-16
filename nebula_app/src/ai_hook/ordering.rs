@@ -196,9 +196,11 @@ impl AiHookEventGate {
         state.last_received_sequence = state.last_received_sequence.max(event.received_sequence);
         state.last_fingerprint = use_fingerprint.then_some((fingerprint, event.received_at_ms));
         state.lifecycle = match event.kind {
-            AiHookKind::SessionStart | AiHookKind::PromptSubmit | AiHookKind::ToolComplete => {
-                StreamLifecycle::Active
-            },
+            AiHookKind::SessionStart
+            | AiHookKind::PromptSubmit
+            | AiHookKind::ToolComplete
+            | AiHookKind::CompactionStart
+            | AiHookKind::CompactionEnd => StreamLifecycle::Active,
             AiHookKind::TurnDone if event.active_background_tasks() > 0 => StreamLifecycle::Active,
             AiHookKind::TurnDone => StreamLifecycle::Done,
             AiHookKind::NeedsAttention => StreamLifecycle::Blocked,

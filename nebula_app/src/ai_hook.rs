@@ -103,7 +103,7 @@ const HELPER_ARGS: [&str; 1] = ["claude"];
 /// Claude hook events we subscribe to. Session boundaries carry the id needed
 /// for resume/fork; PostToolUse lets a stale permission state return to working
 /// before the whole turn completes.
-const CLAUDE_EVENTS: [&str; 10] = [
+const CLAUDE_EVENTS: [&str; 12] = [
     "SessionStart",
     "UserPromptSubmit",
     "Notification",
@@ -111,6 +111,8 @@ const CLAUDE_EVENTS: [&str; 10] = [
     "PreToolUse",
     "PostToolUse",
     "PostToolUseFailure",
+    "PreCompact",
+    "PostCompact",
     "Stop",
     "StopFailure",
     "SessionEnd",

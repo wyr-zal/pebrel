@@ -935,6 +935,12 @@ fn region<'a>(screen: &'a str, spec: &str) -> &'a str {
     if spec == "whole_recent" {
         return screen;
     }
+    if spec == "claude_activity" {
+        return screen_context::claude_activity_region(region(
+            screen,
+            "bottom_non_empty_lines(16)",
+        ));
+    }
     if let Some(inner) =
         spec.strip_prefix("after_last_prompt_row(").and_then(|s| s.strip_suffix(')'))
     {
@@ -1343,6 +1349,41 @@ mod tests {
                       \x20 ⏸ manual mode on · ? for shortcuts · ← for agents";
         let detection = detect("claude", screen).unwrap();
         assert_eq!(detection.status, AgentStatus::Idle, "rule={}", detection.rule_id);
+    }
+
+    #[test]
+    fn claude_activity_chrome_without_interrupt_hint_is_not_idle() {
+        let composer = "────────\n❯ \n────────\n  ⏵⏵ bypass permissions on · ← for agents";
+        for activity in [
+            "✻ Thinking… (3m 11s · ↓ 122 tokens)",
+            "✢ Compacting conversation… (0s)",
+            "* Waiting for background agents… (1m 4s)",
+            "✽ Working... (2s)\n  ⎿ Tip: Review changes before committing.",
+            "Press up to edit queued messages",
+        ] {
+            let screen = format!("Previous answer.\n\n{activity}\n\n{composer}");
+            assert_eq!(
+                detect("claude", &screen).unwrap().status,
+                AgentStatus::Working,
+                "{activity}"
+            );
+        }
+        for history in [
+            "The log said Compacting conversation… (0s)",
+            "✻ Baked for 15m 24s",
+            "Tasks: 8 completed, 0 remaining",
+            "✻ Thinking… (3m 11s · ↓ 122 tokens)\n\nAnswer completed.",
+            "`✻ Thinking… (3m 11s · ↓ 122 tokens)`",
+        ] {
+            assert_eq!(
+                detect("claude", &format!("{history}\n{composer}")).unwrap().status,
+                AgentStatus::Idle,
+                "historical prose: {history}"
+            );
+        }
+        let draft = "────────\n❯ Explain ✻ Thinking… (3m 11s)\n  Press up to edit queued \
+                     messages\n────────\n? for shortcuts";
+        assert!(!detect("claude", draft).is_some_and(|d| d.status == AgentStatus::Working));
     }
 
     #[test]

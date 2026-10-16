@@ -67,8 +67,8 @@ def process_identity(source):
     return None
 
 
-def open_codex_terminal(identity):
-    """Open only the verified Codex ancestor's interactive PTY, never hook stdout."""
+def open_owner_terminal(identity):
+    """Open only the verified provider ancestor's interactive PTY, never hook stdout."""
     match = re.fullmatch(r"([1-9][0-9]*):([0-9]+)", identity or "")
     if match is None:
         return None
@@ -100,6 +100,47 @@ def open_codex_terminal(identity):
                 os.close(fd)
             except OSError:
                 pass
+
+
+def open_claude_compact_terminal(identity):
+    """Compaction stdout is visible CLI text; require a foreground, pane-bound owner."""
+    match = re.fullmatch(r"([1-9][0-9]*):([0-9]+)", identity or "")
+    if match is None:
+        return None
+    pid, start = match.groups()
+
+    def owned_foreground():
+        raw = Path(f"/proc/{pid}/stat").read_text()
+        fields = raw[raw.rfind(")") + 2:].split()
+        if fields[19] != start or int(fields[2]) <= 0 or fields[2] != fields[5]:
+            return None
+        env = dict(item.split(b"=", 1) for item in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0") if b"=" in item)
+        for key in ("PEBREL_PANE_ID", "PEBREL_PROCESS_ID", "PEBREL_REMOTE_HOOK_TOKEN"):
+            expected = os.environ.get(key)
+            if not expected or env.get(key.encode()) != expected.encode():
+                return None
+        device = int(fields[4]) & 0xffffffff
+        tty_device = os.makedev((device >> 8) & 0xfff, (device & 0xff) | ((device >> 12) & 0xfffff00))
+        return int(fields[2]), tty_device
+
+    fd = None
+    try:
+        foreground = owned_foreground()
+        if foreground is None:
+            return None
+        fd = open_owner_terminal(identity)
+        # Detached hooks get ENOTTY from tcgetpgrp. Compare the opened device
+        # with the owner's kernel-reported controlling TTY instead.
+        if fd is None or owned_foreground() != foreground or os.fstat(fd).st_rdev != foreground[1]:
+            return None
+        terminal_fd = fd
+        fd = None
+        return terminal_fd
+    except (OSError, ValueError, IndexError):
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def bounded_payload(args):
@@ -184,7 +225,7 @@ def send(source, native, mode, payload, token):
         if len(envelope) > MAX_ENVELOPE:
             # Lifecycle must still arrive when a tool or answer is huge. Keep
             # protocol identities and drop content, without inventing a result.
-            keep = ("hook_event_name", "type", "kind", "session_id", "session_file", "transcript_path", "thread-id", "turn_id", "turn-id", "prompt_id", "source", "bridge_instance", "bridge_sequence", "event_id", "notification_type", "permission_mode", "stop_reason", "error", "background_tasks", "agent_id", "agent_type")
+            keep = ("hook_event_name", "type", "kind", "session_id", "session_file", "transcript_path", "thread-id", "turn_id", "turn-id", "prompt_id", "source", "trigger", "bridge_instance", "bridge_sequence", "event_id", "notification_type", "permission_mode", "stop_reason", "error", "background_tasks", "agent_id", "agent_type")
             question_input = payload.get("tool_input") if payload.get("tool_name") in ("request_user_input", "AskUserQuestion") else None
             tool_name = payload.get("tool_name")
             payload = {key: payload[key] for key in keep if key in payload}
@@ -194,18 +235,26 @@ def send(source, native, mode, payload, token):
         if len(envelope) > MAX_ENVELOPE:
             return
         osc = b"\x1b]777;nebula-hook;" + token.encode() + b";" + base64.b64encode(envelope) + b"\x07"
-        write_terminal(osc, source, owner)
+        if source == "claude" and payload.get("hook_event_name") in ("PreCompact", "PostCompact"):
+            write_terminal(osc, source, owner, compact=True)
+        else:
+            write_terminal(osc, source, owner)
 
 
-def write_terminal(osc, source=None, owner=None):
+def write_terminal(osc, source=None, owner=None, compact=False):
     try:
-        fd = os.open("/dev/tty", os.O_WRONLY | os.O_NONBLOCK)
+        if compact:
+            fd = open_claude_compact_terminal(owner)
+            if fd is None:
+                raise OSError(errno.ENXIO, "no verified foreground compaction terminal")
+        else:
+            fd = os.open("/dev/tty", os.O_WRONLY | os.O_NONBLOCK)
     except OSError as error:
         if source == "codex" and error.errno == errno.ENXIO:
-            fd = open_codex_terminal(owner)
+            fd = open_owner_terminal(owner)
             if fd is None:
                 raise
-        elif source == "claude" and error.errno == errno.ENXIO:
+        elif source == "claude" and not compact and error.errno == errno.ENXIO:
             # Claude's hook contract transports this allowlisted OSC through its
             # terminalSequence output. Codex captures detached-hook stdout instead.
             print(json.dumps({"terminalSequence": osc.decode("ascii")}), flush=True)

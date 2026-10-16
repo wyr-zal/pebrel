@@ -15,8 +15,7 @@ any = [
   { contains = ["tab to amend"] },
 ]
 
-# 回合进行中的唯一可靠证据是底栏的「esc to interrupt」：Claude Code 只在
-# 真正可中断（即回合未结束）时打印它，回合一结束整行消失。
+# 旧布局的中断提示仍是工作证据；新布局可能省略它，另查当前输入框上方的活动区。
 #
 # 2026-08-22：这条规则此前要求「盲文点阵 spinner 行」AND「esc to interrupt」
 # ——Gate 是 AND 语义（ai_agents.rs:528），而 Claude Code 的动画符号是
@@ -30,6 +29,23 @@ state = "working"
 priority = 400
 region = "bottom_non_empty_lines(8)"
 contains = ["esc to interrupt"]
+
+[[rules]]
+id = "activity_chrome_working"
+state = "working"
+priority = 450
+region = "claude_activity"
+any = [
+  { regex = ['^[\t ]*[·✢✳✶✻✽*][\t ]+[^\n]*(?:…|\.\.\.)[^\n]*(?:\n[\t ]+[^\n]*)*$'] },
+  { line_regex = ['(?i)^\s*Press up to edit queued messages\s*$'] },
+]
+
+[[rules]]
+id = "queued_input_working"
+state = "working"
+priority = 440
+region = "after_last_horizontal_rule"
+line_regex = ['(?i)^\s*Press up to edit queued messages\s*$']
 
 [[rules]]
 id = "prompt_idle"

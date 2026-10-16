@@ -28,6 +28,22 @@ impl SessionRecovery {
     pub(super) fn accepts(&self, target: &crate::session::AgentSession) -> bool {
         !(self.awaiting_confirmation
             && self.target.as_ref().is_some_and(|expected| {
+                // Claude relocates a resumed transcript when its project cwd
+                // changes. Only the same native ID and matching filenames may
+                // refresh that path; other providers keep their file contract.
+                let relocated_claude = expected.source == "claude"
+                    && expected.session_id.as_ref().is_some_and(|id| {
+                        target.session_id.as_ref() == Some(id)
+                            && [expected.session_file.as_deref(), target.session_file.as_deref()]
+                                .into_iter()
+                                .all(|path| {
+                                    path.is_some_and(|path| {
+                                        crate::session::valid_native_session_file(path)
+                                            && path.rsplit(['/', '\\']).next()
+                                                == Some(format!("{id}.jsonl").as_str())
+                                    })
+                                })
+                    });
                 expected.source != target.source
                     || (!self.choosing_session
                         && ((expected.session_id.is_some()
@@ -35,7 +51,8 @@ impl SessionRecovery {
                             || (expected.session_file.is_some()
                                 && (target.session_file.is_some()
                                     || expected.session_id.is_none())
-                                && expected.session_file != target.session_file)))
+                                && expected.session_file != target.session_file
+                                && !relocated_claude)))
             }))
     }
 

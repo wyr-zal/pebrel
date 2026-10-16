@@ -256,6 +256,83 @@ class RemoteHooksTests(unittest.TestCase):
         self.assertEqual(body["error"], "unknown")
         self.assertNotIn("last_assistant_message", body)
 
+    def test_large_compaction_keeps_trigger_and_prompt_but_not_summary(self):
+        bridge = module("remote_bridge")
+        for event, field in [("PreCompact", "custom_instructions"), ("PostCompact", "compact_summary")]:
+            payload = {"hook_event_name": event, "session_id": "main",
+                       "prompt_id": "compact-prompt", "trigger": "manual", field: "x" * 70000}
+            with patch.object(bridge, "write_terminal") as write:
+                bridge.send("claude", False, "", payload, TOKEN)
+            frame = write.call_args.args[0]
+            encoded = frame.split(b";", 3)[3].removesuffix(b"\x07")
+            body = json.loads(base64.b64decode(encoded).split(b"\n", 1)[1])
+            self.assertEqual(body.get("trigger"), "manual")
+            self.assertEqual(body["prompt_id"], "compact-prompt")
+            self.assertNotIn(field, body)
+
+    def test_compaction_without_tty_uses_foreground_claude_pty_without_stdout(self):
+        import pty
+        provider = self.root / "claude"
+        bridge = ASSETS / "remote_bridge.py"
+        provider.write_text(
+            "import json, subprocess, sys\n"
+            "for event in ['PreCompact', 'PostCompact']:\n"
+            " payload = {'hook_event_name': event, 'session_id': 'fixture', 'prompt_id': 'compact', 'trigger': 'manual'}\n"
+            " result = subprocess.run([sys.executable, sys.argv[1], 'claude'], input=json.dumps(payload), text=True, capture_output=True, start_new_session=True, timeout=5)\n"
+            " assert result.returncode == 0\n"
+            " assert not result.stdout, 'compaction hook JSON must not become visible CLI text'\n"
+            " assert not result.stderr\n"
+        )
+        env = dict(os.environ, PEBREL_PANE_ID="31", PEBREL_PROCESS_ID="32")
+        pid, master = pty.fork()
+        if pid == 0:
+            os.execve(sys.executable, [sys.executable, str(provider), str(bridge)], env)
+        output = b""
+        try:
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                if not select.select([master], [], [], 0.1)[0]:
+                    continue
+                try:
+                    part = os.read(master, 65536)
+                except OSError:
+                    break
+                if not part:
+                    break
+                output += part
+            _, status = os.waitpid(pid, 0)
+            self.assertEqual(status, 0, output.decode(errors="replace"))
+        finally:
+            os.close(master)
+        frames = re.findall(rb"\x1b\]777;nebula-hook;" + TOKEN.encode() + rb";([^\x07]+)\x07", output)
+        self.assertEqual(len(frames), 2)
+        for raw in frames:
+            header, payload = base64.b64decode(raw).split(b"\n", 1)
+            self.assertIn(f"process={pid}:".encode(), header)
+            self.assertEqual(json.loads(payload)["prompt_id"], "compact")
+
+    def test_compaction_rejects_stale_pid_foreign_scope_and_background_owner(self):
+        bridge = module("remote_bridge")
+        fields = ["S", "1", "41", "41", "123", "41"] + ["0"] * 13 + ["70"]
+        good_stat = "41 (claude) " + " ".join(fields)
+        background_stat = good_stat.replace("S 1 41 41 123 41", "S 1 41 41 123 99")
+        stale_stat = good_stat[:-2] + "71"
+        scope = {"PEBREL_PANE_ID": "31", "PEBREL_PROCESS_ID": "32", "PEBREL_REMOTE_HOOK_TOKEN": TOKEN}
+        good_env = b"\0".join(f"{key}={value}".encode() for key, value in scope.items())
+        cases = [(stale_stat, good_env, 123), (background_stat, good_env, 123),
+                 (good_stat, good_env.replace(b"ID=31", b"ID=99"), 123),
+                 (good_stat, good_env.replace(b"ID=32", b"ID=99"), 123),
+                 (good_stat, good_env.replace(TOKEN.encode(), b"f" * 32), 123),
+                 (good_stat, good_env, 999)]
+        with patch.dict(os.environ, scope):
+            for raw, env, device in cases:
+                from types import SimpleNamespace
+                with self.subTest(raw=raw, device=device), patch.object(bridge.Path, "read_text", return_value=raw), patch.object(bridge.Path, "read_bytes", return_value=env), patch.object(bridge, "open_owner_terminal", return_value=42), patch.object(bridge.os, "fstat", return_value=SimpleNamespace(st_rdev=device)), patch.object(bridge.os, "close"):
+                    self.assertIsNone(bridge.open_claude_compact_terminal("41:70"))
+            with patch.object(bridge.Path, "read_text", side_effect=[good_stat, stale_stat]), patch.object(bridge.Path, "read_bytes", return_value=good_env), patch.object(bridge, "open_owner_terminal", return_value=42), patch.object(bridge.os, "close") as close:
+                self.assertIsNone(bridge.open_claude_compact_terminal("41:70"))
+                close.assert_called_once_with(42)
+
     def test_large_pi_events_keep_the_native_file_and_bridge_lifetime(self):
         bridge = module("remote_bridge")
         payload = {"kind": "done", "session_id": "pi-native", "session_file": "/sessions/pi.jsonl",

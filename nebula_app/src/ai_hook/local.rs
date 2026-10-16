@@ -628,6 +628,23 @@ mod generated_hook_tests {
         assert_eq!(install_into(&mut root, HELPER), Some(false));
     }
 
+    #[test]
+    fn claude_compaction_install_preserves_custom_commands() {
+        let custom = json!({"hooks":[{"type":"command","command":"user-compact-hook"}]});
+        let mut root =
+            json!({"hooks":{"PreCompact":[custom.clone()], "PostCompact":[custom.clone()]}});
+        assert_eq!(install_into(&mut root, HELPER), Some(true));
+        for event in ["PreCompact", "PostCompact"] {
+            assert_eq!(root["hooks"][event].as_array().map(Vec::len), Some(2));
+            assert_eq!(root["hooks"][event][0], custom);
+        }
+        assert_eq!(install_into(&mut root, HELPER), Some(false));
+        assert!(super::remove_claude_hooks_from(&mut root));
+        for event in ["PreCompact", "PostCompact"] {
+            assert_eq!(root["hooks"][event], json!([custom.clone()]));
+        }
+    }
+
     /// #80: the command string used to be `"<path>" claude`, and claude
     /// hands hook strings to a shell. PowerShell reads the leading quoted
     /// token as a string expression, so `claude` became an unexpected

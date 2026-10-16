@@ -15,6 +15,73 @@ fn hook(session: &str, name: &str, sequence: u64) -> AiHookEvent {
 }
 
 #[gpui::test]
+fn claude_resume_relocated_transcript_accepts_authenticated_hook_chain(cx: &mut TestAppContext) {
+    use crate::runtime_api::RuntimeTaskState;
+    use base64::Engine as _;
+
+    let (view, window, _) = open(cx);
+    let notifications = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let observed = notifications.clone();
+    let _subscription = view.update(window, |_, cx| {
+        cx.subscribe(&view, move |_, _, event, _| {
+            if let TerminalViewEvent::Notification(notification) = event {
+                observed.borrow_mut().push(notification.clone());
+            }
+        })
+    });
+    view.update(window, |view, cx| {
+        let id = "832ce477-f0e1-42d7-a438-32693bb51d6b";
+        let current_file = format!("/home/test/.claude/projects/-project/{id}.jsonl");
+        view.recovery.target = Some(crate::session::AgentSession {
+            source: "claude".into(),
+            session_id: Some(id.into()),
+            session_file: Some(format!("/home/test/.claude/projects/-old-worktree/{id}.jsonl")),
+        });
+        view.recovery.awaiting_confirmation = true;
+        view.agent_activity.begin_command(true);
+        let (session, _input, mut events, proxy) = session::test_session_with_events();
+        view.session = Some(session);
+        let mut stream = nebula_terminal::event_loop::StreamProcessor::default();
+        let token = "0123456789abcdef0123456789abcdef";
+        stream.set_remote_hook_token(token.into());
+        for (index, (name, state, sidebar)) in [
+            ("SessionStart", RuntimeTaskState::Idle, SidebarActivity::Idle),
+            ("UserPromptSubmit", RuntimeTaskState::Running, SidebarActivity::Running),
+            ("PreToolUse", RuntimeTaskState::Running, SidebarActivity::Running),
+            ("Stop", RuntimeTaskState::Finished, SidebarActivity::Done),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let payload = serde_json::json!({
+                "hook_event_name": name, "session_id": id, "transcript_path": current_file,
+                "source": "resume", "bridge_sequence": index + 1,
+            });
+            let wire = format!("nebula-hook/1 source=claude process=4100:70 pane=999\n{payload}");
+            let encoded = base64::engine::general_purpose::STANDARD.encode(wire);
+            let frame = format!("\x1b]777;nebula-hook;{token};{encoded}\x07");
+            for chunk in frame.as_bytes().chunks(11) {
+                stream.feed(&mut view.session.as_ref().unwrap().term.lock(), &proxy, chunk);
+            }
+            while let Ok(event) = events.try_recv() {
+                view.process_event(event, cx);
+            }
+            assert!(view.agent_activity.hook_seen(), "{name} must survive the recovery gate");
+            assert_eq!(view.agent_activity.source(), AgentStatusSource::Hook);
+            assert_eq!(view.runtime_task_state(), state, "{name}");
+            assert_eq!(view.sidebar_activity(), sidebar, "{name}");
+            assert_eq!(view.ai_session.as_ref().unwrap().session_id, id);
+            assert_eq!(
+                view.recovery.target.as_ref().unwrap().session_file.as_ref(),
+                Some(&current_file)
+            );
+            assert!(!view.recovery_pending());
+        }
+    });
+    assert_eq!(notifications.borrow().len(), 1, "only Stop completes the turn");
+}
+
+#[gpui::test]
 fn pi_redraw_anchor_follows_accepted_hook_and_command_lifecycle(cx: &mut TestAppContext) {
     use nebula_terminal::term::test::TermSize;
     use nebula_terminal::vte::ansi::Processor;
@@ -282,6 +349,119 @@ fn codex_screen_retry_and_idle_do_not_emit_completion(cx: &mut TestAppContext) {
         } else {
             assert!(notes.is_empty(), "{output}: no unverified completion");
         }
+    }
+}
+
+#[gpui::test]
+fn claude_activity_chrome_projects_work_and_idle_without_success(cx: &mut TestAppContext) {
+    use crate::runtime_api::RuntimeTaskState;
+    let (view, window, _) = open(cx);
+    let notifications = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let observed = notifications.clone();
+    let _subscription = view.update(window, |_, cx| {
+        cx.subscribe(&view, move |_, _, event, _| {
+            if let TerminalViewEvent::Notification(notification) = event {
+                observed.borrow_mut().push(notification.clone());
+            }
+        })
+    });
+    view.update(window, |view, cx| {
+        view.running_program = Some("claude".into());
+        view.command_running = true;
+        view.agent_activity.begin_command(true);
+        let composer = "────────\n❯ \n────────\n? for shortcuts";
+        for activity in ["✻ Thinking… (3m 11s · ↓ 122 tokens)", "✢ Compacting conversation… (1s)"]
+        {
+            screen(view, &format!("{activity}\n\n{composer}"));
+            for _ in 0..4 {
+                view.refresh_agent_screen_state(cx);
+            }
+            assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running);
+            assert_eq!(view.sidebar_activity(), SidebarActivity::Running);
+            screen(view, &format!("✻ Baked for 15m 24s\n{composer}"));
+            for _ in 0..4 {
+                view.refresh_agent_screen_state(cx);
+            }
+            assert_eq!(view.runtime_task_state(), RuntimeTaskState::Idle);
+            assert_eq!(view.sidebar_activity(), SidebarActivity::Idle);
+            assert!(!view.agent_activity.hook_seen());
+        }
+    });
+    assert!(notifications.borrow().is_empty());
+}
+
+#[gpui::test]
+fn claude_compaction_cancel_requires_own_input_and_current_idle_chrome(cx: &mut TestAppContext) {
+    use crate::runtime_api::RuntimeTaskState;
+    for (index, keyboard_mode) in ["", "\x1b[>1u", "\x1b[?9001h"].into_iter().enumerate() {
+        let (view, window, input) = open(cx);
+        view.update(window, |view, cx| {
+            let event = |name: &str, prompt: &str, sequence: u64| {
+                let payload = serde_json::json!({
+                    "hook_event_name": name, "session_id": format!("compact-cancel-{index}"),
+                    "prompt_id": prompt, "bridge_sequence": sequence, "trigger": "manual",
+                });
+                crate::ai_hook::parse_remote_envelope(
+                    format!("nebula-hook/1 source=claude process=4100:70\n{payload}").as_bytes(),
+                    Some(42),
+                )
+                .unwrap()
+            };
+            assert!(view.handle_ai_hook(&event("SessionStart", "", 1), cx));
+            assert!(view.handle_ai_hook(&event("PreCompact", "compact", 2), cx));
+            let composer = "────────\n❯ /compact\n────────\n? for shortcuts";
+            screen(view, composer);
+            for _ in 0..4 {
+                view.refresh_agent_screen_state(cx);
+            }
+            assert_eq!(
+                view.runtime_task_state(),
+                RuntimeTaskState::Running,
+                "idle text alone has no authority"
+            );
+            view.write_input(b"\x1b[A".to_vec(), cx);
+            for _ in 0..4 {
+                view.refresh_agent_screen_state(cx);
+            }
+            assert_eq!(
+                view.runtime_task_state(),
+                RuntimeTaskState::Running,
+                "arrow is not cancellation"
+            );
+            screen(view, &format!("✢ Compacting conversation… (2s)\n\n{composer}"));
+            feed(view, keyboard_mode.as_bytes());
+            let escape = super::super::keymap::encode(
+                &gpui::Keystroke::parse("escape").unwrap(),
+                &view.term_mode(),
+            )
+            .unwrap();
+            view.write_input(escape.clone(), cx);
+            for _ in 0..4 {
+                view.refresh_agent_screen_state(cx);
+            }
+            assert_eq!(
+                view.runtime_task_state(),
+                RuntimeTaskState::Running,
+                "input is intent until the CLI leaves work"
+            );
+            screen(view, composer);
+            for _ in 0..4 {
+                view.refresh_agent_screen_state(cx);
+            }
+            assert_eq!(view.runtime_task_state(), RuntimeTaskState::Idle);
+            assert_eq!(view.sidebar_activity(), SidebarActivity::Idle);
+            assert!(view.agent_activity.hook_seen());
+            assert!(!view.agent_activity.allows_screen(), "no general screen override");
+            assert!(
+                input.try_iter().any(
+                    |message| matches!(message, Msg::Input(bytes) if bytes.as_ref() == escape)
+                )
+            );
+            assert!(view.handle_ai_hook(&event("UserPromptSubmit", "continue", 3), cx));
+            view.handle_ai_hook(&event("PostCompact", "compact", 4), cx);
+            view.handle_ai_hook(&event("Stop", "compact", 5), cx);
+            assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running);
+        });
     }
 }
 

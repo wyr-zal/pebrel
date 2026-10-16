@@ -38,6 +38,40 @@ pub(super) fn attention_region(agent: AgentKind, screen: &str) -> &str {
     &screen[start..]
 }
 
+/// Only the final activity block above the current boxed Claude composer.
+/// Drafts, old prompt frames and quoted status rows are not activity chrome.
+pub(super) fn claude_activity_region(screen: &str) -> &str {
+    let horizontal = |line: &str| {
+        let row = line.trim();
+        row.chars().count() >= 3 && row.chars().all(|c| c == '─')
+    };
+    let (mut offset, mut previous_start, mut previous_rule, mut end) = (0, 0, false, None);
+    for line in screen.split_inclusive('\n') {
+        if previous_rule
+            && line
+                .trim_start()
+                .strip_prefix('❯')
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+            && screen[offset + line.len()..].lines().any(horizontal)
+        {
+            end = Some(previous_start);
+        }
+        previous_rule = horizontal(line);
+        previous_start = offset;
+        offset += line.len();
+    }
+    let Some(end) = end else { return "" };
+    let activity = screen[..end].trim_end();
+    let (mut offset, mut start) = (0, 0);
+    for line in activity.split_inclusive('\n') {
+        offset += line.len();
+        if line.trim().is_empty() {
+            start = offset;
+        }
+    }
+    &activity[start..]
+}
+
 fn content_row(row: &str) -> &str {
     row.trim().trim_matches(['│', '┃']).trim()
 }
