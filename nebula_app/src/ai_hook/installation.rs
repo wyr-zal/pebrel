@@ -70,7 +70,12 @@ pub(crate) fn codex_groups(
         let mut handler = json!({
             "type": "command",
             "command": command,
-            "timeout": CODEX_HOOK_TIMEOUT_SECONDS,
+            // Codex caps shutdown/cancellation hooks at three seconds.
+            "timeout": if matches!(event, "Interrupt" | "SessionEnd") {
+                3
+            } else {
+                CODEX_HOOK_TIMEOUT_SECONDS
+            },
         });
         if let Some(windows) = windows_command {
             handler["commandWindows"] = json!(windows);
@@ -210,7 +215,38 @@ mod tests {
         );
         for event in CODEX_FULL_EVENTS {
             let hook = &groups[*event][0]["hooks"][0];
-            assert_eq!(hook["timeout"], json!(8), "{event}");
+            let expected = if matches!(*event, "Interrupt" | "SessionEnd") { 3 } else { 8 };
+            assert_eq!(hook["timeout"], json!(expected), "{event}");
+        }
+    }
+
+    #[test]
+    fn short_deadline_upgrade_migrates_owned_hooks_and_preserves_custom_groups() {
+        let desired = codex_groups("helper", Some("windows-helper"), CodexHookMode::Full);
+        let mut previous = desired.clone();
+        for event in ["Interrupt", "SessionEnd"] {
+            previous[event][0]["hooks"][0]["timeout"] = json!(8);
+        }
+        let foreign = json!({"hooks":[{"type":"command","command":"user-helper","timeout":2}]});
+        let mut original = json!({"description":"keep","hooks":previous.clone()});
+        original["hooks"]["Interrupt"].as_array_mut().unwrap().push(foreign.clone());
+        let (raw, marker) =
+            merge_groups(Some(&original.to_string()), Some(&previous.to_string()), &desired)
+                .unwrap();
+        let upgraded: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(upgraded["description"], "keep");
+        assert_eq!(upgraded["hooks"]["Interrupt"], json!([foreign, desired["Interrupt"][0]]));
+        assert_eq!(upgraded["hooks"]["SessionEnd"], desired["SessionEnd"]);
+        assert_eq!(serde_json::from_str::<Value>(&marker).unwrap(), desired);
+        assert_eq!(merge_groups(Some(&raw), Some(&marker), &desired).unwrap(), (raw, marker));
+
+        for event in ["Interrupt", "SessionEnd"] {
+            let mut edited = original.clone();
+            edited["hooks"][event][0]["hooks"][0]["timeout"] = json!(7);
+            let error =
+                merge_groups(Some(&edited.to_string()), Some(&previous.to_string()), &desired)
+                    .unwrap_err();
+            assert_eq!(error, format!("edited {event} hook preserved"));
         }
     }
 
