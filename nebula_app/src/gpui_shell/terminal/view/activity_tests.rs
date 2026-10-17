@@ -14,6 +14,102 @@ fn hook(session: &str, name: &str, sequence: u64) -> AiHookEvent {
     crate::ai_hook::parse_remote_envelope(wire.as_bytes(), Some(42)).unwrap()
 }
 
+#[cfg(windows)]
+#[gpui::test]
+fn wsl_hook_from_a_previous_pty_generation_has_no_effect(cx: &mut TestAppContext) {
+    let (view, window, _) = open(cx);
+    view.update(window, |view, cx| {
+        let (session, _) = session::test_session();
+        view.session = Some(session);
+        let wire = b"nebula-hook/1 source=claude process=20:200\n{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"retired\",\"bridge_sequence\":1}";
+        view.process_event(super::super::event_mailbox::SessionEvent::WslHook {
+            generation: "retired".into(), envelope: wire.to_vec(),
+        }, cx);
+        assert!(!view.agent_activity.hook_seen(), "retired WSL event must not claim the pane");
+        assert!(view.ai_session.is_none());
+    });
+}
+
+#[cfg(windows)]
+#[gpui::test]
+fn wsl_hook_codex_failure_notifies_once_and_rejects_closed_generation(cx: &mut TestAppContext) {
+    use crate::platform::wsl_hooks::channel::{Channel, PIPE_ENV, TOKEN_ENV};
+    use crate::runtime_api::RuntimeTaskState;
+    let (view, window, _) = open(cx);
+    let notifications = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let observed = notifications.clone();
+    let _subscription = view.update(window, |_, cx| {
+        cx.subscribe(&view, move |_, _, event, _| {
+            if let TerminalViewEvent::Notification(note) = event {
+                observed.borrow_mut().push(note.clone());
+            }
+        })
+    });
+    view.update(window, |view, cx| {
+        let mut options = nebula_terminal::tty::Options::default();
+        options.shell = Some(nebula_terminal::tty::Shell::new("wsl.exe".into(), vec!["--distribution".into(), "fixture".into()]));
+        let generation = format!(r"\\.\pipe\pebrel-wsl-hook-failure-{}", crate::ai_hook::remote::new_token().unwrap());
+        options.env.extend([(PIPE_ENV.into(), generation.clone()), (TOKEN_ENV.into(), "a".repeat(32)),
+            (crate::ai_hook::PANE_ENV.into(), "42".into()), (crate::agent_env::PROCESS_ENV.into(), "900".into())]);
+        let (mut session, _) = session::test_session();
+        session.wsl_hook = Channel::start(&options, |_, _| true).unwrap();
+        view.session = Some(session);
+        let start = crate::ai_hook::parse_remote_envelope(b"nebula-hook/1 source=codex process=20:200 codex_hooks=full\n{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"main\",\"turn_id\":\"first\",\"bridge_sequence\":1}", Some(42)).unwrap();
+        view.handle_ai_hook(&start, cx);
+        let target = view.agent_activity.codex_failure_target().unwrap();
+        view.apply_wsl_codex_failure("old-generation", &target, "temporary failure".into(), cx);
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running);
+        view.apply_wsl_codex_failure(&generation, &target, "temporary failure".into(), cx);
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Failed);
+        view.apply_wsl_codex_failure(&generation, &target, "duplicate".into(), cx);
+        view.agent_activity.begin_command(true);
+        view.handle_ai_hook(&start, cx);
+        view.shutdown();
+        view.apply_wsl_codex_failure(&generation, &target, "late".into(), cx);
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running);
+    });
+    let notes = notifications.borrow();
+    assert_eq!(notes.len(), 1);
+    assert!(matches!(
+        &notes[0],
+        crate::notify::Notification::AiTurnIssue {
+            outcome: crate::ai_hook::AiTurnOutcome::Failed,
+            ..
+        }
+    ));
+}
+
+#[cfg(windows)]
+#[gpui::test]
+fn wsl_hook_uses_authenticated_events_and_rejects_osc_forgery_and_shutdown(
+    cx: &mut TestAppContext,
+) {
+    use super::super::event_mailbox::SessionEvent;
+    use crate::platform::wsl_hooks::channel::{Channel, PIPE_ENV, TOKEN_ENV};
+    let (view, window, _) = open(cx);
+    view.update(window, |view, cx| {
+        let mut options = nebula_terminal::tty::Options::default();
+        options.shell = Some(nebula_terminal::tty::Shell::new("wsl.exe".into(), vec!["--distribution".into(), "fixture".into()]));
+        let generation = format!(r"\\.\pipe\pebrel-wsl-hook-test-{}", crate::ai_hook::remote::new_token().unwrap());
+        options.env.extend([(PIPE_ENV.into(), generation.clone()), (TOKEN_ENV.into(), "a".repeat(32)),
+            (crate::ai_hook::PANE_ENV.into(), "42".into()), (crate::agent_env::PROCESS_ENV.into(), "900".into())]);
+        let (mut session, _) = session::test_session();
+        session.wsl_hook = Channel::start(&options, |_, _| true).unwrap();
+        view.session = Some(session);
+        let wire = |event: &str, sequence: u64| format!("nebula-hook/1 source=claude process=20:200\n{{\"hook_event_name\":\"{event}\",\"session_id\":\"authenticated\",\"bridge_sequence\":{sequence}}}").into_bytes();
+        view.process_event(TermEvent::AiHookEnvelope(wire("UserPromptSubmit", 999)), cx);
+        assert!(!view.agent_activity.hook_seen(), "OSC cannot bypass host owner validation");
+        for (index, (event, status)) in [("SessionStart", AgentStatus::Idle), ("UserPromptSubmit", AgentStatus::Working), ("Stop", AgentStatus::Done)].into_iter().enumerate() {
+            view.process_event(SessionEvent::WslHook { generation: generation.clone(), envelope: wire(event, index as u64 + 1) }, cx);
+            assert!(view.agent_activity.hook_seen());
+            assert_eq!(view.agent_activity.status(), status);
+        }
+        view.shutdown();
+        view.process_event(SessionEvent::WslHook { generation, envelope: wire("UserPromptSubmit", 4) }, cx);
+        assert_eq!(view.agent_activity.status(), AgentStatus::Done, "shutdown revokes queued events");
+    });
+}
+
 #[gpui::test]
 fn claude_resume_relocated_transcript_accepts_authenticated_hook_chain(cx: &mut TestAppContext) {
     use crate::runtime_api::RuntimeTaskState;
@@ -388,6 +484,122 @@ fn claude_activity_chrome_projects_work_and_idle_without_success(cx: &mut TestAp
         }
     });
     assert!(notifications.borrow().is_empty());
+}
+
+#[gpui::test]
+fn wsl_hook_claude_turn_cancel_requires_own_escape_and_current_idle(cx: &mut TestAppContext) {
+    use crate::runtime_api::RuntimeTaskState;
+    let (view, window, input) = open(cx);
+    let notifications = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let observed = notifications.clone();
+    let _subscription = view.update(window, |_, cx| {
+        cx.subscribe(&view, move |_, _, event, _| {
+            if let TerminalViewEvent::Notification(note) = event {
+                observed.borrow_mut().push(note.clone());
+            }
+        })
+    });
+    view.update(window, |view, cx| {
+        let event = |name: &str, prompt: &str, sequence: u64| {
+            let payload = serde_json::json!({"hook_event_name": name, "session_id": "turn-cancel",
+                "prompt_id": prompt, "bridge_sequence": sequence});
+            crate::ai_hook::parse_remote_envelope(
+                format!("nebula-hook/1 source=claude process=4100:70\n{payload}").as_bytes(),
+                Some(42),
+            )
+            .unwrap()
+        };
+        assert!(view.handle_ai_hook(&event("UserPromptSubmit", "first", 1), cx));
+        let composer = "────────\n❯ Please wait.\n────────\n? for shortcuts";
+        screen(view, composer);
+        for _ in 0..4 {
+            view.refresh_agent_screen_state(cx);
+        }
+        assert_eq!(
+            view.runtime_task_state(),
+            RuntimeTaskState::Running,
+            "idle alone cannot cancel"
+        );
+        view.write_input(b"\x1b[A".to_vec(), cx);
+        for _ in 0..4 {
+            view.refresh_agent_screen_state(cx);
+        }
+        assert_eq!(
+            view.runtime_task_state(),
+            RuntimeTaskState::Running,
+            "arrow is not cancellation"
+        );
+        screen(view, &format!("✻ Thinking… (2s)\n\n{composer}"));
+        view.write_input(b"\x1b".to_vec(), cx);
+        for _ in 0..4 {
+            view.refresh_agent_screen_state(cx);
+        }
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running, "wait for CLI idle");
+        screen(view, composer);
+        for _ in 0..4 {
+            view.refresh_agent_screen_state(cx);
+        }
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Idle);
+        assert_eq!(view.sidebar_activity(), SidebarActivity::Idle);
+        assert!(!view.agent_activity.allows_screen());
+        for (index, name) in ["Stop", "PostToolUse", "PermissionRequest"].into_iter().enumerate() {
+            let late = event(name, "first", index as u64 + 2);
+            assert!(!view.agent_activity.accepts_hook(&late));
+            view.handle_ai_hook(&late, cx);
+            assert_eq!(view.runtime_task_state(), RuntimeTaskState::Idle);
+        }
+        view.agent_activity.submitted();
+        assert!(
+            !view.agent_activity.accepts_hook(&event("Stop", "first", 5)),
+            "local submission cannot revive a cancelled turn"
+        );
+        assert!(view.handle_ai_hook(&event("UserPromptSubmit", "second", 5), cx));
+        view.write_input(b"\x1b".to_vec(), cx);
+        assert!(view.handle_ai_hook(&event("UserPromptSubmit", "third", 6), cx));
+        for _ in 0..4 {
+            view.refresh_agent_screen_state(cx);
+        }
+        assert_eq!(
+            view.runtime_task_state(),
+            RuntimeTaskState::Running,
+            "new prompt retires cancel intent"
+        );
+        assert!(
+            input
+                .try_iter()
+                .any(|message| matches!(message, Msg::Input(bytes) if bytes.as_ref() == b"\x1b"))
+        );
+    });
+    assert!(notifications.borrow().is_empty(), "cancellation is not success or failure");
+}
+
+#[gpui::test]
+fn wsl_hook_claude_cancel_preserves_chrome_rows_after_a_full_width_redraw(cx: &mut TestAppContext) {
+    use crate::runtime_api::RuntimeTaskState;
+    use nebula_terminal::grid::Dimensions as _;
+    use nebula_terminal::index::{Column, Line};
+    use nebula_terminal::term::cell::Flags;
+    let (view, window, _) = open(cx);
+    view.update(window, |view, cx| {
+        let payload = serde_json::json!({"hook_event_name":"PreCompact", "session_id":"wrapped-cancel",
+            "prompt_id":"compact", "trigger":"manual", "bridge_sequence":1});
+        let event = crate::ai_hook::parse_remote_envelope(
+            format!("nebula-hook/1 source=claude process=4100:70\n{payload}").as_bytes(), Some(42)
+        ).unwrap();
+        assert!(view.handle_ai_hook(&event, cx));
+        let columns = view.session.as_ref().unwrap().term.lock().columns();
+        let rule = "─".repeat(columns);
+        screen(view, &format!("{rule}\n❯ /compact\n{rule}\n  ⏵⏵ auto mode on"));
+        {
+            let mut term = view.session.as_ref().unwrap().term.lock();
+            for row in [0, 2] {
+                term.grid_mut()[Line(row)][Column(columns - 1)].flags.insert(Flags::WRAPLINE);
+            }
+        }
+        view.write_input(b"\x1b".to_vec(), cx);
+        for _ in 0..4 { view.refresh_agent_screen_state(cx); }
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Idle, "visual rows remain separate even when copy text joins wrapped lines");
+    });
 }
 
 #[gpui::test]

@@ -26,6 +26,43 @@ fn screen(status: AgentStatus) -> Option<Detection> {
     Some(Detection { agent: AgentKind::Codex, status, rule_id: "test.chrome".into() })
 }
 
+#[test]
+fn wsl_hook_codex_rollout_failure_is_bound_to_current_turn_and_cannot_become_done() {
+    let event = |name: &str, turn: &str, sequence: u64| {
+        parse_remote_envelope(format!("nebula-hook/1 source=codex process=20:200 codex_hooks=full\n{{\"hook_event_name\":\"{name}\",\"session_id\":\"session\",\"turn_id\":\"{turn}\",\"bridge_sequence\":{sequence}}}").as_bytes(), Some(1)).unwrap()
+    };
+    let mut activity = AgentActivity::default();
+    assert!(activity.codex_failure_target().is_none());
+    activity.apply_hook(&event("UserPromptSubmit", "first", 1));
+    let target = activity.codex_failure_target().unwrap();
+    for field in ["session", "turn", "process"] {
+        let mut foreign = target.clone();
+        match field {
+            "session" => foreign.session = "foreign".into(),
+            "turn" => foreign.turn = "old".into(),
+            _ => foreign.process = "20:201".into(),
+        }
+        assert!(!activity.observe_codex_failure(&foreign));
+    }
+    assert!(activity.observe_codex_failure(&target));
+    assert_eq!(activity.status(), AgentStatus::Failed);
+    assert!(!activity.observe_codex_failure(&target));
+    for name in ["Stop", "PostToolUse", "PermissionRequest"] {
+        assert!(!activity.accepts_hook(&event(name, "first", 2)));
+    }
+    activity.submitted();
+    assert!(activity.codex_failure_target().is_none(), "local input cannot bind a new turn");
+    assert!(!activity.accepts_hook(&event("Stop", "first", 2)));
+    activity.apply_hook(&event("UserPromptSubmit", "second", 3));
+    assert!(!activity.observe_codex_failure(&target), "old async results cannot end the new turn");
+    assert_eq!(activity.status(), AgentStatus::Working);
+    activity.apply_hook(&event("Stop", "second", 4));
+    assert_eq!(activity.status(), AgentStatus::Done);
+    assert!(!activity.observe_codex_failure(&target));
+    activity.command_finished();
+    assert!(activity.codex_failure_target().is_none());
+}
+
 fn claude_turn_event(name: &str, prompt: &str, sequence: u64, trigger: &str) -> AiHookEvent {
     let payload = serde_json::json!({
         "hook_event_name": name, "session_id": "compact-session", "prompt_id": prompt,

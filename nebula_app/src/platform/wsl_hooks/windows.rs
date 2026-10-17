@@ -1,8 +1,8 @@
 //! WSL transport for the shared POSIX hook installer. No provider policy here.
 //!
 //! A guest has its own home and executable search path. Windows hook files and
-//! Windows PIDs cannot stand in for either. Delivery uses the pane's existing
-//! authenticated OSC protocol, with a fresh token for every PTY.
+//! Windows PIDs cannot stand in for either. Claude/Codex use a per-PTY
+//! authenticated pipe; the other POSIX integrations retain their OSC channel.
 
 use std::collections::HashMap;
 use std::io::{Read as _, Seek as _, Write as _};
@@ -118,7 +118,12 @@ impl Target {
 /// the caller checks the local preference and prepares the pane environment.
 pub(crate) fn prepare(options: &mut tty::Options) {
     let Some(target) = options.shell.as_ref().and_then(Target::from_shell) else { return };
-    if nebula_settings::RawSettings::load().bool_on("ai_hooks") == Some(false) {
+    let enabled = nebula_settings::RawSettings::load().bool_on("ai_hooks") != Some(false);
+    #[cfg(feature = "gpui-shell")]
+    if let Err(error) = super::channel::prepare(options, enabled) {
+        log::warn!("ai_hook: WSL pipe preparation unavailable: {error}");
+    }
+    if !enabled {
         return;
     }
     let token = match remote::new_token() {

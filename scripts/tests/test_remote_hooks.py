@@ -26,6 +26,79 @@ def module(name):
 
 @unittest.skipUnless(os.name == "posix", "remote adapter targets POSIX SSH hosts")
 class RemoteHooksTests(unittest.TestCase):
+    def test_wsl_hook_transport_uses_helper_stdin_without_terminal_output(self):
+        import io
+        bridge = module("remote_bridge")
+        payload = {"hook_event_name": "PostCompact", "session_id": "fixture",
+                   "prompt_id": "compact", "trigger": "manual", "compact_summary": "x" * 24000}
+        helper = self.root / "helper"
+        helper.write_text("#!/usr/bin/python3\nimport sys\nfrom pathlib import Path\n"
+                          "Path(__file__).with_suffix('.wire').write_bytes(sys.stdin.buffer.read())\n")
+        helper.chmod(0o700)
+        output = io.StringIO()
+        env = {"PEBREL_WSL_HOOK_PIPE": "fixture-pipe", "PEBREL_WSL_HOOK_TOKEN": TOKEN,
+               "PEBREL_HOOK_EXE": str(helper), "WSLENV": "USER_VALUE/p"}
+        with patch.dict(os.environ, env), patch.object(bridge, "process_identity", return_value="41:70"), patch.object(bridge, "write_terminal") as terminal, patch.object(bridge.sys, "stdout", output):
+            bridge.send("claude", False, "", payload, TOKEN)
+            self.assertFalse(terminal.called, "WSL hook must not write to the terminal")
+        wire = helper.with_suffix(".wire").read_bytes()
+        prefix, envelope = wire.split(b"\n", 1)
+        self.assertEqual(prefix, b"pebrel-wsl-hook/1 token=" + TOKEN.encode())
+        header, body = envelope.split(b"\n", 1)
+        self.assertIn(b"source=claude process=41:70", header)
+        self.assertEqual(json.loads(body)["compact_summary"], payload["compact_summary"])
+        self.assertNotIn(b"\x1b", wire)
+        self.assertEqual(output.getvalue(), "")
+
+    def test_wsl_hook_unavailable_never_falls_back_and_preserves_notifier(self):
+        import io
+        bridge = module("remote_bridge")
+        env = {"PEBREL_WSL_HOOK_PIPE": "fixture", "PEBREL_WSL_HOOK_TOKEN": TOKEN,
+               "PEBREL_HOOK_EXE": "/missing/helper"}
+        with patch.dict(os.environ, env), patch.object(bridge, "write_terminal") as terminal, patch.object(bridge.subprocess, "run", side_effect=OSError("missing helper")), patch.object(bridge.subprocess, "Popen") as notifier:
+            with self.assertRaises(OSError):
+                bridge.run(["codex", "--chain", "original-notifier", '{}'])
+            self.assertFalse(terminal.called, "transport failure must not write OSC")
+            notifier.assert_called_once()
+
+    def test_wsl_hook_preserves_wslenv_but_overrides_pipe_direction(self):
+        bridge = module("remote_bridge")
+        env = {"PEBREL_WSL_HOOK_PIPE": "fixture", "PEBREL_WSL_HOOK_TOKEN": TOKEN,
+               "PEBREL_HOOK_EXE": "/fixture/helper", "WSLENV": "USER_VALUE/p:PEBREL_WSL_HOOK_PIPE/p"}
+        with patch.dict(os.environ, env), patch.object(bridge.subprocess, "run") as helper:
+            bridge.write_wsl_hook(b"fixture")
+            self.assertEqual(helper.call_args.kwargs["env"]["WSLENV"], "USER_VALUE/p:PEBREL_WSL_HOOK_PIPE/w")
+            self.assertNotIn(TOKEN, repr(helper.call_args.args))
+
+    def test_wsl_hook_concurrent_events_wait_for_authenticated_delivery(self):
+        import threading
+        bridge = module("remote_bridge")
+        helper = self.root / "slow-helper"
+        helper.write_text("#!/usr/bin/python3\nimport json, sys, time\nfrom pathlib import Path\n"
+                          "wire=sys.stdin.buffer.read()\ntime.sleep(0.45)\n"
+                          "sequence=json.loads(wire.split(b'\\n',2)[2])['bridge_sequence']\n"
+                          "Path(str(Path(__file__))+str(sequence)).write_bytes(wire)\n")
+        helper.chmod(0o700)
+        errors = []
+        def deliver():
+            try:
+                bridge.send("claude", False, "", {"hook_event_name":"Stop", "session_id":"fixture"}, TOKEN)
+            except Exception as error:
+                errors.append(type(error).__name__)
+        env = {"PEBREL_WSL_HOOK_PIPE":"fixture", "PEBREL_WSL_HOOK_TOKEN":TOKEN, "PEBREL_HOOK_EXE":str(helper)}
+        with patch.dict(os.environ, env), patch.object(bridge, "process_identity", return_value="41:70"), patch.object(bridge, "write_terminal") as terminal:
+            first = threading.Thread(target=deliver)
+            second = threading.Thread(target=deliver)
+            first.start()
+            time.sleep(0.03)
+            second.start()
+            first.join(3)
+            second.join(3)
+            self.assertFalse(first.is_alive() or second.is_alive())
+            self.assertFalse(errors, f"concurrent lifecycle event lost: {errors}")
+            self.assertFalse(terminal.called)
+        self.assertEqual(len(list(self.root.glob("slow-helper[12]"))), 2)
+
     def test_claude_without_controlling_tty_returns_terminal_sequence(self):
         import errno
         import io

@@ -1,5 +1,7 @@
 //! Guest hook setup is a Windows transport capability. Provider policy stays in ai_hook.
 #[cfg(windows)]
+pub(crate) mod channel;
+#[cfg(windows)]
 mod windows;
 #[cfg(windows)]
 pub(crate) use windows::{prepare, setup_cli};

@@ -148,6 +148,71 @@ impl TerminalView {
         self.screen_error_indicator
     }
 
+    #[cfg(windows)]
+    fn probe_wsl_codex_failure(&mut self, screen: &str, cx: &mut Context<Self>) {
+        // Chrome only wakes a bounded probe; its text cannot end a hook-owned
+        // turn. The process's open rollout must prove the exact terminal error.
+        if self.codex_failure_probe.is_some()
+            || self
+                .last_codex_failure_probe
+                .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(2))
+            || !screen.lines().any(|line| line.trim_start().starts_with('■'))
+        {
+            return;
+        }
+        let Some(target) = self.agent_activity.codex_failure_target() else { return };
+        let Some(probe) = self
+            .session
+            .as_ref()
+            .and_then(|session| session.wsl_hook.as_ref())
+            .and_then(|channel| channel.failure_probe())
+        else {
+            return;
+        };
+        self.last_codex_failure_probe = Some(std::time::Instant::now());
+        let generation = probe.generation.clone();
+        let expected = target.clone();
+        let work = cx.background_executor().spawn(async move { probe.run(&expected) });
+        self.codex_failure_probe = Some(cx.spawn(async move |this, cx| {
+            let failure = work.await;
+            let _ = this.update(cx, |view, cx| {
+                view.codex_failure_probe = None;
+                if let Some(message) = failure {
+                    view.apply_wsl_codex_failure(&generation, &target, message, cx);
+                }
+            });
+        }));
+    }
+
+    #[cfg(windows)]
+    pub(super) fn apply_wsl_codex_failure(
+        &mut self,
+        generation: &str,
+        target: &crate::ai_hook::lifecycle::CodexFailureTarget,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.exited.is_some()
+            || self.running_program.as_deref() != Some("codex")
+            || !self
+                .session
+                .as_ref()
+                .and_then(|session| session.wsl_hook.as_ref())
+                .is_some_and(|channel| channel.accepts(generation))
+            || !self.agent_activity.observe_codex_failure(target)
+        {
+            return;
+        }
+        self.confirmation.observe_waiting(false);
+        cx.emit(TerminalViewEvent::Notification(crate::notify::Notification::AiTurnIssue {
+            program: "codex".into(),
+            message: Some(message),
+            outcome: crate::ai_hook::AiTurnOutcome::Failed,
+        }));
+        cx.emit(TerminalViewEvent::TitleChanged);
+        cx.notify();
+    }
+
     pub(super) fn set_screen_error_indicator(&mut self, visible: bool, cx: &mut Context<Self>) {
         if self.screen_error_indicator == visible {
             return;
@@ -204,9 +269,24 @@ impl TerminalView {
                     });
                 let screen = (allows_screen || screen_observation_enabled).then(|| {
                     let start = Point::new(Line((lines - lines.min(24)) as i32), Column(0));
-                    let end =
-                        Point::new(Line(lines as i32 - 1), Column(columns.saturating_sub(1)));
-                    term.bounds_to_string(start, end)
+                    let end = Point::new(Line(lines as i32 - 1), Column(columns.saturating_sub(1)));
+                    if self.agent_activity.awaiting_cancel() {
+                        // Copy text joins soft wraps. Cancellation needs the
+                        // visual composer rows after a full-width TUI redraw.
+                        let mut screen = String::new();
+                        for row in start.line.0..=end.line.0 {
+                            if row > start.line.0 {
+                                screen.push('\n');
+                            }
+                            screen.push_str(&term.bounds_to_string(
+                                Point::new(Line(row), Column(0)),
+                                Point::new(Line(row), end.column),
+                            ));
+                        }
+                        screen
+                    } else {
+                        term.bounds_to_string(start, end)
+                    }
                 });
                 (prompt_restored, screen)
             }
@@ -241,15 +321,16 @@ impl TerminalView {
             })
         });
         self.set_screen_error_indicator(screen_error_visible, cx);
+        #[cfg(windows)]
+        self.probe_wsl_codex_failure(&screen, cx);
         if let Some(program) = retry_source.as_deref() {
             self.schedule_auto_continue_screen_failure(program, &screen, cx);
         }
         if !allows_screen {
-            if self.agent_activity.awaiting_compaction_cancel()
-                && self
-                    .agent_activity
-                    .observe_compaction_cancel(crate::ai_agents::detect("claude", &screen))
+            if self.agent_activity.awaiting_cancel()
+                && self.agent_activity.observe_cancel(crate::ai_agents::detect("claude", &screen))
             {
+                self.confirmation.observe_waiting(false);
                 cx.emit(TerminalViewEvent::TitleChanged);
                 cx.notify();
             }

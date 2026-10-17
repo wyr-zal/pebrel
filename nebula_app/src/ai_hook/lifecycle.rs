@@ -29,7 +29,13 @@ struct Owner {
 struct Compaction {
     prompt_id: Option<String>,
     resume_status: AgentStatus,
-    cancel_requested: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexFailureTarget {
+    pub session: String,
+    pub turn: String,
+    pub process: String,
 }
 
 /// Owns status and arbitration. Adapters may submit facts but cannot set fields.
@@ -52,6 +58,9 @@ pub(crate) struct AgentActivity {
     last_remote_sequence: Option<u64>,
     compaction: Option<Compaction>,
     retired_compaction: Option<String>,
+    cancel_requested: bool,
+    turn_cancelled: bool,
+    retired_codex_failure: Option<CodexFailureTarget>,
 }
 
 impl Default for AgentActivity {
@@ -72,6 +81,9 @@ impl Default for AgentActivity {
             last_remote_sequence: None,
             compaction: None,
             retired_compaction: None,
+            cancel_requested: false,
+            turn_cancelled: false,
+            retired_codex_failure: None,
         }
     }
 }
@@ -94,6 +106,37 @@ impl AgentActivity {
     }
     pub fn allows_screen(&self) -> bool {
         !self.command_ended && self.coverage != HookCoverage::Lifecycle
+    }
+
+    pub fn codex_failure_target(&self) -> Option<CodexFailureTarget> {
+        if self.command_ended
+            || !self.native_codex
+            || self.pending_submit
+            || self.status != AgentStatus::Working
+        {
+            return None;
+        }
+        let owner = self.owner.as_ref().filter(|owner| owner.source == "codex")?;
+        let target = CodexFailureTarget {
+            session: owner.session.clone()?,
+            turn: self.turn_id.clone()?,
+            process: owner.remote_process.clone()?,
+        };
+        (self.retired_codex_failure.as_ref() != Some(&target)).then_some(target)
+    }
+
+    /// An authenticated process's structured terminal error can fill a missing
+    /// Codex end hook. A screen phrase or local submission has no such authority.
+    pub fn observe_codex_failure(&mut self, target: &CodexFailureTarget) -> bool {
+        if self.codex_failure_target().as_ref() != Some(target) {
+            return false;
+        }
+        self.retired_codex_failure = Some(target.clone());
+        self.status = AgentStatus::Failed;
+        self.source = AgentStatusSource::Process;
+        self.rule = Some("codex.rollout.task_complete.error".into());
+        self.screen_armed = false;
+        true
     }
 
     pub fn reset(&mut self) {
@@ -148,6 +191,7 @@ impl AgentActivity {
     /// Physical Enter alone can also dismiss a menu. It only permits observing a
     /// new turn; it is not itself a successful submission or a completion.
     pub fn input_sent(&mut self) {
+        self.cancel_requested = false;
         self.screen_armed = true;
         self.idle_samples = 0;
     }
@@ -171,6 +215,26 @@ impl AgentActivity {
             return false;
         }
         if !self.accepts_compaction(event) {
+            return false;
+        }
+        if event.source == "codex"
+            && self.retired_codex_failure.as_ref().is_some_and(|target| {
+                event.turn_id.as_ref().is_none_or(|turn| turn == &target.turn)
+            })
+            && matches!(
+                event.kind,
+                AiHookKind::TurnDone | AiHookKind::ToolComplete | AiHookKind::NeedsAttention
+            )
+        {
+            return false;
+        }
+        if self.turn_cancelled
+            && matches!(
+                event.kind,
+                AiHookKind::TurnDone | AiHookKind::ToolComplete | AiHookKind::NeedsAttention
+            )
+            && (event.turn_id.is_none() || event.turn_id == self.turn_id)
+        {
             return false;
         }
         let active_turn = self.compaction.as_ref().map_or(&self.turn_id, |phase| &phase.prompt_id);
@@ -276,6 +340,7 @@ impl AgentActivity {
 
     fn end_compaction(&mut self) -> Option<AgentStatus> {
         let phase = self.compaction.take()?;
+        self.cancel_requested = false;
         self.retired_compaction = phase.prompt_id;
         Some(phase.resume_status)
     }
@@ -284,21 +349,28 @@ impl AgentActivity {
         self.compaction.is_some()
     }
 
-    pub fn request_compaction_cancel(&mut self) {
-        if let Some(phase) = &mut self.compaction {
-            phase.cancel_requested = true;
+    pub fn request_cancel(&mut self) {
+        if self.compacting()
+            || (self.owner.as_ref().is_some_and(|owner| owner.source == "claude")
+                && self.hook_seen()
+                && self.turn_observed
+                && !self.pending_submit
+                && self.rule.is_none()
+                && matches!(self.status, AgentStatus::Working | AgentStatus::Blocked))
+        {
+            self.cancel_requested = true;
             self.idle_samples = 0;
         }
     }
 
-    pub fn awaiting_compaction_cancel(&self) -> bool {
-        self.compaction.as_ref().is_some_and(|phase| phase.cancel_requested)
+    pub fn awaiting_cancel(&self) -> bool {
+        self.cancel_requested
     }
 
-    /// Claude 2.1.294 emits no hook for an Esc-cancelled compact. Only explicit
-    /// owner input followed by idle chrome may retire that phase, never Done.
-    pub fn observe_compaction_cancel(&mut self, detection: Option<Detection>) -> bool {
-        if !self.awaiting_compaction_cancel() {
+    /// Claude can omit an end hook on Esc. Explicit owner input and current
+    /// idle chrome may retire that phase or turn, never report success.
+    pub fn observe_cancel(&mut self, detection: Option<Detection>) -> bool {
+        if !self.awaiting_cancel() {
             return false;
         }
         if !detection
@@ -312,12 +384,22 @@ impl AgentActivity {
         if self.idle_samples < 2 {
             return false;
         }
+        let compacting = self.compacting();
         self.end_compaction();
+        self.cancel_requested = false;
+        self.turn_cancelled |= !compacting;
         self.pending_submit = false;
         self.screen_armed = false;
         self.status = AgentStatus::Idle;
         self.source = AgentStatusSource::Screen;
-        self.rule = Some("compaction_cancelled_after_input".into());
+        self.rule = Some(
+            if compacting {
+                "compaction_cancelled_after_input"
+            } else {
+                "turn_cancelled_after_input"
+            }
+            .into(),
+        );
         true
     }
 
@@ -351,6 +433,17 @@ impl AgentActivity {
             return false;
         }
         self.record_owner(event);
+        if matches!(
+            event.kind,
+            AiHookKind::SessionStart | AiHookKind::PromptSubmit | AiHookKind::TurnDone
+        ) {
+            self.cancel_requested = false;
+        }
+        if event.kind == AiHookKind::PromptSubmit
+            || (event.kind == AiHookKind::SessionStart && !event.session_compacted)
+        {
+            self.turn_cancelled = false;
+        }
         self.native_codex |= event.codex_hooks.is_some();
         if event.remote_process.is_some() && event.bridge_sequence.is_some() {
             self.last_remote_sequence = event.bridge_sequence;
@@ -394,9 +487,9 @@ impl AgentActivity {
                 self.end_compaction().unwrap_or(self.status)
             },
             AiHookKind::CompactionStart => {
+                self.cancel_requested = false;
                 self.compaction = Some(Compaction {
                     prompt_id: event.turn_id.clone(),
-                    cancel_requested: false,
                     resume_status: if self.status == AgentStatus::Blocked
                         || (event.compaction_auto
                             && self.turn_observed

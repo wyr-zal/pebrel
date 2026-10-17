@@ -160,7 +160,7 @@ def bounded_payload(args):
 
 
 @contextmanager
-def stream_state(token, identity):
+def stream_state(token, identity, delivery_deadline=None):
     root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "pebrel/hooks"
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     if any(parent.is_symlink() for parent in [root, *root.parents]):
@@ -182,12 +182,11 @@ def stream_state(token, identity):
                     pass
             if count >= MAX_STREAM_FILES - 2:
                 raise ValueError("hook cache is full")
-    # Serialize every writer to this terminal, including child Agent processes.
-    # Sequence identity remains per process; two OSC frames must never interleave.
+    # Serialize hook sequences and delivery. This lock cannot serialize TUI output.
     lock_name = hashlib.sha256((token + ":channel").encode()).hexdigest()
     lock_fd = os.open(root / lock_name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     with os.fdopen(lock_fd, "a+b") as lock:
-        deadline = time.monotonic() + 0.3
+        deadline = delivery_deadline if delivery_deadline is not None else time.monotonic() + 0.3
         while True:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -203,8 +202,10 @@ def stream_state(token, identity):
 
 
 def send(source, native, mode, payload, token):
+    wsl_channel = source in ("claude", "codex") and any(key in os.environ for key in ("PEBREL_WSL_HOOK_PIPE", "PEBREL_WSL_HOOK_TOKEN"))
+    delivery_deadline = time.monotonic() + 2 if wsl_channel else None
     owner = process_identity(source)
-    with stream_state(token, owner or source) as state:
+    with stream_state(token, owner or source, delivery_deadline) as state:
         state.seek(0)
         previous = state.read(32)
         sequence = int(previous or b"0") + 1
@@ -234,11 +235,31 @@ def send(source, native, mode, payload, token):
             envelope = header.encode() + b"\n" + json.dumps(payload, separators=(",", ":")).encode()
         if len(envelope) > MAX_ENVELOPE:
             return
+        if wsl_channel:
+            write_wsl_hook(envelope, delivery_deadline)
+            return
         osc = b"\x1b]777;nebula-hook;" + token.encode() + b";" + base64.b64encode(envelope) + b"\x07"
         if source == "claude" and payload.get("hook_event_name") in ("PreCompact", "PostCompact"):
             write_terminal(osc, source, owner, compact=True)
         else:
             write_terminal(osc, source, owner)
+
+
+def write_wsl_hook(envelope, delivery_deadline=None):
+    pipe = os.environ.get("PEBREL_WSL_HOOK_PIPE", "")
+    token = os.environ.get("PEBREL_WSL_HOOK_TOKEN", "")
+    helper = os.environ.get("PEBREL_HOOK_EXE", "")
+    if not pipe or not helper or not re.fullmatch(r"[a-fA-F0-9]{32}", token):
+        return
+    remaining = 2 if delivery_deadline is None else delivery_deadline - time.monotonic()
+    if remaining <= 0:
+        return
+    env = os.environ.copy()
+    entries = [entry for entry in env.get("WSLENV", "").split(":") if entry and entry.split("/", 1)[0] != "PEBREL_WSL_HOOK_PIPE"]
+    env["WSLENV"] = ":".join([*entries, "PEBREL_WSL_HOOK_PIPE/w"])
+    wire = b"pebrel-wsl-hook/1 token=" + token.encode() + b"\n" + envelope
+    subprocess.run([helper, "--wsl-hook"], input=wire, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=remaining, env=env, check=False)
 
 
 def write_terminal(osc, source=None, owner=None, compact=False):

@@ -21,7 +21,9 @@ pub(super) fn attach(
                 }
             }
             let full_batch = batch.len() == 128;
-            let done = batch.iter().any(|e| matches!(e, TermEvent::Exit));
+            let done = batch.iter().any(|e| {
+                matches!(e, super::event_mailbox::SessionEvent::Terminal(TermEvent::Exit))
+            });
             if this
                 .update(cx, |view: &mut TerminalView, cx| {
                     for event in batch {

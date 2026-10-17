@@ -309,6 +309,10 @@ impl TerminalView {
             active_run: None,
             last_run: None,
             agent_activity: Default::default(),
+            #[cfg(windows)]
+            codex_failure_probe: None,
+            #[cfg(windows)]
+            last_codex_failure_probe: None,
             auto_continue: Default::default(),
             auto_continue_task: None,
             screen_error_indicator: false,

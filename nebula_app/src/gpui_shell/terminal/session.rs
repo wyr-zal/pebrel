@@ -67,6 +67,8 @@ impl Dimensions for GridSize {
 }
 
 pub struct TerminalSession {
+    #[cfg(windows)]
+    pub(super) wsl_hook: Option<crate::platform::wsl_hooks::channel::Channel>,
     pub term: Arc<FairMutex<Term<EventProxy>>>,
     pub notifier: Notifier,
     pub(super) native_prompt: super::event_mailbox::NativePromptState,
@@ -74,6 +76,33 @@ pub struct TerminalSession {
     /// SSH 没有本地 shell 进程，固定为 0。
     pub shell_pid: u32,
     pub(super) remote_reader: Arc<std::sync::Mutex<Option<crate::ssh_session::TranscriptReader>>>,
+}
+
+impl TerminalSession {
+    pub(super) fn cancel_remote_hooks(&self) {
+        #[cfg(windows)]
+        if let Some(channel) = &self.wsl_hook {
+            channel.cancel();
+        }
+    }
+
+    pub(super) fn accepts_remote_hook(&self, bytes: &[u8]) -> bool {
+        #[cfg(windows)]
+        {
+            if self.wsl_hook.is_some() {
+                let header = bytes.split(|byte| *byte == b'\n').next().unwrap_or_default();
+                if std::str::from_utf8(header).is_ok_and(|header| {
+                    header
+                        .split_whitespace()
+                        .any(|field| matches!(field, "source=claude" | "source=codex"))
+                }) {
+                    return false;
+                }
+            }
+        }
+        let _ = bytes;
+        true
+    }
 }
 
 #[cfg(all(test, feature = "gpui-test-support"))]
@@ -98,6 +127,8 @@ pub(super) fn test_session_with_events() -> (
     let (sender, receiver) = nebula_terminal::event_loop::EventLoopSender::standalone().unwrap();
     (
         TerminalSession {
+            #[cfg(windows)]
+            wsl_hook: None,
             term: Arc::new(FairMutex::new(term)),
             notifier: Notifier(sender),
             native_prompt: proxy.events.native_prompt.clone(),
@@ -175,6 +206,21 @@ pub fn spawn(
     };
     let term = Arc::new(FairMutex::new(Term::new(term_config, &grid, proxy.clone())));
 
+    #[cfg(windows)]
+    let wsl_hook = {
+        let events = proxy.events.clone();
+        match crate::platform::wsl_hooks::channel::Channel::start(
+            &options,
+            move |generation, bytes| events.send_wsl_hook(generation, bytes),
+        ) {
+            Ok(channel) => channel,
+            Err(error) => {
+                log::warn!("ai_hook: WSL pipe unavailable: {error}");
+                None
+            },
+        }
+    };
+
     tty::setup_env();
     let pty = tty::new(&options, window_size, 0)?;
     let shell_pid = pty.child_pid().unwrap_or(0);
@@ -192,7 +238,19 @@ pub fn spawn(
     let notifier = Notifier(event_loop.channel());
     let _io_thread = event_loop.spawn();
 
-    Ok((TerminalSession { term, notifier, native_prompt, shell_pid, remote_reader }, rx, stage_rx))
+    Ok((
+        TerminalSession {
+            term,
+            notifier,
+            native_prompt,
+            shell_pid,
+            remote_reader,
+            #[cfg(windows)]
+            wsl_hook,
+        },
+        rx,
+        stage_rx,
+    ))
 }
 
 /// 启动一个 SSH 直连会话（russh，与旧壳 `create_ssh_pane` 同一业务层）：
@@ -226,6 +284,8 @@ pub fn spawn_ssh(
 
     Ok((
         TerminalSession {
+            #[cfg(windows)]
+            wsl_hook: None,
             term,
             notifier: Notifier(sender),
             native_prompt,

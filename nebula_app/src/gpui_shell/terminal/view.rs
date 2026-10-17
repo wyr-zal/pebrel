@@ -335,6 +335,10 @@ pub struct TerminalView {
     last_run: Option<crate::runtime_api::RuntimeRunOutcome>,
     /// Shared lifecycle owns hook authority, session scope and fallback evidence.
     agent_activity: crate::ai_hook::lifecycle::AgentActivity,
+    #[cfg(windows)]
+    codex_failure_probe: Option<gpui::Task<()>>,
+    #[cfg(windows)]
+    last_codex_failure_probe: Option<std::time::Instant>,
     auto_continue: crate::ai_hook::auto_continue::AutoContinue,
     auto_continue_task: Option<gpui::Task<()>>,
     screen_error_indicator: bool,
@@ -560,7 +564,27 @@ impl TerminalView {
         }
     }
 
-    pub(super) fn process_event(&mut self, event: TermEvent, cx: &mut Context<Self>) {
+    pub(super) fn process_event(
+        &mut self,
+        event: impl Into<super::event_mailbox::SessionEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        let event = match event.into() {
+            super::event_mailbox::SessionEvent::Terminal(event) => event,
+            #[cfg(windows)]
+            super::event_mailbox::SessionEvent::WslHook { generation, envelope } => {
+                if self
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.wsl_hook.as_ref())
+                    .is_some_and(|channel| channel.accepts(&generation))
+                    && let Some(hook) = crate::ai_hook::parse_remote_envelope(&envelope, None)
+                {
+                    self.handle_ai_hook(&hook, cx);
+                }
+                return;
+            },
+        };
         let cwd_changed = cwd_report::apply(&mut self.cwd, &event);
         // Both shell metadata channels update completion and directory history.
         if cwd_changed
@@ -698,9 +722,15 @@ impl TerminalView {
                 }
             },
             TermEvent::AiHookEnvelope(envelope) => {
-                // SSH/WSL pane 里的 agent 靠私有 OSC 把 hook 信封带回本地（原生本地
-                // agent 走 workspace 的 ai_events 通道）。信封在 event_loop 里
-                // 已核过通道令牌，这里解析出来喂进同一个应用路径。
+                if !self
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.accepts_remote_hook(&envelope))
+                {
+                    return;
+                }
+                // SSH and legacy POSIX OSC authenticate in the terminal reader.
+                // WSL Claude/Codex enter only through SessionEvent::WslHook.
                 //
                 // hook 自报客户端名（claude/codex），是**程序身份的权威来源**
                 // ——比 OSC 133 的命令行嗅探准，后者漏掉包装启动和没有 shell
@@ -744,6 +774,9 @@ impl TerminalView {
 
     /// `Exited` 只对宿主发一次；重复的退出信号（ChildExit 之后必然跟 Exit）只更新文案。
     fn mark_exited(&mut self, message: String, cx: &mut Context<Self>) {
+        if let Some(session) = &self.session {
+            session.cancel_remote_hooks();
+        }
         self.port_forward_task = None;
         self.port_forwards.clear();
         self.confirmation.invalidate();
@@ -760,6 +793,7 @@ impl TerminalView {
     /// 让 EventLoop 退出并回收 ConPTY/子进程。幂等：重复调用只会得到发送失败。
     pub fn shutdown(&self) {
         if let Some(session) = &self.session {
+            session.cancel_remote_hooks();
             let _ = session.notifier.0.send(Msg::Shutdown);
         }
     }
@@ -772,7 +806,7 @@ impl TerminalView {
 
     /// 输入后回到底部并请求重绘。
     fn write_input(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
-        if self.session.is_some() && self.agent_activity.compacting() {
+        if self.session.is_some() && self.running_program.as_deref() == Some("claude") {
             let escape = gpui::Keystroke::parse("escape").expect("constant key");
             let physical_escape = super::keymap::encode(&escape, &self.term_mode());
             if physical_escape.as_deref() == Some(bytes.as_slice())
@@ -784,7 +818,7 @@ impl TerminalView {
                     )
                     .is_ok_and(|encoded| encoded == bytes)
             {
-                self.agent_activity.request_compaction_cancel();
+                self.agent_activity.request_cancel();
             }
         }
         self.cancel_auto_continue();

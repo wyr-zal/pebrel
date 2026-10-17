@@ -8,9 +8,24 @@ use std::task::{Context, Poll};
 use futures::{Stream, channel::mpsc};
 use nebula_terminal::event::Event;
 
+pub(super) enum SessionEvent {
+    Terminal(Event),
+    #[cfg(windows)]
+    WslHook {
+        generation: String,
+        envelope: Vec<u8>,
+    },
+}
+
+impl From<Event> for SessionEvent {
+    fn from(event: Event) -> Self {
+        Self::Terminal(event)
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct EventSender {
-    sender: mpsc::UnboundedSender<Event>,
+    sender: mpsc::UnboundedSender<SessionEvent>,
     wake_pending: Arc<AtomicBool>,
     pub(super) native_prompt: NativePromptState,
 }
@@ -27,7 +42,7 @@ pub(super) struct NativePrompt {
 }
 
 pub(super) struct EventReceiver {
-    receiver: mpsc::UnboundedReceiver<Event>,
+    receiver: mpsc::UnboundedReceiver<SessionEvent>,
     wake_pending: Arc<AtomicBool>,
 }
 
@@ -116,6 +131,11 @@ impl NativePromptState {
 }
 
 impl EventSender {
+    #[cfg(windows)]
+    pub(super) fn send_wsl_hook(&self, generation: String, envelope: Vec<u8>) -> bool {
+        self.sender.unbounded_send(SessionEvent::WslHook { generation, envelope }).is_ok()
+    }
+
     pub(super) fn send(&self, event: Event) {
         if matches!(&event, Event::UserVar { name, value }
             if name == "pebrel_cmd_prompt" && value == "1")
@@ -126,22 +146,22 @@ impl EventSender {
         if wake && self.wake_pending.swap(true, Ordering::AcqRel) {
             return;
         }
-        if self.sender.unbounded_send(event).is_err() && wake {
+        if self.sender.unbounded_send(event.into()).is_err() && wake {
             self.wake_pending.store(false, Ordering::Release);
         }
     }
 }
 
 impl EventReceiver {
-    fn acknowledge(&self, event: &Event) {
-        if matches!(event, Event::Wakeup) {
+    fn acknowledge(&self, event: &SessionEvent) {
+        if matches!(event, SessionEvent::Terminal(Event::Wakeup)) {
             // Clear before processing: output arriving during UI work must
             // still enqueue a subsequent repaint, even on an inactive tab.
             self.wake_pending.store(false, Ordering::Release);
         }
     }
 
-    pub(super) fn try_recv(&mut self) -> Result<Event, mpsc::TryRecvError> {
+    pub(super) fn try_recv(&mut self) -> Result<SessionEvent, mpsc::TryRecvError> {
         let event = self.receiver.try_recv()?;
         self.acknowledge(&event);
         Ok(event)
@@ -149,8 +169,8 @@ impl EventReceiver {
 }
 
 impl Stream for EventReceiver {
-    type Item = Event;
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Event>> {
+    type Item = SessionEvent;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<SessionEvent>> {
         let result = Pin::new(&mut self.receiver).poll_next(cx);
         if let Poll::Ready(Some(event)) = &result {
             self.acknowledge(event);
@@ -162,6 +182,26 @@ impl Stream for EventReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn wsl_hook_queue_reports_whether_authenticated_input_was_enqueued() {
+        let (sender, mut receiver) = channel();
+        assert!(sender.send_wsl_hook("active".into(), b"envelope".to_vec()));
+        assert!(
+            matches!(receiver.try_recv().unwrap(), SessionEvent::WslHook { generation, .. } if generation == "active")
+        );
+        drop(receiver);
+        assert!(!sender.send_wsl_hook("active".into(), b"late".to_vec()));
+    }
+
+    fn terminal(receiver: &mut EventReceiver) -> Event {
+        match receiver.try_recv().unwrap() {
+            SessionEvent::Terminal(event) => event,
+            #[cfg(windows)]
+            _ => panic!("unexpected hook channel"),
+        }
+    }
 
     #[test]
     fn line_editor_controls_keep_the_prompt_but_submissions_and_interrupts_end_it() {
@@ -195,21 +235,18 @@ mod tests {
             sender.send(Event::CommandDone { exit_code: Some(0) });
         }
         for (id, (sender, receiver)) in sessions.iter_mut().enumerate() {
-            assert!(matches!(receiver.try_recv().unwrap(), Event::CommandStart));
-            assert!(matches!(receiver.try_recv().unwrap(), Event::Wakeup));
+            assert!(matches!(terminal(receiver), Event::CommandStart));
+            assert!(matches!(terminal(receiver), Event::Wakeup));
             for edge in ["working", "attention", "done"] {
-                let Event::AiHookEnvelope(bytes) = receiver.try_recv().unwrap() else {
+                let Event::AiHookEnvelope(bytes) = terminal(receiver) else {
                     panic!("lost agent edge")
                 };
                 assert_eq!(bytes, format!("{edge}:{id}").into_bytes());
             }
-            assert!(matches!(
-                receiver.try_recv().unwrap(),
-                Event::CommandDone { exit_code: Some(0) }
-            ));
+            assert!(matches!(terminal(receiver), Event::CommandDone { exit_code: Some(0) }));
             assert!(receiver.try_recv().is_err());
             sender.send(Event::Wakeup);
-            assert!(matches!(receiver.try_recv().unwrap(), Event::Wakeup));
+            assert!(matches!(terminal(receiver), Event::Wakeup));
         }
     }
 
@@ -219,8 +256,8 @@ mod tests {
         sender.send(Event::Wakeup);
         sender.clone().send(Event::Wakeup);
         sender.send(Event::Exit);
-        assert!(matches!(receiver.try_recv().unwrap(), Event::Wakeup));
-        assert!(matches!(receiver.try_recv().unwrap(), Event::Exit));
+        assert!(matches!(terminal(&mut receiver), Event::Wakeup));
+        assert!(matches!(terminal(&mut receiver), Event::Exit));
         assert!(receiver.try_recv().is_err());
     }
 }

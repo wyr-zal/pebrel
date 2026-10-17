@@ -42,6 +42,9 @@
 
 use std::io::{Read, Write};
 
+mod wsl_hook;
+use wsl_hook::valid_wsl_hook;
+
 const MAX_PAYLOAD_BYTES: usize = 1 << 20;
 const FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -255,6 +258,17 @@ fn envelope(source: &str, pane: &str, contract: &str, payload: &[u8]) -> Vec<u8>
 }
 
 fn run(args: &[String]) {
+    if args.len() == 1 && args[0] == "--wsl-hook" {
+        if let Ok(Some(wire)) = read_payload(std::io::stdin().lock()) {
+            let outcome = if valid_wsl_hook(&wire) && wsl_hook::forward(&wire).is_ok() {
+                Outcome::Sent
+            } else {
+                Outcome::PipeUnavailable
+            };
+            log_outcome("wsl-hook", "", wire.len(), &outcome);
+        }
+        return;
+    }
     let Some(source) = args.first().filter(|s| known_source(s)) else {
         return;
     };
@@ -380,6 +394,16 @@ fn base64_encode(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{FOREIGN_HOOK_RUNNERS, Outcome, base64_encode, foreign_hook_runner, outcome_line};
+
+    #[test]
+    fn wsl_hook_requires_its_narrow_wire_contract() {
+        let wire = b"pebrel-wsl-hook/1 token=0123456789abcdef0123456789abcdef\nnebula-hook/1 source=claude process=41:70\n{}";
+        assert!(super::valid_wsl_hook(wire));
+        for invalid in [b"nebula-hook/1 source=claude pane=1\n{}".as_slice(), b"pebrel-wsl-hook/1 token=bad\nnebula-hook/1 source=claude process=41:70\n{}", b"pebrel-wsl-hook/1 token=0123456789abcdef0123456789abcdef\nnebula-hook/1 source=pi process=41:70\n{}"] {
+            assert!(!super::valid_wsl_hook(invalid));
+        }
+        assert!(!super::valid_wsl_hook(&vec![b'x'; 65537]));
+    }
 
     #[test]
     fn environment_migration_retains_scope_and_prefers_current_names() {
