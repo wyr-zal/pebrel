@@ -153,23 +153,16 @@ impl TerminalView {
 
     #[cfg(windows)]
     fn probe_wsl_codex_terminal(&mut self, screen: &str, cx: &mut Context<Self>) {
-        // Chrome only wakes a bounded probe; its text cannot end a hook-owned
-        // turn. The process's open rollout must prove the exact terminal record.
+        // The tail-only terminal record is a positive result, not a readiness
+        // oracle: while it has no terminal event, an already working turn stays
+        // working. Only the composer's idle-looking chrome wakes the probe.
         let Some(target) = self.agent_activity.codex_failure_target() else { return };
-        let idle_chrome = crate::ai_agents::codex_idle_chrome_complete(screen);
-        if idle_chrome
-            && self.agent_activity.mark_status_unconfirmed(
-                crate::ai_agents::AgentStatusUncertainty::AwaitingTerminalEvidence,
-            )
-        {
-            cx.emit(TerminalViewEvent::TitleChanged);
-            cx.notify();
-        }
+        let wake_probe = crate::ai_agents::codex_idle_chrome_complete(screen);
         if self.codex_failure_probe.is_some()
             || self
                 .last_codex_failure_probe
                 .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(2))
-            || !(screen.lines().any(|line| line.trim_start().starts_with('■')) || idle_chrome)
+            || !(screen.lines().any(|line| line.trim_start().starts_with('■')) || wake_probe)
         {
             return;
         }
