@@ -214,6 +214,14 @@ impl SettingsPane {
             window,
             cx,
         );
+        // 取值顺序与 localization.rs 的 accept 标签序锁步（右方向键/Tab/两者）。
+        add_select(
+            "accept",
+            &["right", "tab", "both"],
+            runtime.accept.settings_value(),
+            window,
+            cx,
+        );
         add_select(
             "background_media_kind",
             nebula_settings::BackgroundMediaKind::VALUES,

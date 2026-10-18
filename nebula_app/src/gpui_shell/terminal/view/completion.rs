@@ -8,6 +8,7 @@ impl TerminalView {
     pub(super) fn handle_completion_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
         use crate::display::CompletionStyle;
         let hybrid = self.completion_style == CompletionStyle::Hybrid;
+        let accept = self.accept_key;
         if key == "escape"
             && (hybrid && self.suggest.completion_popup_requested
                 || self.completion_editor.is_querying())
@@ -52,6 +53,7 @@ impl TerminalView {
             }
         }
         if key == "tab"
+            && accept.accepts_tab()
             && self.ghost_enabled
             && (self.completion_style != CompletionStyle::Inline
                 || self.suggest.suggestion.is_empty())
@@ -60,6 +62,7 @@ impl TerminalView {
             return true;
         }
         if key == "tab"
+            && accept.accepts_tab()
             && hybrid
             && self.ghost_enabled
             && (self.suggest_anchor.is_some() && !self.suggest.screen_line.is_empty()
@@ -78,7 +81,13 @@ impl TerminalView {
             );
             return true;
         }
-        if !self.suggest.suggestion.is_empty() && (key == "right" || key == "tab" && !hybrid) {
+        // accept 不覆盖的键在这里放行：返回 false 后走正常编码通路进 PTY
+        // （tab→`\t`、right→CSI C），shell 的原生补全（如 PSReadLine）照常接管。
+        // 即将写键时不留旧 ghost——透传后 shell 立即重画，残留会闪现。
+        let ghost_passes = !self.suggest.suggestion.is_empty()
+            && (accept.accepts_right() && key == "right"
+                || accept.accepts_tab() && key == "tab" && !hybrid);
+        if ghost_passes {
             if let Some(item) = self.suggest.suggestion_edit.take() {
                 self.suggest.suggestion.clear();
                 return self.accept_completion_item(item, cx);
@@ -89,6 +98,9 @@ impl TerminalView {
             }
             self.write_user_text(ghost.clone(), false, ghost.into_bytes(), cx);
             return true;
+        }
+        if matches!(key, "tab" | "right") {
+            self.suggest.clear_completion_hints();
         }
         false
     }

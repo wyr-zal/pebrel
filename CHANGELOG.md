@@ -4,6 +4,20 @@ Every release entry is provided in English and Simplified Chinese.
 
 每个版本条目均同时提供英文和简体中文说明。
 
+## 2.2.8 - 2026-10-18
+
+### English
+
+#### Fixed
+
+- Fixed: The "Suggestion accept key" setting now takes effect in the app. Tab and the right arrow key are wired into the actual key path; choosing "Right arrow" restores shell-native completion on Tab while the right arrow key accepts the inline suggestion. The completion settings group also shows its previously missing dropdown entry.
+
+### 中文
+
+#### 修复
+
+- 修复：设置页「建议采纳键」此前在应用内无效果。现已把 Tab 与右方向键接入实际按键路径：选择「右方向键」时 Tab 恢复 shell 原生补全，右方向键采纳行内建议；补全设置组同时补上此前缺失的下拉项。
+
 ## 2.2.7 - 2026-10-17
 
 ### English

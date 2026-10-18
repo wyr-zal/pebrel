@@ -1328,6 +1328,12 @@ impl SettingsPane {
                 language.text(crate::i18n::Message::SettingsCompletionMode),
                 help("completion_style", language),
                 cx,
+            ))
+            .child(self.select_row(
+                "accept",
+                language.pick("建议采纳键", "Suggestion accept key"),
+                help("accept", language),
+                cx,
             ));
         v_flex().w_full().gap(px(GROUP_GAP)).child(terminal).child(completion).child(alerts)
     }

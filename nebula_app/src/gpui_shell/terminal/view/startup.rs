@@ -231,9 +231,9 @@ impl TerminalView {
             },
         };
 
-        let (ghost_enabled, completion_style) = match cx.try_global::<Settings>() {
-            Some(settings) => (settings.ghost, settings.completion_style),
-            None => (true, Default::default()),
+        let (ghost_enabled, completion_style, accept_key) = match cx.try_global::<Settings>() {
+            Some(settings) => (settings.ghost, settings.completion_style, settings.accept),
+            None => (true, Default::default(), Default::default()),
         };
 
         let focus_handle = cx.focus_handle();
@@ -396,6 +396,7 @@ impl TerminalView {
             completion_viewport: super::super::completion_viewport::CompletionViewport::default(),
             ghost_enabled,
             completion_style,
+            accept_key,
             awaiting_input: false,
             last_command_failed: false,
             completed_at: None,

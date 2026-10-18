@@ -254,6 +254,8 @@ fn run_native_completion_fixture(editor_only: bool) {
         crate::gpui_shell::scientific_render::init(cx);
         let mut settings = Settings::load(nebula_settings::ThemeName::Nord);
         settings.ghost = true;
+        // QA 场景固定 Tab+Right 都能采纳，不随宿主机 pebrel_settings.txt 波动。
+        settings.accept = nebula_settings::AcceptKeyName::Both;
         if demo.is_some() {
             settings.font_size_px = 18.0;
         }

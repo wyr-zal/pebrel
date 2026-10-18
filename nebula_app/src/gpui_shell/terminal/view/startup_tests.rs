@@ -70,7 +70,12 @@ fn open_at(
                 cx,
             )
         });
-        let receiver = view.update(cx, |view, _| view.install_completion_test_session());
+        let receiver = view.update(cx, |view, _| {
+            // 夹具读的是真实用户设置文件；宿主机存档可能带 accept=right，
+            // 先钉默认，避免既有 Hybrid Tab 用例静默走透传分支。
+            view.accept_key = nebula_settings::AcceptKeyName::Both;
+            view.install_completion_test_session()
+        });
         result = Some((view, receiver));
         Root::new(cx.new(|_| Surface), window, cx)
     });
@@ -1367,6 +1372,140 @@ fn remote_scroll_reuses_mouse_alternate_screen_and_history_routing(cx: &mut Test
             assert_eq!(view.session.as_ref().unwrap().term.lock().grid().display_offset(), 3);
             assert!(receiver.try_iter().all(|m| !matches!(m, Msg::Input(_))));
             assert!(view.runtime_scroll(1, 400, 0, window, cx).is_err());
+        });
+    });
+}
+
+#[gpui::test]
+fn accept_right_passes_tab_to_the_shell_and_right_accepts_the_ghost(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("pass-through.txt"), b"").unwrap();
+    let (view, window, receiver) = open_at(cx, Some(directory.path().to_path_buf()));
+    window.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.accept_key = nebula_settings::AcceptKeyName::Right;
+            view.suggest.suggest_env = crate::display::SuggestEnv::Local;
+            view.ghost_enabled = true;
+            view.completion_style = crate::display::CompletionStyle::Inline;
+            feed(view, "❯ cat pass-th".as_bytes());
+            refresh_completion_from_grid(view, cx);
+        });
+    });
+    window.run_until_parked();
+    window.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            assert_eq!(view.suggest.suggestion, "rough.txt");
+            // Tab 不归 accept 时必须完整到达 shell：无 APP_CURSOR、无 WIN32 输入
+            // 模式（本会话两者皆未协商），keymap 把 tab 编码为裸 \t。
+            view.on_terminal_tab(&TerminalTab, window, cx);
+            let input: Vec<u8> = receiver
+                .try_iter()
+                .filter_map(|message| match message {
+                    Msg::Input(bytes) => Some(bytes.into_owned()),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            assert_eq!(input, b"\t", "tab beyond accept falls through to the shell");
+            assert!(
+                view.suggest.suggestion.is_empty(),
+                "stale ghost must not linger over the redraw"
+            );
+        });
+    });
+    window.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            // 右方向键仍按 accept=right 采纳行内建议。
+            refresh_completion_from_grid(view, cx);
+        });
+    });
+    window.run_until_parked();
+    window.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            assert_eq!(view.suggest.suggestion, "rough.txt");
+            view.on_key_down(
+                &KeyDownEvent {
+                    keystroke: gpui::Keystroke::parse("right").unwrap(),
+                    is_held: false,
+                    prefer_character_input: false,
+                },
+                window,
+                cx,
+            );
+            let input: Vec<u8> = receiver
+                .try_iter()
+                .filter_map(|message| match message {
+                    Msg::Input(bytes) => Some(bytes.into_owned()),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            assert_eq!(input, b"rough.txt", "right keeps accepting the inline ghost");
+        });
+    });
+}
+
+#[gpui::test]
+fn accept_tab_passes_right_to_the_shell_and_tab_accepts_the_ghost(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("mode-candidate.txt"), b"").unwrap();
+    let (view, window, receiver) = open_at(cx, Some(directory.path().to_path_buf()));
+    window.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.accept_key = nebula_settings::AcceptKeyName::Tab;
+            view.suggest.suggest_env = crate::display::SuggestEnv::Local;
+            view.ghost_enabled = true;
+            view.completion_style = crate::display::CompletionStyle::Inline;
+            feed(view, "❯ cat mode-c".as_bytes());
+            refresh_completion_from_grid(view, cx);
+        });
+    });
+    window.run_until_parked();
+    window.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            assert_eq!(view.suggest.suggestion, "andidate.txt");
+            // right 不归 accept 时透传：编码前提同上（无 APP_CURSOR / WIN32 输入）。
+            view.on_key_down(
+                &KeyDownEvent {
+                    keystroke: gpui::Keystroke::parse("right").unwrap(),
+                    is_held: false,
+                    prefer_character_input: false,
+                },
+                window,
+                cx,
+            );
+            let input: Vec<u8> = receiver
+                .try_iter()
+                .filter_map(|message| match message {
+                    Msg::Input(bytes) => Some(bytes.into_owned()),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            assert_eq!(input, b"\x1b[C", "right beyond accept falls through to the shell");
+            assert!(view.suggest.suggestion.is_empty());
+        });
+    });
+    window.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            // Tab 仍按 accept=tab 采纳行内建议。
+            refresh_completion_from_grid(view, cx);
+        });
+    });
+    window.run_until_parked();
+    window.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            assert_eq!(view.suggest.suggestion, "andidate.txt");
+            view.on_terminal_tab(&TerminalTab, window, cx);
+            let input: Vec<u8> = receiver
+                .try_iter()
+                .filter_map(|message| match message {
+                    Msg::Input(bytes) => Some(bytes.into_owned()),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            assert_eq!(input, b"andidate.txt", "tab keeps accepting the inline ghost");
         });
     });
 }

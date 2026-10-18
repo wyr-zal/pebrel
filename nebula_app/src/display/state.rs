@@ -7,15 +7,7 @@ use nebula_terminal::index::{Line, Point, Side};
 
 use super::terminal_math::TerminalMathState;
 
-/// Which key accepts an inline suggestion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AcceptKey {
-    Right,
-    Tab,
-    #[default]
-    Both,
-}
-
+pub use nebula_settings::AcceptKeyName as AcceptKey;
 pub use nebula_settings::CompletionStyleName as CompletionStyle;
 
 /// Source of a popup completion candidate; drives the right-aligned tag.
@@ -41,24 +33,6 @@ pub struct NebulaCompletionItem {
     /// Characters after a cursor proven by the native line editor.
     pub replace_after_chars: usize,
     pub kind: NebulaCompletionKind,
-}
-
-impl AcceptKey {
-    pub(super) fn cycle(self) -> Self {
-        match self {
-            Self::Right => Self::Tab,
-            Self::Tab => Self::Both,
-            Self::Both => Self::Right,
-        }
-    }
-
-    pub fn accepts_right(self) -> bool {
-        matches!(self, Self::Right | Self::Both)
-    }
-
-    pub fn accepts_tab(self) -> bool {
-        matches!(self, Self::Tab | Self::Both)
-    }
 }
 
 /// Runtime-selected default executor for new terminal sessions.

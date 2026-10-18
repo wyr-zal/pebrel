@@ -469,6 +469,8 @@ pub struct TerminalView {
     editor_query_task: Option<gpui::Task<()>>,
     ghost_enabled: bool,
     completion_style: crate::display::CompletionStyle,
+    /// 哪些键可采纳行内建议（`accept=`）；不满足的键放行走正常 PTY 通路。
+    accept_key: crate::display::AcceptKey,
     /// BEL 后暂停侧栏转圈，直到用户再往 PTY 打字（旧壳 `awaiting_input`）。
     awaiting_input: bool,
     /// 上一条命令的退出码非 0（OSC 133;D 报的）。下一条命令起跑即作废
@@ -997,6 +999,7 @@ impl TerminalView {
         let cursor_style_changed = self.default_cursor_style != default_cursor_style;
         self.ghost_enabled = settings.ghost;
         self.completion_style = settings.completion_style;
+        self.accept_key = settings.accept;
         // 样式/开关热切换即作废当前提示：缓存键留着会挡住新样式的首次重算。
         self.suggestion_task = None;
         self.suggest.clear_completion_hints();

@@ -96,10 +96,11 @@ pub struct Settings {
     /// 标签关闭按钮与标签插入动画都在渲染热路径读取，必须随全局设置驻留内存。
     pub tab_close_visible: bool,
     pub tab_reveal: nebula_settings::TabRevealName,
-    /// 命令补全设置（settings.txt 的 `ghost`/`completion_style`），
+    /// 命令补全设置（settings.txt 的 `ghost`/`completion_style`/`accept`），
     /// 类型直接用旧壳 display 的语义枚举：接受键判定与样式分支两壳同源。
     pub ghost: bool,
     pub completion_style: crate::display::CompletionStyle,
+    pub accept: crate::display::AcceptKey,
     /// 单元格宽度取整方式；同一窗口宽度下必须与旧壳得到相同列数。
     pub cell_width_mode: nebula_settings::CellWidthModeName,
     /// 全宽字形（CJK 等）的 bold run 用 Regular 字形栅格（粗体只提亮不加粗，
@@ -317,6 +318,7 @@ impl Settings {
             tab_reveal: runtime.tab_reveal,
             ghost: runtime.ghost,
             completion_style: runtime.completion_style,
+            accept: runtime.accept,
             cell_width_mode: runtime.cell_width_mode,
             cjk_bold_regular: runtime.cjk_bold_regular,
             shell_id: runtime.shell.clone(),

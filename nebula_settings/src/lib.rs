@@ -589,6 +589,14 @@ impl AcceptKeyName {
             Self::Both => "both",
         }
     }
+
+    pub fn accepts_right(self) -> bool {
+        matches!(self, Self::Right | Self::Both)
+    }
+
+    pub fn accepts_tab(self) -> bool {
+        matches!(self, Self::Tab | Self::Both)
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
