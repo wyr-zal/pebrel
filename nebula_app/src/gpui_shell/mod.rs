@@ -174,6 +174,8 @@ pub fn run_shell(
     }
     let _runtime_server = runtime_server;
     let _acrylic = crate::platform::acrylic::RunGuard::default();
+    // Export the selected helper before the background guard inspects it.
+    let ai_events = crate::ai_hook::spawn_gpui_server();
     let _ai_config_guard = crate::ai_hook::spawn_config_guard();
     // 驻留由工作区持有隐藏窗口；真正关闭最后窗口时统一退出并回收服务。
     let application = gpui_platform::application()
@@ -184,9 +186,6 @@ pub fn run_shell(
     });
     application.on_reopen(|cx| workspace::windowing::focus_notification(None, cx));
     application.run(move |cx| {
-        // GPUI is the only event loop in `--gpui` mode, so it owns the same
-        // per-process hook pipe before the first TerminalView spawns.
-        let ai_events = crate::ai_hook::spawn_gpui_server();
         init(cx, config_file);
         if initial_cwd.is_some()
             || !crate::platform::startup::start_hidden(&nebula_settings::RuntimeSettings::load())

@@ -248,15 +248,14 @@ impl AgentKind {
         argv0: &str,
         argv1: Option<&str>,
     ) -> Option<Self> {
-        Self::parse(executable)
-            .or_else(|| Self::parse(argv0))
-            .or_else(|| {
-                if !is_agent_interpreter(argv0) {
-                    return None;
-                }
-                let entrypoint = argv1?;
-                Self::parse(entrypoint).or_else(|| is_claude_node_entrypoint(entrypoint).then_some(Self::Claude))
-            })
+        Self::parse(executable).or_else(|| Self::parse(argv0)).or_else(|| {
+            if !is_agent_interpreter(argv0) {
+                return None;
+            }
+            let entrypoint = argv1?;
+            Self::parse(entrypoint)
+                .or_else(|| is_claude_node_entrypoint(entrypoint).then_some(Self::Claude))
+        })
     }
 
     /// Shell-safe resume command. Session ids are untrusted hook/file input,
@@ -410,6 +409,25 @@ pub enum AgentStatusSource {
     Process,
     #[default]
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentStatusUncertainty {
+    IdentityOnly,
+    ScreenAmbiguous,
+    PendingInput,
+    AwaitingTerminalEvidence,
+}
+
+impl AgentStatusUncertainty {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::IdentityOnly => "identity_only",
+            Self::ScreenAmbiguous => "screen_ambiguous",
+            Self::PendingInput => "pending_input",
+            Self::AwaitingTerminalEvidence => "awaiting_terminal_evidence",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -637,13 +655,26 @@ pub fn detect(program: &str, screen: &str) -> Option<Detection> {
     let loaded = guard.manifests.get(&agent)?;
     let attention_screen = screen_context::attention_region(agent, screen);
     let live_input = screen_context::has_live_input_controls(attention_screen);
+    let codex_activity = (agent == AgentKind::Codex)
+        .then(|| screen_context::codex_activity_region(screen))
+        .flatten();
     let mut best: Option<(&Rule, &CompiledGate)> = None;
     for (rule, gate) in loaded.manifest.rules.iter().zip(&loaded.rules) {
         let blocked = matches!(rule.state, RuleState::Blocked);
         if blocked && !live_input {
             continue;
         }
-        let text = region(if blocked { attention_screen } else { screen }, &rule.region);
+        let observation = if blocked {
+            attention_screen
+        } else if agent == AgentKind::Codex {
+            if rule.state == RuleState::Idle {
+                continue;
+            }
+            codex_activity.unwrap_or("")
+        } else {
+            screen
+        };
+        let text = region(observation, &rule.region);
         if !gate.matches(text) {
             continue;
         }
@@ -653,6 +684,11 @@ pub fn detect(program: &str, screen: &str) -> Option<Detection> {
         }
     }
     best.map(|(rule, _)| Detection { agent, status: rule.state.into(), rule_id: rule.id.clone() })
+}
+
+/// Wake a bound terminal-evidence probe; this never establishes Idle by itself.
+pub(crate) fn codex_idle_chrome_complete(screen: &str) -> bool {
+    screen_context::codex_activity_region(screen).is_some() && detect("codex", screen).is_none()
 }
 
 const MAX_AUTO_CONTINUE_ERROR_PATTERNS: usize = 16;
@@ -906,7 +942,7 @@ fn from_last_empty_prompt(screen: &str) -> &str {
     while let Some(line) = lines.next() {
         let row = line.trim();
         let row = row.strip_prefix('│').and_then(|row| row.strip_suffix('│')).unwrap_or(row).trim();
-        let draft = row.strip_prefix(['›', '❯', '>']).is_some_and(|rest| {
+        let draft = row.strip_prefix(['›', '»', '❯', '>']).is_some_and(|rest| {
             rest.starts_with(char::is_whitespace)
                 && !rest.trim_start().starts_with(|c: char| c.is_ascii_digit() || c == '[')
         });
@@ -914,7 +950,7 @@ fn from_last_empty_prompt(screen: &str) -> &str {
             let row = line.trim();
             row.chars().count() >= 3 && row.chars().all(|c| c == '─')
         };
-        if matches!(row, "›" | "❯" | ">")
+        if matches!(row, "›" | "»" | "❯" | ">")
             || (draft
                 && horizontal_rule(previous)
                 && lines.peek().is_some_and(|next| horizontal_rule(next)))
@@ -1083,7 +1119,7 @@ mod tests {
     #[test]
     fn auto_continue_live_permission_controls_override_failure_rules() {
         let frame = "■ 503 Service Unavailable\nAllow command?\n› 1. Yes\n2. No\nPress enter to confirm or esc to cancel";
-        assert_eq!(detect("codex", frame).unwrap().status, AgentStatus::Failed);
+        assert_eq!(detect("codex", frame).unwrap().status, AgentStatus::Blocked);
         assert!(!auto_continue_error_matches("codex", frame, &[]));
     }
 
@@ -1200,14 +1236,8 @@ mod tests {
             ),
             Some(AgentKind::Claude),
         );
-        assert_eq!(
-            AgentKind::parse_process_argv("/usr/bin/cc", "cc", Some("claude.md")),
-            None,
-        );
-        assert_eq!(
-            AgentKind::parse_process_argv("/usr/bin/node", "node", Some("server.js")),
-            None,
-        );
+        assert_eq!(AgentKind::parse_process_argv("/usr/bin/cc", "cc", Some("claude.md")), None,);
+        assert_eq!(AgentKind::parse_process_argv("/usr/bin/node", "node", Some("server.js")), None,);
         assert_eq!(
             AgentKind::parse_process_argv("/usr/bin/node", "node", Some("/home/claude/server.js")),
             None,
@@ -1291,7 +1321,11 @@ mod tests {
         let blocked =
             detect("claude", "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel").unwrap();
         assert_eq!(blocked.status, AgentStatus::Blocked);
-        let working = detect("codex", "• Working (12s • esc to interrupt)").unwrap();
+        let working = detect(
+            "codex",
+            "• Working (12s • esc to interrupt)\n› Ask Codex to do anything\ngpt-6 high · /project",
+        )
+        .unwrap();
         assert_eq!(working.status, AgentStatus::Working);
         let idle = detect("claude", "────────────────\n❯ ").unwrap();
         assert_eq!(idle.status, AgentStatus::Idle);
@@ -1308,6 +1342,28 @@ mod tests {
             "› Ask Codex to do anything\ngpt-6-astra max · /project\nuser@host:~$ ",
         ] {
             assert_eq!(identify(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn current_codex_identity_accepts_composer_and_footer_variants() {
+        for prompt in ["›", "»"] {
+            for footer in [
+                "GPT-6 Astra · Agent1 max · Context 16% used · No changes · task · master",
+                "GPT-6 Astra · Agent1 ultra · Context 30% used · Main [default]",
+                "GLM-5.3-Flash · run-other max · Context 45% used · No changes · task",
+                "gpt-6-astra high · Context 12% used · /project",
+            ] {
+                let screen = format!(
+                    "• Working (2m 15s • esc to interrupt)\n\n{prompt} Ask Codex to do anything\n\n  {footer}\n  ? for shortcuts"
+                );
+                assert_eq!(identify(&screen), Some(AgentKind::Codex), "{screen}");
+                assert_eq!(
+                    identify(&format!("{screen}\nuser@host:~$ ")),
+                    None,
+                    "a shell prompt must retire the old branded frame"
+                );
+            }
         }
     }
 
@@ -1413,10 +1469,12 @@ mod tests {
                 "{chrome}\n{}› Ask Codex to do anything\ngpt-6 max · /project",
                 "completed output\n".repeat(20)
             );
-            assert_eq!(detect("codex", &stale).unwrap().status, AgentStatus::Idle);
+            assert!(detect("codex", &stale).is_none());
+            assert!(codex_idle_chrome_complete(&stale));
         }
         let quoted = "The log said Compacting context; Messages to be submitted after next tool call\n› Ask Codex to do anything\ngpt-6 max · /project";
-        assert_eq!(detect("codex", quoted).unwrap().status, AgentStatus::Idle);
+        assert!(detect("codex", quoted).is_none());
+        assert!(codex_idle_chrome_complete(quoted));
     }
 
     #[test]
@@ -1436,7 +1494,7 @@ mod tests {
                     assert_eq!(detection.status, AgentStatus::Working, "{frame}");
                     assert_eq!(detection.rule_id, "working_status");
                     let stale = format!("{chrome}\n{}{footer}", "completed output\n".repeat(20));
-                    assert_eq!(detect("codex", &stale).unwrap().status, AgentStatus::Idle);
+                    assert!(detect("codex", &stale).is_none());
                 }
             }
         }
@@ -1455,14 +1513,13 @@ mod tests {
     }
 
     #[test]
-    fn real_codex_idle_chrome_reads_idle() {
-        // codex 早已答完，屏幕上就是空闲输入框。这块屏幕当初根本没人去匹:
-        // running_program 是 None，1 Hz 看门狗在入口就早退了，于是转圈长挂。
+    fn real_codex_idle_chrome_only_wakes_bound_terminal_evidence() {
+        // A complete composer can wake a bound rollout probe, but cannot prove idle.
         let screen = "  代码级修复和带 gpui-shell 的编译、针对性测试已经通过。\n\
                       › Improve documentation in @filename\n\
                       \x20 gpt-5.6-sol xhigh · D:\\temp_build\\nebula";
-        let detection = detect("codex", screen).unwrap();
-        assert_eq!(detection.status, AgentStatus::Idle, "rule={}", detection.rule_id);
+        assert!(detect("codex", screen).is_none());
+        assert!(codex_idle_chrome_complete(screen));
     }
 
     /// 下面六段是 2026-09-17 用 pebrel 1.8.1 的 runtime `pane.read` 从 kimi

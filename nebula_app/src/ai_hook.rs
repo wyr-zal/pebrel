@@ -118,6 +118,10 @@ const CLAUDE_EVENTS: [&str; 12] = [
     "SessionEnd",
 ];
 
+pub(crate) use local::helper_health::{
+    HelperHealth, HelperHealthReason, HelperHealthState, cached_native_helper_health,
+    cached_wsl_helper_health, cached_wsl_helper_health_for_path, refresh_helper_health,
+};
 pub use local::{setup_ai_cli, spawn_config_guard};
 #[cfg(windows)]
 pub use windows::spawn_gpui_server;

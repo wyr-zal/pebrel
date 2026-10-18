@@ -78,6 +78,7 @@ impl WindowContext {
                     .iter()
                     .filter_map(|id| self.pane(*id))
                     .map(|pane| RuntimePane {
+                        wsl_hook_channel: None,
                         id: pane.id,
                         active: pane.id == tab.active_pane,
                         title: pane.title.clone(),
@@ -87,6 +88,11 @@ impl WindowContext {
                         running_program: pane.nebula_state.running_program.clone(),
                         agent: runtime_agent(pane),
                         task_state: task_state(&pane.nebula_state),
+                        state_evidence: crate::runtime_api::RuntimeStateEvidence::from_uncertainty(
+                            runtime_agent(pane)
+                                .and_then(|_| pane.nebula_state.agent_activity.uncertainty())
+                                .map(crate::ai_agents::AgentStatusUncertainty::as_str),
+                        ),
                         // Seeded to 0; the hub stamps the real transition
                         // counter at publish time, where the previous snapshot
                         // is available to compare against.

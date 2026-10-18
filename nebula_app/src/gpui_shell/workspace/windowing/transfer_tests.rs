@@ -56,6 +56,114 @@ fn open_test_window(cx: &mut App, count: usize) -> (u64, Entity<NebulaWorkspace>
 }
 
 #[gpui::test]
+fn rejected_hook_cannot_complete_a_delegation_or_reroute_across_windows(cx: &mut TestAppContext) {
+    use crate::gpui_shell::terminal::view::TerminalView;
+    use crate::runtime_api::RuntimeTaskState;
+    use nebula_terminal::event_loop::Msg;
+
+    initialize_test(cx);
+    cx.update(|cx| {
+        let (target_window, target_workspace) = open_test_window(cx, 1);
+        let (_, origin_workspace) = open_test_window(cx, 1);
+        let (_, other_workspace) = open_test_window(cx, 1);
+        // Keep real dispatch/snapshots, but do not deliver native desktop notifications.
+        for workspace in [&target_workspace, &origin_workspace, &other_workspace] {
+            workspace.update(cx, |workspace, cx| {
+                let WorkspaceTab::Terminal { panes, .. } = &mut workspace.tabs[0] else {
+                    panic!("terminal fixture");
+                };
+                for pane in panes {
+                    pane._subscription = cx.subscribe(&pane.view, |_, _, _, _| {});
+                }
+            });
+        }
+        let pane = |workspace: &Entity<NebulaWorkspace>, cx: &App| {
+            let WorkspaceTab::Terminal { panes, .. } = &workspace.read(cx).tabs[0] else {
+                panic!("terminal fixture");
+            };
+            (panes[0].id, panes[0].view.clone())
+        };
+        let (target_id, target_view) = pane(&target_workspace, cx);
+        let (origin_id, origin_view) = pane(&origin_workspace, cx);
+        let (_, other_view) = pane(&other_workspace, cx);
+        let install = |view: &Entity<TerminalView>, cx: &mut App| {
+            view.update(cx, |view, _| view.install_completion_test_session())
+        };
+        let _target_input = install(&target_view, cx);
+        let origin_input = install(&origin_view, cx);
+        let _other_input = install(&other_view, cx);
+        let event = |pane: u64, session: &str, name: &str, turn: &str, sequence: u64| {
+            let payload = json!({
+                "hook_event_name": name, "session_id": session, "turn_id": turn,
+                "bridge_sequence": sequence, "last_assistant_message": turn,
+            });
+            crate::ai_hook::parse_remote_envelope(
+                format!("nebula-hook/1 source=codex codex_hooks=full pane={pane}\n{payload}")
+                    .as_bytes(),
+                Some(pane),
+            )
+            .unwrap()
+        };
+        let target_session = "119909a3-2222-4333-8444-555555555555";
+        let origin_session = "229909a3-2222-4333-8444-555555555555";
+        dispatch_ai_events(
+            vec![
+                event(target_id, target_session, "UserPromptSubmit", "worker-old", 1),
+                event(origin_id, origin_session, "UserPromptSubmit", "origin-turn", 1),
+            ],
+            cx,
+        );
+        dispatch_ai_events(
+            vec![event(target_id, target_session, "UserPromptSubmit", "worker-new", 2)],
+            cx,
+        );
+        let hub = cx.global::<WindowRegistry>().runtime_hub.clone();
+        let target = hub
+            .register_agent(
+                "hook-route-worker".into(),
+                crate::ai_agents::AgentKind::Codex,
+                target_window,
+                target_id,
+                Some(target_session.into()),
+                None,
+            )
+            .unwrap();
+        publish_runtime_snapshot(cx);
+        hub.begin_delegation(origin_id, &target).unwrap();
+
+        dispatch_ai_events(vec![event(target_id, target_session, "Stop", "worker-old", 3)], cx);
+        assert_eq!(target_view.read(cx).runtime_task_state(), RuntimeTaskState::Running);
+        assert_eq!(origin_view.read(cx).runtime_task_state(), RuntimeTaskState::Running);
+        assert!(other_view.read(cx).runtime_agent().is_none(), "no fallback to another window");
+        let error = hub.begin_delegation(origin_id, &target).unwrap_err();
+        assert_eq!(error.code, "delegation_in_progress", "rejected Stop must not consume work");
+
+        let mut missing = event(u64::MAX, target_session, "Stop", "worker-new", 4);
+        missing.pane = Some(u64::MAX);
+        dispatch_ai_events(vec![missing], cx);
+        assert!(other_view.read(cx).runtime_agent().is_none(), "missing pane cannot use MRU");
+        assert_eq!(
+            hub.begin_delegation(origin_id, &target).unwrap_err().code,
+            "delegation_in_progress"
+        );
+        dispatch_ai_events(vec![event(target_id, target_session, "Stop", "worker-new", 5)], cx);
+        assert!(origin_input.try_iter().all(|message| !matches!(message, Msg::Input(_))));
+        dispatch_ai_events(vec![event(origin_id, origin_session, "Stop", "origin-turn", 2)], cx);
+        let input: Vec<_> = origin_input
+            .try_iter()
+            .filter_map(|message| match message {
+                Msg::Input(bytes) => Some(bytes.to_vec()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(input.len(), 1, "the accepted current completion is delivered exactly once");
+        let text = String::from_utf8_lossy(&input[0]);
+        assert!(text.contains("worker-new"));
+        assert!(!text.contains("worker-old"));
+    });
+}
+
+#[gpui::test]
 fn moving_last_tab_closes_only_source_after_transfer(cx: &mut TestAppContext) {
     initialize_test(cx);
     let (source_id, source, other_id, other, moved_view) = cx.update(|cx| {

@@ -15,9 +15,12 @@ mod mobile_screen;
 mod orchestrate;
 mod server;
 pub(crate) mod tabs;
+mod task_state;
 mod terminal_read;
 mod transport;
 
+use task_state::stamp_state_change_seq;
+pub use task_state::{RuntimeStateEvidence, RuntimeTaskState, RuntimeWslHookChannel};
 use transport::*;
 pub mod shortcuts;
 #[cfg(test)]
@@ -220,17 +223,6 @@ impl ApiError {
     pub(crate) fn invalid_params(message: impl Into<String>) -> Self {
         Self::new("invalid_params", message)
     }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimeTaskState {
-    Idle,
-    Running,
-    WaitingInput,
-    Attention,
-    Finished,
-    Failed,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -483,8 +475,12 @@ pub struct RuntimePane {
     pub running_program: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<RuntimeAgent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wsl_hook_channel: Option<RuntimeWslHookChannel>,
     pub task_state: RuntimeTaskState,
-    /// Monotonic count of this pane's task-state transitions. A state value on
+    #[serde(flatten)]
+    pub state_evidence: RuntimeStateEvidence,
+    /// Monotonic count of this pane's task-state/evidence transitions. A state value on
     /// its own cannot answer "did anything happen since I submitted?", so
     /// callers that sent work compare against a baseline captured at submit
     /// time. Stamped by [`RuntimeHub::publish`]; projection callers leave it 0.
@@ -509,6 +505,8 @@ pub struct RuntimeAgentPane {
     pub ssh_destination: Option<String>,
     pub agent: RuntimeAgent,
     pub task_state: RuntimeTaskState,
+    #[serde(flatten)]
+    pub state_evidence: RuntimeStateEvidence,
     pub state_change_seq: u64,
 }
 
@@ -986,44 +984,6 @@ struct ResolvedPaneRelocations {
     by_target: std::collections::HashMap<PaneIdentity, PaneIdentity>,
 }
 
-/// Carry each pane's transition counter forward, incrementing only where the
-/// task state actually changed. Pane ids are window-local, so the identity key
-/// is (window, pane) — matching on the pane id alone would let a same-numbered
-/// pane in another window inherit an unrelated counter.
-fn stamp_state_change_seq(
-    previous: Option<&RuntimeSnapshot>,
-    next: &mut RuntimeSnapshot,
-    relocations: &ResolvedPaneRelocations,
-) {
-    let mut before = std::collections::HashMap::new();
-    if let Some(previous) = previous {
-        for window in &previous.windows {
-            for tab in &window.tabs {
-                for pane in &tab.panes {
-                    before.insert((window.id, pane.id), (pane.task_state, pane.state_change_seq));
-                }
-            }
-        }
-    }
-
-    for window in &mut next.windows {
-        let window_id = window.id;
-        for tab in &mut window.tabs {
-            for pane in &mut tab.panes {
-                let identity = (window_id, pane.id);
-                let previous_identity = relocations.by_target.get(&identity).unwrap_or(&identity);
-                pane.state_change_seq = match before.get(previous_identity) {
-                    Some((state, seq)) if *state == pane.task_state => *seq,
-                    Some((_, seq)) => seq.saturating_add(1),
-                    // A pane observed for the first time starts at 1, so a
-                    // baseline of 0 always reads as "not yet seen".
-                    None => 1,
-                };
-            }
-        }
-    }
-}
-
 #[derive(Default)]
 struct HubState {
     current: Option<RuntimeSnapshot>,
@@ -1496,6 +1456,10 @@ impl RuntimeHub {
                     "delegation callback dropped task_id={} reason=origin_replaced",
                     callback.task_id
                 );
+                continue;
+            }
+            if !pane.state_evidence.confirmed {
+                waiting.push_back(callback);
                 continue;
             }
             match pane.task_state {

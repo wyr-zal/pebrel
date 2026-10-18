@@ -5,11 +5,14 @@ use nebula_terminal::grid::Dimensions as _;
 use nebula_terminal::index::{Column, Line, Point};
 
 use crate::ai_agents::{AgentStatus, AgentStatusSource};
+#[cfg(windows)]
+use crate::ai_hook::lifecycle::CodexTerminalEvidence;
 use crate::ai_hook::{AiHookEvent, AiHookKind};
 
 use super::{TerminalView, TerminalViewEvent, notifications};
 
 impl TerminalView {
+    /// True means the selected pane applied the Hook, not merely that it was routed here.
     pub fn handle_ai_hook(&mut self, event: &AiHookEvent, cx: &mut Context<Self>) -> bool {
         if let Some(client_pid) = event.client_pid
             && event.pane == Some(self.pane_id)
@@ -21,7 +24,7 @@ impl TerminalView {
         }
         if !self.agent_activity.accepts_hook(event) {
             log::debug!("ai_hook: pane={} ignored hook outside the active lifecycle", self.pane_id);
-            return true;
+            return false;
         }
         if !self.recovery.accepts_choice_event(event) {
             return false;
@@ -149,18 +152,27 @@ impl TerminalView {
     }
 
     #[cfg(windows)]
-    fn probe_wsl_codex_failure(&mut self, screen: &str, cx: &mut Context<Self>) {
+    fn probe_wsl_codex_terminal(&mut self, screen: &str, cx: &mut Context<Self>) {
         // Chrome only wakes a bounded probe; its text cannot end a hook-owned
-        // turn. The process's open rollout must prove the exact terminal error.
+        // turn. The process's open rollout must prove the exact terminal record.
+        let Some(target) = self.agent_activity.codex_failure_target() else { return };
+        let idle_chrome = crate::ai_agents::codex_idle_chrome_complete(screen);
+        if idle_chrome
+            && self.agent_activity.mark_status_unconfirmed(
+                crate::ai_agents::AgentStatusUncertainty::AwaitingTerminalEvidence,
+            )
+        {
+            cx.emit(TerminalViewEvent::TitleChanged);
+            cx.notify();
+        }
         if self.codex_failure_probe.is_some()
             || self
                 .last_codex_failure_probe
                 .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(2))
-            || !screen.lines().any(|line| line.trim_start().starts_with('■'))
+            || !(screen.lines().any(|line| line.trim_start().starts_with('■')) || idle_chrome)
         {
             return;
         }
-        let Some(target) = self.agent_activity.codex_failure_target() else { return };
         let Some(probe) = self
             .session
             .as_ref()
@@ -170,45 +182,50 @@ impl TerminalView {
             return;
         };
         self.last_codex_failure_probe = Some(std::time::Instant::now());
+        let input_epoch = self.prompt_input_epoch;
         let generation = probe.generation.clone();
         let expected = target.clone();
         let work = cx.background_executor().spawn(async move { probe.run(&expected) });
         self.codex_failure_probe = Some(cx.spawn(async move |this, cx| {
-            let failure = work.await;
+            let terminal = work.await;
             let _ = this.update(cx, |view, cx| {
                 view.codex_failure_probe = None;
-                if let Some(message) = failure {
-                    view.apply_wsl_codex_failure(&generation, &target, message, cx);
+                if let Some(terminal) = terminal {
+                    view.apply_wsl_codex_terminal(&generation, input_epoch, &target, terminal, cx);
                 }
             });
         }));
     }
 
     #[cfg(windows)]
-    pub(super) fn apply_wsl_codex_failure(
+    pub(super) fn apply_wsl_codex_terminal(
         &mut self,
         generation: &str,
+        input_epoch: u64,
         target: &crate::ai_hook::lifecycle::CodexFailureTarget,
-        message: String,
+        terminal: CodexTerminalEvidence,
         cx: &mut Context<Self>,
     ) {
         if self.exited.is_some()
+            || self.prompt_input_epoch != input_epoch
             || self.running_program.as_deref() != Some("codex")
             || !self
                 .session
                 .as_ref()
                 .and_then(|session| session.wsl_hook.as_ref())
                 .is_some_and(|channel| channel.accepts(generation))
-            || !self.agent_activity.observe_codex_failure(target)
+            || !self.agent_activity.observe_codex_terminal(target, &terminal)
         {
             return;
         }
         self.confirmation.observe_waiting(false);
-        cx.emit(TerminalViewEvent::Notification(crate::notify::Notification::AiTurnIssue {
-            program: "codex".into(),
-            message: Some(message),
-            outcome: crate::ai_hook::AiTurnOutcome::Failed,
-        }));
+        if let CodexTerminalEvidence::Failed { error } = terminal {
+            cx.emit(TerminalViewEvent::Notification(crate::notify::Notification::AiTurnIssue {
+                program: "codex".into(),
+                message: Some(error),
+                outcome: crate::ai_hook::AiTurnOutcome::Failed,
+            }));
+        }
         cx.emit(TerminalViewEvent::TitleChanged);
         cx.notify();
     }
@@ -322,7 +339,7 @@ impl TerminalView {
         });
         self.set_screen_error_indicator(screen_error_visible, cx);
         #[cfg(windows)]
-        self.probe_wsl_codex_failure(&screen, cx);
+        self.probe_wsl_codex_terminal(&screen, cx);
         if let Some(program) = retry_source.as_deref() {
             self.schedule_auto_continue_screen_failure(program, &screen, cx);
         }

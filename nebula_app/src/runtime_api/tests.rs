@@ -110,6 +110,8 @@ fn snapshot(state: RuntimeTaskState) -> RuntimeSnapshot {
                     running_program: None,
                     agent: None,
                     task_state: state,
+                    state_evidence: Default::default(),
+                    wsl_hook_channel: None,
                     state_change_seq: 0,
                     active_run: None,
                     last_run: None,
@@ -155,6 +157,8 @@ fn delegation_snapshot(
         running_program: agent.as_ref().map(|agent: &RuntimeAgent| agent.kind.clone()),
         agent,
         task_state,
+        state_evidence: Default::default(),
+        wsl_hook_channel: None,
         state_change_seq: 0,
         active_run: None,
         last_run: None,
@@ -1146,6 +1150,76 @@ fn wait_ignores_a_pane_that_never_left_the_target_state() {
     ));
 }
 
+pub(super) fn unconfirmed_snapshot(snapshot: RuntimeSnapshot) -> RuntimeSnapshot {
+    let mut value = serde_json::to_value(snapshot).unwrap();
+    let pane = &mut value["windows"][0]["tabs"][0]["panes"][0];
+    pane["task_state_confirmed"] = json!(false);
+    pane["task_state_reason"] = json!("screen_ambiguous");
+    serde_json::from_value(value).unwrap()
+}
+
+#[test]
+fn state_confirmation_rejects_waits_for_unconfirmed_observations() {
+    for (state, expected) in [
+        (RuntimeTaskState::Idle, RuntimeWaitState::Idle),
+        (RuntimeTaskState::Running, RuntimeWaitState::Running),
+        (RuntimeTaskState::Attention, RuntimeWaitState::Attention),
+        (RuntimeTaskState::Finished, RuntimeWaitState::Finished),
+        (RuntimeTaskState::Failed, RuntimeWaitState::Failed),
+    ] {
+        let observed = unconfirmed_snapshot(snapshot(state));
+        let pane = observed.pane(Some(7), 3).unwrap();
+        assert!(!wait_matches(pane, expected, None), "unconfirmed {state:?}");
+        assert!(!wait_matches(pane, RuntimeWaitState::Settled, None));
+    }
+}
+
+#[test]
+fn state_confirmation_changes_are_visible_to_revision_waiters() {
+    let hub = RuntimeHub::new();
+    let first = hub.publish(snapshot(RuntimeTaskState::Idle));
+    let baseline = first.pane(None, 3).unwrap().state_change_seq;
+    let uncertain = hub.publish(unconfirmed_snapshot(snapshot(RuntimeTaskState::Idle)));
+    assert_eq!(uncertain.pane(None, 3).unwrap().state_change_seq, baseline + 1);
+    let repeated = hub.publish(unconfirmed_snapshot(snapshot(RuntimeTaskState::Idle)));
+    assert_eq!(repeated.revision, uncertain.revision);
+    let confirmed = hub.publish(snapshot(RuntimeTaskState::Idle));
+    assert_eq!(confirmed.pane(None, 3).unwrap().state_change_seq, baseline + 2);
+    assert!(wait_matches(confirmed.pane(None, 3).unwrap(), RuntimeWaitState::Idle, Some(baseline)));
+}
+
+#[test]
+fn state_confirmation_does_not_deliver_callbacks_to_ambiguous_idle() {
+    let (hub, target) = delegation_hub(RuntimeTaskState::Running);
+    hub.begin_delegation(3, &target).unwrap();
+    hub.complete_delegations_for_turn(&codex_turn_done("done"));
+    hub.publish(unconfirmed_snapshot(delegation_snapshot(
+        RuntimeTaskState::Idle,
+        RuntimeTaskState::Finished,
+        Some("claude-session-1"),
+    )));
+    assert!(hub.take_ready_delegation_callbacks().is_empty());
+    hub.publish(delegation_snapshot(
+        RuntimeTaskState::Idle,
+        RuntimeTaskState::Finished,
+        Some("claude-session-1"),
+    ));
+    assert_eq!(hub.take_ready_delegation_callbacks().len(), 1);
+}
+
+#[test]
+fn state_confirmation_defaults_to_confirmed_for_legacy_snapshots() {
+    let legacy = snapshot(RuntimeTaskState::Idle);
+    let mut wire = serde_json::to_value(legacy).unwrap();
+    let pane = wire["windows"][0]["tabs"][0]["panes"][0].as_object_mut().unwrap();
+    pane.remove("task_state_confirmed");
+    pane.remove("task_state_reason");
+    let restored: RuntimeSnapshot = serde_json::from_value(wire).unwrap();
+    let pane = restored.pane(Some(7), 3).unwrap();
+    assert!(wait_matches(pane, RuntimeWaitState::Idle, None));
+    assert_eq!(serde_json::to_value(pane).unwrap()["task_state_confirmed"], json!(true));
+}
+
 #[test]
 fn state_change_seq_does_not_leak_across_windows() {
     // Pane ids are window-local, so pane 3 in window 8 must not inherit
@@ -1345,6 +1419,95 @@ fn agent_ready_requires_observed_process_identity() {
     .unwrap();
     assert!(ready.observed);
     assert_eq!(state, RuntimeTaskState::Idle);
+}
+
+#[test]
+fn agent_ready_requires_confirmed_idle_after_identity_is_observed() {
+    let hub = RuntimeHub::new();
+    let agent = hub
+        .register_agent("worker".into(), crate::ai_agents::AgentKind::Codex, 7, 3, None, None)
+        .unwrap();
+    let mut detected = snapshot(RuntimeTaskState::Idle);
+    detected.windows[0].tabs[0].panes[0].agent = Some(detected_agent("codex", None));
+    hub.publish(unconfirmed_snapshot(detected.clone()));
+    assert!(hub.active_agent(&agent.agent_id, Some(agent.generation)).unwrap().observed);
+    let error = super::orchestrate::wait_agent_ready(
+        &hub,
+        &agent.agent_id,
+        agent.generation,
+        Instant::now() + Duration::from_millis(5),
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "agent_ready_timeout");
+
+    hub.publish(detected);
+    let (ready, state) = super::orchestrate::wait_agent_ready(
+        &hub,
+        &agent.agent_id,
+        agent.generation,
+        Instant::now() + Duration::from_millis(50),
+    )
+    .unwrap();
+    assert!(ready.observed);
+    assert_eq!(state, RuntimeTaskState::Idle);
+}
+
+#[test]
+fn agent_unconfirmed_idle_never_receives_its_initial_prompt() {
+    let hub = RuntimeHub::new();
+    hub.publish(snapshot(RuntimeTaskState::Idle));
+    let prompt_dispatches = Arc::new(AtomicUsize::new(0));
+    let sink_hub = hub.clone();
+    let sink_prompt_dispatches = prompt_dispatches.clone();
+    let sink = EventSink::Callback(Arc::new(move |callback| {
+        let RuntimeCallback::Control(dispatch) = callback else { return };
+        match &dispatch.command {
+            RuntimeCommand::AgentStart { pane_id: Some(pane_id), name, kind, .. } => {
+                let agent =
+                    sink_hub.register_agent(name.clone(), *kind, 7, *pane_id, None, None).unwrap();
+                let mut detected = snapshot(RuntimeTaskState::Idle);
+                detected.windows[0].tabs[0].panes[0].agent = Some(detected_agent("codex", None));
+                sink_hub.publish(unconfirmed_snapshot(detected));
+                dispatch.respond(Ok(json!({
+                    "action": { "agent": agent, "window_id": 7, "pane_id": pane_id },
+                    "snapshot": null
+                })));
+            },
+            RuntimeCommand::ReadPane { .. } => {
+                dispatch.respond(Ok(json!({
+                    "action": { "text": "", "returned_lines": 0 }
+                })));
+            },
+            RuntimeCommand::Prompt { .. } | RuntimeCommand::AgentPrompt { .. } => {
+                sink_prompt_dispatches.fetch_add(1, Ordering::Relaxed);
+                dispatch.respond(Ok(json!({ "action": {} })));
+            },
+            command => panic!("unexpected command: {command:?}"),
+        }
+    }));
+    let receipt = super::orchestrate::execute_for_test(
+        &json!({
+            "steps": [{
+                "id": "agent",
+                "op": "agent_launch",
+                "target": { "window_id": 7, "pane_id": 3 },
+                "name": "worker",
+                "kind": "codex",
+                "initial_prompt": "must not dispatch",
+                "ready_timeout_ms": 5
+            }]
+        }),
+        &sink,
+        &hub,
+    )
+    .unwrap();
+    assert_eq!(prompt_dispatches.load(Ordering::Relaxed), 0);
+    assert_eq!(receipt["failed_step"], "agent");
+    let error = &receipt["steps"][0]["error"];
+    assert_eq!(error["code"], "agent_ready_timeout");
+    assert_eq!(error["details"]["observed"], true);
+    assert_eq!(error["details"]["task_state"], "idle");
+    assert_eq!(error["details"]["submitted"], false);
 }
 
 #[test]

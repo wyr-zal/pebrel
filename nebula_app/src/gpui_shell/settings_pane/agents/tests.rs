@@ -9,6 +9,16 @@ use std::sync::{
 
 type Reply = (Result<(), String>, Vec<AgentIntegration>);
 
+#[cfg(windows)]
+#[gpui::test]
+fn helper_capabilities_are_distinct_from_hook_installation(cx: &mut TestAppContext) {
+    let (_, window, reply, _) = fixture(cx);
+    drop(reply);
+    assert!(window.debug_bounds("agents-native-capability").is_some());
+    assert!(window.debug_bounds("agents-wsl-capability").is_some());
+    assert!(window.debug_bounds("agent-hook-status-0").is_some());
+}
+
 fn rows(installed: bool) -> Vec<AgentIntegration> {
     vec![AgentIntegration {
         agent: AgentKind::Claude,

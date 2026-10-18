@@ -175,6 +175,28 @@ impl SettingsPane {
                 )
             })
             .child(list)
+            .when(crate::platform::CAPABILITIES.ai_hook_server, |view| {
+                view.children([
+                    div()
+                        .id("agents-native-capability")
+                        .debug_selector(|| "agents-native-capability".into())
+                        .text_xs()
+                        .text_color(muted)
+                        .child(language.text(helper_capability_message(
+                            false,
+                            crate::ai_hook::cached_native_helper_health().state,
+                        ))),
+                    div()
+                        .id("agents-wsl-capability")
+                        .debug_selector(|| "agents-wsl-capability".into())
+                        .text_xs()
+                        .text_color(muted)
+                        .child(language.text(helper_capability_message(
+                            true,
+                            crate::ai_hook::cached_wsl_helper_health().state,
+                        ))),
+                ])
+            })
             .child(
                 div()
                     .text_sm()
@@ -376,6 +398,18 @@ fn can_toggle(row: &AgentIntegration) -> bool {
             || (row.executable.is_some()
                 && row.inspection.available
                 && !row.inspection.helper_missing))
+}
+
+fn helper_capability_message(wsl: bool, state: crate::ai_hook::HelperHealthState) -> Message {
+    use crate::ai_hook::HelperHealthState::*;
+    match (wsl, state) {
+        (false, Checking) => Message::SettingsAgentsNativeCapabilityChecking,
+        (false, Compatible) => Message::SettingsAgentsNativeCapabilityCompatible,
+        (false, Unavailable) => Message::SettingsAgentsNativeCapabilityUnavailable,
+        (true, Checking) => Message::SettingsAgentsWslCapabilityChecking,
+        (true, Compatible) => Message::SettingsAgentsWslCapabilityCompatible,
+        (true, Unavailable) => Message::SettingsAgentsWslCapabilityUnavailable,
+    }
 }
 
 fn agent_status(row: &AgentIntegration, busy: bool) -> Message {

@@ -2430,6 +2430,9 @@
         "agent": {
           "$ref": "#/$defs/agent"
         },
+        "wsl_hook_channel": {
+          "$ref": "#/$defs/wsl_hook_channel"
+        },
         "task_state": {
           "enum": [
             "idle",
@@ -2440,8 +2443,16 @@
             "failed"
           ]
         },
+        "task_state_confirmed": {
+          "type": "boolean",
+          "default": true,
+          "description": "False retains the last task state as unconfirmed evidence; it cannot satisfy waits or agent readiness."
+        },
+        "task_state_reason": {
+          "enum": ["identity_only", "screen_ambiguous", "pending_input", "awaiting_terminal_evidence"]
+        },
         "state_change_seq": {
-          "description": "Monotonic per-pane counter, bumped every time task_state changes. Capture it before sending work, then pass it as wait's after_seq so an unchanged pane cannot satisfy the wait.",
+          "description": "Monotonic per-pane counter, bumped when task_state or its confirmation changes. Capture it before sending work, then pass it as wait's after_seq so an unchanged pane cannot satisfy the wait.",
           "type": "integer",
           "minimum": 1
         },
@@ -2450,6 +2461,25 @@
         },
         "last_run": {
           "$ref": "#/$defs/run_outcome"
+        }
+      },
+      "additionalProperties": false
+    },
+    "wsl_hook_channel": {
+      "type": "object",
+      "required": ["receiver_available", "authenticated", "lifecycle_seen", "helper"],
+      "properties": {
+        "receiver_available": {"type": "boolean"},
+        "authenticated": {"type": "boolean"},
+        "lifecycle_seen": {"type": "boolean"},
+        "helper": {
+          "type": "object",
+          "required": ["state"],
+          "properties": {
+            "state": {"enum": ["checking", "compatible", "unavailable"]},
+            "reason": {"enum": ["missing_file", "unsupported_protocol", "missing_native_capability", "missing_wsl_capability", "probe_failed", "probe_timeout", "output_too_large", "changed_during_probe", "uninspected_path"]}
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false
@@ -2753,6 +2783,14 @@
             "failed"
           ]
         },
+        "task_state_confirmed": {
+          "type": "boolean",
+          "default": true,
+          "description": "False retains the last task state as unconfirmed evidence; it cannot satisfy waits or agent readiness."
+        },
+        "task_state_reason": {
+          "enum": ["identity_only", "screen_ambiguous", "pending_input", "awaiting_terminal_evidence"]
+        },
         "state_change_seq": {
           "type": "integer",
           "minimum": 1
@@ -2794,6 +2832,9 @@
         "exited"
       ],
       "properties": {
+        "wsl_hook_channel": {
+          "$ref": "#/$defs/wsl_hook_channel"
+        },
         "window_id": {
           "type": "integer",
           "minimum": 0
@@ -2831,6 +2872,14 @@
             "finished",
             "failed"
           ]
+        },
+        "task_state_confirmed": {
+          "type": "boolean",
+          "default": true,
+          "description": "False retains the last task state as unconfirmed evidence; it cannot satisfy waits or agent readiness."
+        },
+        "task_state_reason": {
+          "enum": ["identity_only", "screen_ambiguous", "pending_input", "awaiting_terminal_evidence"]
         },
         "exited": {
           "type": "boolean"

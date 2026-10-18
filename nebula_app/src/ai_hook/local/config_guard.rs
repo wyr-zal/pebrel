@@ -43,6 +43,7 @@ pub fn spawn_config_guard() -> Option<ConfigGuard> {
 }
 
 fn heal_all() {
+    super::helper_health::refresh_helper_health();
     let Ok(_lock) = settings::lock() else { return };
     // 锁内重读授权，不能把菜单/卸载刚移除的 Hook 按旧快照装回。
     let raw = match RawSettings::try_load() {

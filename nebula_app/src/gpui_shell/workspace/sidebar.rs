@@ -266,6 +266,11 @@ impl NebulaWorkspace {
                 });
                 let status_color = if active { active_fg } else { muted };
                 let resting_status: Option<gpui::AnyElement> = match activity {
+                    SidebarActivity::Unconfirmed => Some(
+                        tab_presentation::unconfirmed_status(
+                            format!("sidebar-unconfirmed-{ix}").into(), cx,
+                        ).into_any_element(),
+                    ),
                     SidebarActivity::Running => {
                         items_running.set(true);
                         let (track, head) =

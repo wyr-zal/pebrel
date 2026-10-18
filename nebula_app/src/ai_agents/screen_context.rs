@@ -27,7 +27,7 @@ pub(super) fn attention_region(agent: AgentKind, screen: &str) -> &str {
     let mut start = 0;
     let mut offset = 0;
     for line in screen.split_inclusive('\n') {
-        if let Some(rest) = line.trim().strip_prefix('›')
+        if let Some(rest) = line.trim().strip_prefix(['›', '»'])
             && rest.starts_with(char::is_whitespace)
             && !rest.trim_start().starts_with(|c: char| c.is_ascii_digit() || c == '[')
         {
@@ -36,6 +36,47 @@ pub(super) fn attention_region(agent: AgentKind, screen: &str) -> &str {
         offset += line.len();
     }
     &screen[start..]
+}
+
+static CODEX_FOOTER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?s)^[^\r\n]+(?:\r?\n[^\r\n]+)?[ \t]+(?:default|minimal|low|medium|high|xhigh|max|ultra)[ \t]*[·•][^\r\n]*(?:\r?\n[ \t]*Context [^\r\n]+)?(?:\r?\n[ \t]*\?[ \t]+for shortcuts[^\r\n]*)?\s*\z",
+    )
+    .unwrap()
+});
+
+/// A composer is a frame boundary, not evidence that an assistant has stopped.
+/// Only the adjacent activity block may supply busy/error observations.
+pub(super) fn codex_activity_region(screen: &str) -> Option<&str> {
+    let mut composer = None;
+    let mut offset = 0;
+    for line in screen.split_inclusive('\n') {
+        if let Some(rest) = line.trim().strip_prefix(['›', '»'])
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+            && !rest.trim_start().starts_with(|c: char| c.is_ascii_digit() || c == '[')
+        {
+            composer = Some((offset, offset + line.len()));
+        }
+        offset += line.len();
+    }
+    let (start, end) = composer?;
+    let footer = screen[end..].trim();
+    if footer.len() > 2048 || !CODEX_FOOTER.is_match(footer) {
+        return None;
+    }
+    let above = screen[..start].trim_end();
+    let mut end = above.len();
+    for row in above.split_inclusive('\n').rev().take(16) {
+        end -= row.len();
+        let row = row.trim();
+        if row.starts_with(['•', '◦', '■']) {
+            return Some(&above[end..]);
+        }
+        if !row.starts_with(['└', '│', '↳']) {
+            break;
+        }
+    }
+    Some("")
 }
 
 /// Only the final activity block above the current boxed Claude composer.
@@ -102,6 +143,67 @@ mod tests {
     use crate::ai_agents::{AgentKind, AgentStatus, detect};
 
     #[test]
+    fn codex_default_effort_chrome_can_wake_a_probe_without_proving_idle() {
+        let footer = "› Ask Codex to do anything\n\n  gpt-5.4 default · /work/project  ⚠ 4 warnings · f2 to view";
+        assert!(crate::ai_agents::codex_idle_chrome_complete(footer));
+        assert!(detect("codex", footer).is_none());
+        let working = format!("• Working (12s • esc to interrupt)\n\n{footer}");
+        assert_eq!(detect("codex", &working).unwrap().status, AgentStatus::Working);
+        let quoted = format!("```text\n{working}\n```\nuser@host:~$ ");
+        assert!(!crate::ai_agents::codex_idle_chrome_complete(&quoted));
+    }
+
+    #[test]
+    fn codex_composer_alone_has_no_idle_authority() {
+        for prompt in ["›", "»"] {
+            for text in ["", "Ask Codex to do anything", "Review my changes"] {
+                let frame = format!(
+                    "{prompt} {text}\nGPT-6 Astra · Agent1 ultra · Context 30% used\n? for shortcuts"
+                );
+                assert!(
+                    detect("codex", &frame).is_none(),
+                    "an input composer is present during work too: {frame}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_status_requires_the_current_activity_block() {
+        for prompt in ["›", "»"] {
+            let footer = format!(
+                "{prompt} Ask Codex to do anything\nGPT-6 Astra · Agent1 max · Context 30% used\n? for shortcuts"
+            );
+            let working = "• Working (2m 15s • esc to interrupt)";
+            let frame = format!("{working}\n  └ Reading files\n\n{footer}");
+            assert_eq!(detect("codex", &frame).unwrap().status, AgentStatus::Working);
+            for stale in [
+                format!("```text\n{working}\n```\n{footer}"),
+                format!("{working}\nThe answer is finished.\n{footer}"),
+                format!("{working}\n› old draft\ngpt-6 high · /old\n\n{footer}"),
+                format!("{frame}\nuser@host:~$ "),
+                working.to_owned(),
+            ] {
+                assert!(
+                    !detect("codex", &stale)
+                        .is_some_and(|detection| detection.status == AgentStatus::Working),
+                    "old, partial, or quoted activity is not current work: {stale}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_alternate_prompt_retires_old_approval_controls() {
+        let frame = "Allow command?\n› 1. Yes\n2. No\nPress enter to confirm or esc to cancel\n» Ask Codex to do anything\nGPT-6 Astra · Agent1 ultra · Context 30% used\n? for shortcuts";
+        assert!(detect("codex", frame).is_none());
+        assert_eq!(
+            super::attention_region(AgentKind::Codex, frame),
+            "» Ask Codex to do anything\nGPT-6 Astra · Agent1 ultra · Context 30% used\n? for shortcuts"
+        );
+    }
+
+    #[test]
     fn all_agents_reject_quoted_keywords_and_expired_forms() {
         for agent in AgentKind::ALL {
             for phrase in [
@@ -124,10 +226,11 @@ mod tests {
 
     #[test]
     fn codex_source_listing_and_idle_answer_do_not_become_questions() {
-        let listing = "  { contains = [\"(y/n)\"] },\n  { contains = [\"[y/n]\"] },\n]\n\n◦ Working (12m 36s • esc to interrupt)\n\n› Ask Codex to do anything";
+        let listing = "  { contains = [\"(y/n)\"] },\n  { contains = [\"[y/n]\"] },\n]\n\n◦ Working (12m 36s • esc to interrupt)\n\n› Ask Codex to do anything\ngpt-6 high · /project";
         assert_eq!(detect("codex", listing).unwrap().status, AgentStatus::Working);
         let old_form = "Allow command?\n› 1. Yes\n2. No\nPress enter to confirm or esc to cancel\n› Improve documentation\ngpt-6 high · /project";
-        assert_eq!(detect("codex", old_form).unwrap().status, AgentStatus::Idle);
+        assert!(detect("codex", old_form).is_none());
+        assert!(crate::ai_agents::codex_idle_chrome_complete(old_form));
     }
 
     #[test]

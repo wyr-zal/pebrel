@@ -487,6 +487,8 @@ fn flatten_panes(response: &ApiResponse, window: Option<u64>) -> Option<Value> {
                     "ssh_destination": pane.ssh_destination,
                     "agent": pane.agent,
                     "task_state": pane.task_state,
+                    "task_state_confirmed": pane.state_evidence.confirmed,
+                    "task_state_reason": pane.state_evidence.reason,
                     "state_change_seq": pane.state_change_seq,
                 }));
             }
@@ -908,6 +910,8 @@ mod tests {
                         running_program: None,
                         agent: None,
                         task_state: RuntimeTaskState::Idle,
+                        state_evidence: Default::default(),
+                        wsl_hook_channel: None,
                         state_change_seq,
                         active_run: None,
                         last_run: None,
@@ -981,6 +985,33 @@ mod tests {
 
         let wrapped = json!({ "action": { "pane_id": 17 }, "snapshot": snapshot });
         assert_eq!(snapshot_of(&wrapped).map(|snapshot| snapshot.revision), Some(0));
+    }
+
+    #[test]
+    fn pane_list_preserves_state_confirmation_from_snapshot() {
+        for confirmed in [false, true] {
+            let snapshot = snapshot_with_pane(17, 41);
+            let snapshot = if confirmed {
+                snapshot
+            } else {
+                super::super::tests::unconfirmed_snapshot(snapshot)
+            };
+            for result in
+                [serde_json::to_value(&snapshot).unwrap(), json!({ "snapshot": snapshot })]
+            {
+                let response = ApiResponse::success("runtime.snapshot", result);
+                let listed = flatten_panes(&response, Some(7)).unwrap();
+                let pane = &listed["panes"][0];
+                assert_eq!(pane["task_state"], "idle");
+                assert_eq!(pane["task_state_confirmed"], confirmed);
+                assert_eq!(
+                    pane["task_state_reason"],
+                    if confirmed { Value::Null } else { json!("screen_ambiguous") }
+                );
+                assert_eq!(pane["state_change_seq"], 41);
+                assert_eq!(listed["panes"].as_array().unwrap().len(), 1);
+            }
+        }
     }
 
     #[test]

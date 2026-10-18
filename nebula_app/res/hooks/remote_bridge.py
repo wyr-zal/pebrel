@@ -258,8 +258,25 @@ def write_wsl_hook(envelope, delivery_deadline=None):
     entries = [entry for entry in env.get("WSLENV", "").split(":") if entry and entry.split("/", 1)[0] != "PEBREL_WSL_HOOK_PIPE"]
     env["WSLENV"] = ":".join([*entries, "PEBREL_WSL_HOOK_PIPE/w"])
     wire = b"pebrel-wsl-hook/1 token=" + token.encode() + b"\n" + envelope
-    subprocess.run([helper, "--wsl-hook"], input=wire, stdout=subprocess.DEVNULL,
-                   stderr=subprocess.DEVNULL, timeout=remaining, env=env, check=False)
+    read_fd, write_fd = os.pipe()
+    try:
+        # A wrong helper can fill only this bounded pipe, then hits the delivery timeout.
+        result = subprocess.run([helper, "--wsl-hook"], input=wire, stdout=write_fd,
+                                stderr=subprocess.DEVNULL, timeout=remaining, env=env, check=False)
+        os.close(write_fd)
+        write_fd = None
+        os.set_blocking(read_fd, False)
+        try:
+            accepted = (os.read(read_fd, 65) == b"pebrel-wsl-hook/1 accepted\n"
+                        and os.read(read_fd, 1) == b"")
+        except BlockingIOError:
+            accepted = False
+        if result.returncode != 0 or not accepted:
+            raise OSError("WSL hook acknowledgement missing or invalid")
+    finally:
+        if write_fd is not None:
+            os.close(write_fd)
+        os.close(read_fd)
 
 
 def write_terminal(osc, source=None, owner=None, compact=False):

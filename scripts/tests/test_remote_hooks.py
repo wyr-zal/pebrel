@@ -24,6 +24,15 @@ def module(name):
     return result
 
 
+def helper_ack_result(returncode, stdout):
+    def invoke(args, **kwargs):
+        destination = kwargs["stdout"]
+        if destination not in (subprocess.PIPE, subprocess.DEVNULL):
+            os.write(destination, stdout)
+        return subprocess.CompletedProcess(args, returncode, stdout=stdout)
+    return invoke
+
+
 @unittest.skipUnless(os.name == "posix", "remote adapter targets POSIX SSH hosts")
 class RemoteHooksTests(unittest.TestCase):
     def test_wsl_hook_transport_uses_helper_stdin_without_terminal_output(self):
@@ -33,7 +42,8 @@ class RemoteHooksTests(unittest.TestCase):
                    "prompt_id": "compact", "trigger": "manual", "compact_summary": "x" * 24000}
         helper = self.root / "helper"
         helper.write_text("#!/usr/bin/python3\nimport sys\nfrom pathlib import Path\n"
-                          "Path(__file__).with_suffix('.wire').write_bytes(sys.stdin.buffer.read())\n")
+                          "Path(__file__).with_suffix('.wire').write_bytes(sys.stdin.buffer.read())\n"
+                          "sys.stdout.buffer.write(b'pebrel-wsl-hook/1 accepted\\n')\n")
         helper.chmod(0o700)
         output = io.StringIO()
         env = {"PEBREL_WSL_HOOK_PIPE": "fixture-pipe", "PEBREL_WSL_HOOK_TOKEN": TOKEN,
@@ -65,7 +75,7 @@ class RemoteHooksTests(unittest.TestCase):
         bridge = module("remote_bridge")
         env = {"PEBREL_WSL_HOOK_PIPE": "fixture", "PEBREL_WSL_HOOK_TOKEN": TOKEN,
                "PEBREL_HOOK_EXE": "/fixture/helper", "WSLENV": "USER_VALUE/p:PEBREL_WSL_HOOK_PIPE/p"}
-        with patch.dict(os.environ, env), patch.object(bridge.subprocess, "run") as helper:
+        with patch.dict(os.environ, env), patch.object(bridge.subprocess, "run", side_effect=helper_ack_result(0, b"pebrel-wsl-hook/1 accepted\n")) as helper:
             bridge.write_wsl_hook(b"fixture")
             self.assertEqual(helper.call_args.kwargs["env"]["WSLENV"], "USER_VALUE/p:PEBREL_WSL_HOOK_PIPE/w")
             self.assertNotIn(TOKEN, repr(helper.call_args.args))
@@ -77,7 +87,8 @@ class RemoteHooksTests(unittest.TestCase):
         helper.write_text("#!/usr/bin/python3\nimport json, sys, time\nfrom pathlib import Path\n"
                           "wire=sys.stdin.buffer.read()\ntime.sleep(0.45)\n"
                           "sequence=json.loads(wire.split(b'\\n',2)[2])['bridge_sequence']\n"
-                          "Path(str(Path(__file__))+str(sequence)).write_bytes(wire)\n")
+                          "Path(str(Path(__file__))+str(sequence)).write_bytes(wire)\n"
+                          "sys.stdout.buffer.write(b'pebrel-wsl-hook/1 accepted\\n')\n")
         helper.chmod(0o700)
         errors = []
         def deliver():
@@ -98,6 +109,47 @@ class RemoteHooksTests(unittest.TestCase):
             self.assertFalse(errors, f"concurrent lifecycle event lost: {errors}")
             self.assertFalse(terminal.called)
         self.assertEqual(len(list(self.root.glob("slow-helper[12]"))), 2)
+
+    def test_wsl_hook_private_acknowledgement_is_required_not_exit_zero(self):
+        bridge = module("remote_bridge")
+        accepted = b"pebrel-wsl-hook/1 accepted\n"
+        env = {"PEBREL_WSL_HOOK_PIPE": "fixture", "PEBREL_WSL_HOOK_TOKEN": TOKEN,
+               "PEBREL_HOOK_EXE": "/fixture/helper"}
+        for returncode, stdout in [(0, b""), (0, b"accepted\n"),
+                                   (0, accepted + b"extra\n"), (0, b"x" * 65), (1, accepted)]:
+            with self.subTest(returncode=returncode, stdout=stdout):
+                result = subprocess.CompletedProcess([], returncode, stdout=stdout)
+                with patch.dict(os.environ, env), patch.object(bridge.subprocess, "run", side_effect=helper_ack_result(result.returncode, result.stdout)), patch.object(bridge, "write_terminal") as terminal:
+                    with self.assertRaisesRegex(OSError, "acknowledgement"):
+                        bridge.write_wsl_hook(b"fixture")
+                    terminal.assert_not_called()
+
+    def test_wsl_hook_private_acknowledgement_is_not_provider_output(self):
+        import io
+        bridge = module("remote_bridge")
+        env = {"PEBREL_WSL_HOOK_PIPE": "fixture", "PEBREL_WSL_HOOK_TOKEN": TOKEN,
+               "PEBREL_HOOK_EXE": "/fixture/helper"}
+        result = subprocess.CompletedProcess([], 0, stdout=b"pebrel-wsl-hook/1 accepted\n")
+        output = io.StringIO()
+        with patch.dict(os.environ, env), patch.object(bridge.subprocess, "run", side_effect=helper_ack_result(result.returncode, result.stdout)) as helper, patch.object(bridge.sys, "stdout", output):
+            bridge.write_wsl_hook(b"fixture")
+            descriptor = helper.call_args.kwargs["stdout"]
+            self.assertNotIn(descriptor, (subprocess.PIPE, subprocess.DEVNULL))
+            self.assertEqual(helper.call_args.kwargs["stderr"], subprocess.DEVNULL)
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+        self.assertEqual(output.getvalue(), "")
+
+    def test_wsl_hook_missing_ack_preserves_notifier_without_osc(self):
+        bridge = module("remote_bridge")
+        env = {"PEBREL_WSL_HOOK_PIPE": "fixture", "PEBREL_WSL_HOOK_TOKEN": TOKEN,
+               "PEBREL_HOOK_EXE": "/fixture/helper"}
+        result = subprocess.CompletedProcess([], 0, stdout=b"")
+        with patch.dict(os.environ, env), patch.object(bridge.subprocess, "run", side_effect=helper_ack_result(result.returncode, result.stdout)), patch.object(bridge.subprocess, "Popen") as notifier, patch.object(bridge, "write_terminal") as terminal:
+            with self.assertRaisesRegex(OSError, "acknowledgement"):
+                bridge.run(["codex", "--chain", "original-notifier", '{}'])
+            notifier.assert_called_once()
+            terminal.assert_not_called()
 
     def test_claude_without_controlling_tty_returns_terminal_sequence(self):
         import errno

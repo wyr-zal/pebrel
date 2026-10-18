@@ -876,6 +876,8 @@ impl NebulaWorkspace {
                                     running_program: view.running_program.clone(),
                                     agent: view.runtime_agent(),
                                     task_state: view.runtime_task_state(),
+                                    state_evidence: view.runtime_state_evidence(),
+                                    wsl_hook_channel: view.runtime_wsl_hook_channel(),
                                     state_change_seq: 0,
                                     active_run: view.runtime_active_run(),
                                     last_run: view.runtime_last_run(),

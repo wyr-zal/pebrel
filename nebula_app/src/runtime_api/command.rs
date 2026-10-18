@@ -649,7 +649,8 @@ pub(super) fn wait_matches(
     expected: RuntimeWaitState,
     after_seq: Option<u64>,
 ) -> bool {
-    after_seq.is_none_or(|baseline| pane.state_change_seq > baseline)
+    pane.state_evidence.confirmed
+        && after_seq.is_none_or(|baseline| pane.state_change_seq > baseline)
         && wait_state_matches(pane.task_state, expected)
 }
 

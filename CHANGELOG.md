@@ -4,6 +4,70 @@ Every release entry is provided in English and Simplified Chinese.
 
 每个版本条目均同时提供英文和简体中文说明。
 
+## 2.2.7 - 2026-10-17
+
+### English
+
+#### Fixed
+
+- Fixed: Foreground WSL agents can be recognized without shell command-start markers. Process and terminal ownership are rechecked so old discovery results cannot claim a new pane session.
+- Fixed: An empty Codex composer no longer proves idle. Tabs and Runtime report uncertain activity explicitly, and waits do not treat it as completion. Verified current-turn finish or cancellation can clear a missing end hook without reporting success; late events cannot overwrite a newly submitted prompt.
+- Fixed: Hook helper capabilities and WSL channel diagnostics are reported separately from installed configuration and accepted lifecycle events. Windows packaging rejects a helper missing the required protocols; an unavailable WSL channel keeps its authenticated transport policy.
+
+### 中文
+
+#### 修复
+
+- 修复：缺少 shell 命令开始标记时，仍可补认前台 WSL Agent；重新核对进程与终端归属，避免旧探测结果认领新的窗格会话。
+- 修复：Codex 空输入框不再作为空闲证据。标签和 Runtime 明确标记未确认状态，等待逻辑不会将其当作完成；当前回合的已验证结束或取消可补足缺失的结束 Hook，且不误报成功，迟到事件不会覆盖新提交。
+- 修复：Hook helper 能力、WSL 通道诊断与配置安装、生命周期接收分别显示；Windows 打包拒绝缺少所需协议的 helper，WSL 通道不可用时仍保持认证传输策略。
+
+## 2.2.6 - 2026-10-16
+
+### English
+
+#### Fixed
+
+- Fixed: WSL Claude and Codex hooks use a separate authenticated channel, preventing long hook messages from mixing with terminal redraws and leaking encoded text. Session and process ownership checks still apply; an unavailable channel does not write hook content to the terminal.
+- Fixed: Concurrent WSL hook delivery shares one bounded delivery deadline, and a client that disconnects early no longer closes the pane's hook channel.
+- Fixed: After an explicit Esc, Claude can return to idle without an end hook once its current terminal chrome confirms cancellation. Late events from that cancelled turn cannot report success or restart work.
+- Fixed: When WSL Codex omits its failure hook, a verified error for the current turn in its active conversation can clear the busy state and report failure. Old errors cannot end a new turn or report success.
+
+### 中文
+
+#### 修复
+
+- 修复：WSL Claude 和 Codex Hook 改用独立认证通道，避免长报文与终端重绘交错、漏出编码文本。继续校验会话与进程归属；通道不可用时不向终端写入 Hook 内容。
+- 修复：并发 WSL Hook 共用有界投递期限，客户端提前断开不再导致整个窗格的 Hook 通道关闭。
+- 修复：明确按 Esc 后，即使 Claude 没有发送结束 Hook，也能在当前画面确认取消后回到空闲；已取消回合的迟到事件不会误报成功或重新开始工作。
+- 修复：WSL Codex 缺少失败 Hook 时，可根据当前进程活动会话中同回合的明确错误结束忙碌并显示失败；旧错误不会结束新回合或误报成功。
+
+## 2.2.5 - 2026-10-16
+
+### English
+
+#### Fixed
+
+- Fixed: A restored Claude session can accept hooks after its transcript moves to another project directory, provided the saved session ID and both transcript filenames still match. Other session and process ownership checks remain in place.
+- Fixed: Claude work and queued-input indicators are recognized without the older interrupt footer. An idle composer alone no longer produces a successful-completion badge or notification when Claude hooks are unavailable.
+- Fixed: Claude compaction is tracked separately from task completion. Manual compaction returns to idle, automatic compaction resumes the prior activity, and an explicit Esc followed by idle chrome clears a cancelled compaction without reporting success. WSL compaction hooks use the verified foreground terminal without displaying their transport JSON.
+
+#### Known limitation
+
+Claude 2.1.294 emits no end hook when `/compact` reports that there are not enough messages. Press Esc to clear that pending phase; it is not inferred as successful completion.
+
+### 中文
+
+#### 修复
+
+- 修复：恢复的 Claude 会话在 transcript 移到另一个项目目录后，只要保存的 session ID 与新旧文件名仍一致，即可继续接收 Hook；其他会话和进程归属校验保持不变。
+- 修复：Claude 工作与排队输入提示不再依赖旧版中断提示栏；缺少有效 Hook 时，仅出现输入框不再产生成功完成标记或通知。
+- 修复：Claude 压缩阶段与任务完成分开处理。手动压缩结束回到空闲，自动压缩结束恢复原活动状态；明确发送 Esc 且界面回到空闲后，清理取消的压缩，不误报成功。WSL 压缩 Hook 通过已验证的前台终端发送，不再把传输 JSON 显示到界面。
+
+#### 已知限制
+
+Claude 2.1.294 在 `/compact` 提示消息不足时不发送结束 Hook；此时需按 Esc 清理待结束阶段，不将其推断为成功完成。
+
 ## 2.2.4 - 2026-10-15
 
 ### English

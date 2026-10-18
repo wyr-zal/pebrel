@@ -11,7 +11,7 @@ contains = ["openai codex"]
 # A restored conversation can omit the startup banner. Require its branded
 # empty prompt immediately followed by the live model/effort footer at the tail.
 [[identity]]
-regex = ['(?m)^[ \t]*› Ask Codex to do anything[ \t]*\r?\n(?:[ \t]*\r?\n)*[ \t]*\S+[ \t]+(?:minimal|low|medium|high|xhigh|max)[ \t]*[·•][^\r\n]*\s*\z']
+regex = ['(?m)^[ \t]*[›»] Ask Codex to do anything[ \t]*\r?\n(?:[ \t]*\r?\n)*[ \t]*[^\r\n]+[ \t]+(?:default|minimal|low|medium|high|xhigh|max|ultra)[ \t]*[·•][^\r\n]*(?:\r?\n[ \t]*\?[ \t]+for shortcuts[^\r\n]*)?\s*\z']
 
 [[rules]]
 id = "request_failed"
@@ -49,10 +49,5 @@ any = [
   { line_regex = ['^[•◦]\s+Messages to be submitted after next tool call \(press esc to interrupt and send immediately\)$'] },
 ]
 
-[[rules]]
-id = "prompt_idle"
-state = "idle"
-priority = 100
-region = "bottom_non_empty_lines(4)"
-line_regex = ['^\s*›(?:\s|$)']
-not = [{ contains = ["esc to interrupt"] }]
+# Codex keeps its composer visible while running. Only hooks or verified current
+# turn records establish that it has stopped; an empty prompt is not an idle rule.

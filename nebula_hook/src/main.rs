@@ -172,6 +172,12 @@ fn log_outcome(source: &str, pane: &str, bytes: usize, outcome: &Outcome) {
 fn main() {
     // Constraint 1: never leak a failure to the calling CLI.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.len() == 1 && args[0] == "--capabilities" {
+        let _ = std::io::stdout()
+            .lock()
+            .write_all(b"pebrel-hook-capabilities/1 native-hook/1 wsl-hook/1\n");
+        return;
+    }
     let forwarding_args = args.clone();
     let (done, finished) = std::sync::mpsc::sync_channel(1);
     // Bound the entire forwarding operation, including stdin drain and pipe
@@ -261,6 +267,7 @@ fn run(args: &[String]) {
     if args.len() == 1 && args[0] == "--wsl-hook" {
         if let Ok(Some(wire)) = read_payload(std::io::stdin().lock()) {
             let outcome = if valid_wsl_hook(&wire) && wsl_hook::forward(&wire).is_ok() {
+                let _ = std::io::stdout().lock().write_all(b"pebrel-wsl-hook/1 accepted\n");
                 Outcome::Sent
             } else {
                 Outcome::PipeUnavailable

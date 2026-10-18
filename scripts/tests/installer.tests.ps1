@@ -148,6 +148,8 @@ if ($shellAt -lt 0 -or $directoryAt -lt 0 -or $shellAt -gt $directoryAt) {
     throw "The WSL context-menu command must pass --shell before --working-directory: $($commandTemplates[0].Trim())"
 }
 
+& (Join-Path $PSScriptRoot 'windows-hook-capabilities.tests.ps1')
+
 $validationArguments = @{ SkipBuild = $true; AllowStale = $true; ValidateOnly = $true }
 if (-not [string]::IsNullOrWhiteSpace($TargetDirectory)) {
     $validationArguments.TargetDirectory = $TargetDirectory

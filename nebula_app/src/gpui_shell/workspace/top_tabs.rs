@@ -208,6 +208,11 @@ impl NebulaWorkspace {
                     tab_w * 0.4,
                 );
                 let resting_status: Option<gpui::AnyElement> = match activity {
+                    SidebarActivity::Unconfirmed => Some(
+                        super::tab_presentation::unconfirmed_status(
+                            format!("top-tab-unconfirmed-{ix}").into(), cx,
+                        ).into_any_element(),
+                    ),
                     SidebarActivity::Running => {
                         items_running.set(true);
                         let (track, head) =

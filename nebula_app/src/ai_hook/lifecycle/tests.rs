@@ -27,6 +27,14 @@ fn screen(status: AgentStatus) -> Option<Detection> {
 }
 
 #[test]
+fn identifying_an_agent_command_does_not_prove_a_running_turn() {
+    let mut activity = AgentActivity::default();
+    activity.begin_command(true);
+    assert_eq!(activity.status(), AgentStatus::Unknown);
+    assert_eq!(activity.source(), AgentStatusSource::Process);
+}
+
+#[test]
 fn wsl_hook_codex_rollout_failure_is_bound_to_current_turn_and_cannot_become_done() {
     let event = |name: &str, turn: &str, sequence: u64| {
         parse_remote_envelope(format!("nebula-hook/1 source=codex process=20:200 codex_hooks=full\n{{\"hook_event_name\":\"{name}\",\"session_id\":\"session\",\"turn_id\":\"{turn}\",\"bridge_sequence\":{sequence}}}").as_bytes(), Some(1)).unwrap()
@@ -63,6 +71,143 @@ fn wsl_hook_codex_rollout_failure_is_bound_to_current_turn_and_cannot_become_don
     assert!(activity.codex_failure_target().is_none());
 }
 
+fn codex_verified_turn_event(name: &str, turn: &str, sequence: u64) -> AiHookEvent {
+    parse_remote_envelope(
+        format!(
+            "nebula-hook/1 source=codex process=20:200 codex_hooks=full\n{{\"hook_event_name\":\"{name}\",\"session_id\":\"session\",\"turn_id\":\"{turn}\",\"bridge_sequence\":{sequence}}}"
+        )
+        .as_bytes(),
+        Some(1),
+    )
+    .unwrap()
+}
+
+#[test]
+fn wsl_hook_codex_input_without_a_new_start_cannot_apply_old_rollout_evidence() {
+    let mut activity = AgentActivity::default();
+    assert!(activity.apply_hook(&codex_verified_turn_event("UserPromptSubmit", "first", 1)));
+    let old_target = activity.codex_failure_target().unwrap();
+
+    activity.input_sent();
+    assert!(
+        activity.codex_failure_target().is_none(),
+        "physical input cannot preserve an authoritative target for the old turn"
+    );
+    assert!(!activity.observe_codex_failure(&old_target));
+    assert_eq!(activity.status(), AgentStatus::Working);
+}
+
+#[test]
+fn wsl_hook_codex_old_tool_hook_cannot_rebind_input_to_a_stale_turn() {
+    let mut activity = AgentActivity::default();
+    assert!(activity.apply_hook(&codex_verified_turn_event("UserPromptSubmit", "first", 1)));
+    let old_target = activity.codex_failure_target().unwrap();
+    activity.input_sent();
+    activity.apply_hook(&codex_verified_turn_event("PostToolUse", "first", 2));
+    assert!(activity.codex_failure_target().is_none());
+    assert!(!activity.observe_codex_failure(&old_target));
+
+    assert!(activity.apply_hook(&codex_verified_turn_event("UserPromptSubmit", "second", 3)));
+    let current = activity.codex_failure_target().unwrap();
+    assert_eq!(current.turn, "second");
+    assert!(!activity.observe_codex_failure(&old_target));
+    assert!(activity.observe_codex_failure(&current));
+}
+
+#[test]
+fn wsl_hook_codex_structured_finish_and_cancel_are_idle_not_success() {
+    for terminal in [CodexTerminalEvidence::Finished {}, CodexTerminalEvidence::Cancelled {}] {
+        let mut activity = AgentActivity::default();
+        assert!(activity.apply_hook(&codex_verified_turn_event("UserPromptSubmit", "first", 1)));
+        let target = activity.codex_failure_target().unwrap();
+        activity.mark_status_unconfirmed(
+            crate::ai_agents::AgentStatusUncertainty::AwaitingTerminalEvidence,
+        );
+        assert!(activity.observe_codex_terminal(&target, &terminal));
+        assert_eq!(activity.uncertainty(), None);
+        assert_eq!(activity.status(), AgentStatus::Idle);
+        assert_eq!(activity.source(), AgentStatusSource::Process);
+        assert!(activity.hook_seen());
+        assert!(activity.retired_codex_failure.is_none());
+        assert!(!activity.observe_codex_terminal(&target, &terminal));
+        for name in ["UserPromptSubmit", "PostToolUse", "PermissionRequest"] {
+            assert!(!activity.apply_hook(&codex_verified_turn_event(name, "first", 2)), "{name}");
+            assert_eq!(activity.status(), AgentStatus::Idle);
+        }
+    }
+}
+
+#[test]
+fn wsl_hook_codex_structured_idle_keeps_one_authoritative_stop_and_rejects_late_work() {
+    use crate::ai_hook::AiTurnOutcome;
+    for outcome in [AiTurnOutcome::Succeeded, AiTurnOutcome::Failed, AiTurnOutcome::Cancelled] {
+        let mut activity = AgentActivity::default();
+        assert!(activity.apply_hook(&codex_verified_turn_event("UserPromptSubmit", "first", 1)));
+        let target = activity.codex_failure_target().unwrap();
+        assert!(activity.observe_codex_terminal(&target, &CodexTerminalEvidence::Finished {}));
+        let mut stop = codex_verified_turn_event("Stop", "first", 2);
+        stop.turn_outcome = outcome;
+        assert!(activity.apply_hook(&stop), "a real Hook still owns its terminal outcome");
+        let expected = match outcome {
+            AiTurnOutcome::Succeeded => AgentStatus::Done,
+            AiTurnOutcome::Failed => AgentStatus::Failed,
+            _ => AgentStatus::Idle,
+        };
+        assert_eq!(activity.status(), expected);
+        assert_eq!(activity.source(), AgentStatusSource::Hook);
+        assert!(!activity.apply_hook(&codex_verified_turn_event("Stop", "first", 3)));
+        assert!(!activity.apply_hook(&codex_verified_turn_event("PostToolUse", "first", 4)));
+        assert!(!activity.observe_codex_terminal(&target, &CodexTerminalEvidence::Cancelled {}));
+        assert_eq!(activity.status(), expected);
+        assert!(activity.apply_hook(&codex_verified_turn_event("UserPromptSubmit", "second", 5)));
+        assert_eq!(activity.status(), AgentStatus::Working);
+        assert!(!activity.observe_codex_terminal(&target, &CodexTerminalEvidence::Finished {}));
+    }
+}
+
+#[test]
+fn wsl_hook_codex_terminal_evidence_rejects_foreign_or_unconfirmed_targets() {
+    let mut activity = AgentActivity::default();
+    assert!(activity.apply_hook(&codex_verified_turn_event("UserPromptSubmit", "first", 1)));
+    let target = activity.codex_failure_target().unwrap();
+    for field in ["session", "turn", "process"] {
+        let mut foreign = target.clone();
+        match field {
+            "session" => foreign.session = "foreign".into(),
+            "turn" => foreign.turn = "older".into(),
+            _ => foreign.process = "20:201".into(),
+        }
+        assert!(!activity.observe_codex_terminal(&foreign, &CodexTerminalEvidence::Finished {}));
+    }
+    activity.input_sent();
+    assert!(!activity.observe_codex_terminal(&target, &CodexTerminalEvidence::Finished {}));
+    assert!(activity.apply_hook(&codex_verified_turn_event("UserPromptSubmit", "second", 2)));
+    let current = activity.codex_failure_target().unwrap();
+    assert!(activity.apply_hook(&codex_verified_turn_event("PermissionRequest", "second", 3)));
+    assert!(!activity.observe_codex_terminal(&current, &CodexTerminalEvidence::Finished {}));
+    activity.command_finished();
+    assert!(!activity.observe_codex_terminal(&current, &CodexTerminalEvidence::Cancelled {}));
+}
+
+#[test]
+fn wsl_hook_codex_structured_failure_remains_failed_and_rejects_empty_errors() {
+    let mut activity = AgentActivity::default();
+    assert!(activity.apply_hook(&codex_verified_turn_event("UserPromptSubmit", "first", 1)));
+    let target = activity.codex_failure_target().unwrap();
+    assert!(!activity.observe_codex_terminal(
+        &target,
+        &CodexTerminalEvidence::Failed { error: "  ".into() },
+    ));
+    assert_eq!(activity.status(), AgentStatus::Working);
+    assert!(activity.observe_codex_terminal(
+        &target,
+        &CodexTerminalEvidence::Failed { error: "bounded terminal failure".into() },
+    ));
+    assert_eq!(activity.status(), AgentStatus::Failed);
+    assert!(!activity.observe_codex_terminal(&target, &CodexTerminalEvidence::Finished {}));
+    assert!(!activity.apply_hook(&codex_verified_turn_event("Stop", "first", 2)));
+}
+
 fn claude_turn_event(name: &str, prompt: &str, sequence: u64, trigger: &str) -> AiHookEvent {
     let payload = serde_json::json!({
         "hook_event_name": name, "session_id": "compact-session", "prompt_id": prompt,
@@ -70,6 +215,135 @@ fn claude_turn_event(name: &str, prompt: &str, sequence: u64, trigger: &str) -> 
     });
     let wire = format!("nebula-hook/1 source=claude process=4100:70\n{payload}");
     parse_remote_envelope(wire.as_bytes(), Some(1)).expect("supported Claude lifecycle event")
+}
+
+fn runtime_prompt_hook(program: &str, name: &str, turn: &str, sequence: u64) -> AiHookEvent {
+    match program {
+        "codex" => codex_verified_turn_event(name, turn, sequence),
+        "claude" => claude_turn_event(name, turn, sequence, ""),
+        _ => unreachable!("runtime prompt fixture provider"),
+    }
+}
+
+#[test]
+fn runtime_prompt_pending_rejects_old_stop_before_new_start() {
+    for program in ["codex", "claude"] {
+        let mut activity = AgentActivity::default();
+        assert!(activity.apply_hook(&runtime_prompt_hook(program, "UserPromptSubmit", "A", 1)));
+        activity.submitted_text(program, "new task B");
+        let uncertainty = activity.uncertainty();
+        assert!(activity.pending_submit);
+        assert!(uncertainty.is_some());
+
+        assert!(
+            !activity.apply_hook(&runtime_prompt_hook(program, "Stop", "A", 2)),
+            "{program}: old Stop A cannot acknowledge the pending runtime prompt B"
+        );
+        assert_eq!(activity.status(), AgentStatus::Working, "{program}");
+        assert_eq!(activity.source(), AgentStatusSource::Process, "{program}");
+        assert_eq!(activity.uncertainty(), uncertainty, "{program}");
+        assert!(activity.pending_submit, "{program}");
+    }
+}
+
+#[test]
+fn runtime_prompt_pending_does_not_reopen_a_completed_turn() {
+    for program in ["codex", "claude"] {
+        let mut activity = AgentActivity::default();
+        assert!(activity.apply_hook(&runtime_prompt_hook(program, "UserPromptSubmit", "A", 1)));
+        assert!(activity.apply_hook(&runtime_prompt_hook(program, "Stop", "A", 2)));
+        assert_eq!(activity.status(), AgentStatus::Done);
+        assert!(activity.uncertainty().is_none());
+        activity.submitted_text(program, "new task B");
+        let uncertainty = activity.uncertainty();
+        assert!(activity.pending_submit);
+        assert!(uncertainty.is_some());
+
+        assert!(
+            !activity.apply_hook(&runtime_prompt_hook(program, "Stop", "A", 3)),
+            "{program}: changing Done to pending Working must not reopen completed A"
+        );
+        assert_eq!(activity.status(), AgentStatus::Working, "{program}");
+        assert_eq!(activity.uncertainty(), uncertainty, "{program}");
+        assert!(activity.pending_submit, "{program}");
+    }
+}
+
+#[test]
+fn runtime_prompt_pending_accepts_the_new_turn_and_its_completion() {
+    for program in ["codex", "claude"] {
+        let mut activity = AgentActivity::default();
+        assert!(activity.apply_hook(&runtime_prompt_hook(program, "UserPromptSubmit", "A", 1)));
+        activity.submitted_text(program, "new task B");
+        assert!(activity.pending_submit);
+        assert!(activity.uncertainty().is_some());
+
+        assert!(activity.apply_hook(&runtime_prompt_hook(program, "UserPromptSubmit", "B", 2)));
+        assert!(!activity.pending_submit, "{program}");
+        assert_eq!(activity.status(), AgentStatus::Working, "{program}");
+        assert!(activity.uncertainty().is_none(), "{program}");
+        assert!(!activity.apply_hook(&runtime_prompt_hook(program, "Stop", "A", 3)));
+        assert!(activity.apply_hook(&runtime_prompt_hook(program, "Stop", "B", 4)));
+        assert_eq!(activity.status(), AgentStatus::Done, "{program}");
+        assert!(activity.uncertainty().is_none(), "{program}");
+    }
+}
+
+#[test]
+fn runtime_prompt_pending_keeps_current_turn_permission_and_tool_hooks_valid() {
+    for program in ["codex", "claude"] {
+        let mut activity = AgentActivity::default();
+        assert!(activity.apply_hook(&runtime_prompt_hook(program, "UserPromptSubmit", "A", 1)));
+        activity.submitted_text(program, "new task B");
+        assert!(activity.apply_hook(&runtime_prompt_hook(program, "UserPromptSubmit", "B", 2)));
+        assert!(activity.apply_hook(&runtime_prompt_hook(program, "PermissionRequest", "B", 3)));
+        assert_eq!(activity.status(), AgentStatus::Blocked, "{program}");
+        assert!(!activity.pending_submit, "{program}");
+
+        // Confirmation buttons write their reply without declaring another submitted prompt.
+        assert!(activity.apply_hook(&runtime_prompt_hook(program, "PostToolUse", "B", 4)));
+        assert_eq!(activity.status(), AgentStatus::Working, "{program}");
+        assert!(activity.uncertainty().is_none(), "{program}");
+        assert!(activity.apply_hook(&runtime_prompt_hook(program, "Stop", "B", 5)));
+        assert_eq!(activity.status(), AgentStatus::Done, "{program}");
+        assert!(activity.uncertainty().is_none(), "{program}");
+    }
+}
+
+#[test]
+fn runtime_prompt_pending_rejects_old_or_unidentified_hooks_until_new_prompt() {
+    for program in ["codex", "claude"] {
+        let mut activity = AgentActivity::default();
+        assert!(activity.apply_hook(&runtime_prompt_hook(program, "UserPromptSubmit", "A", 1)));
+        activity.submitted_text(program, "task B");
+        for name in ["Stop", "PostToolUse", "PermissionRequest", "SessionStart", "UserPromptSubmit"]
+        {
+            for turn in [Some("A"), None] {
+                let mut old = runtime_prompt_hook(program, name, "A", 2);
+                old.turn_id = turn.map(str::to_owned);
+                assert!(!activity.apply_hook(&old), "{program} {name} {turn:?}");
+                assert!(activity.uncertainty().is_some());
+                assert!(activity.pending_submit);
+            }
+        }
+        assert!(activity.apply_hook(&runtime_prompt_hook(program, "UserPromptSubmit", "B", 3)));
+        assert!(activity.uncertainty().is_none());
+    }
+}
+
+#[test]
+fn codex_terminal_probe_cannot_end_authoritative_background_work() {
+    let mut activity = AgentActivity::default();
+    assert!(activity.apply_hook(&codex_verified_turn_event("UserPromptSubmit", "A", 1)));
+    let target = activity.codex_failure_target().unwrap();
+    let wire = b"nebula-hook/1 source=codex process=20:200 codex_hooks=full\n{\"hook_event_name\":\"Stop\",\"session_id\":\"session\",\"turn_id\":\"A\",\"bridge_sequence\":2,\"background_tasks\":[{\"type\":\"local_bash\",\"status\":\"running\"}]}";
+    let stop = parse_remote_envelope(wire, Some(1)).unwrap();
+    assert_eq!(stop.active_background_tasks(), 1, "fixture must prove background work first");
+    assert!(activity.apply_hook(&stop));
+    assert_eq!(activity.status(), AgentStatus::Working);
+    assert!(!activity.observe_codex_terminal(&target, &CodexTerminalEvidence::Finished {}));
+    assert_eq!(activity.status(), AgentStatus::Working);
+    assert_eq!(activity.source(), AgentStatusSource::Hook);
 }
 
 #[test]
@@ -248,13 +522,13 @@ fn completion_only_hooks_latch_old_frames_but_can_observe_a_new_turn() {
         assert!(!activity.observe_screen(screen(status)));
         assert_eq!(activity.status(), AgentStatus::Done);
     }
-    // A single idle redraw does not reopen the previous turn.
-    activity.observe_screen(screen(AgentStatus::Idle));
-    activity.observe_screen(screen(AgentStatus::Working));
-    assert_eq!(activity.status(), AgentStatus::Done);
-    for _ in 0..2 {
+    // Empty Codex chrome never separates turns, even after repeated redraws.
+    for _ in 0..6 {
         activity.observe_screen(screen(AgentStatus::Idle));
     }
+    assert!(!activity.observe_screen(screen(AgentStatus::Working)));
+    assert_eq!(activity.status(), AgentStatus::Done);
+    activity.input_sent();
     assert!(activity.observe_screen(screen(AgentStatus::Working)));
     for _ in 0..6 {
         activity.observe_screen(screen(AgentStatus::Idle));
@@ -310,6 +584,18 @@ fn fallback_requires_consecutive_idle_and_work_before_a_completion() {
         for _ in 0..2 {
             activity.observe_screen(screen(AgentStatus::Idle));
         }
+        if agent == AgentKind::Codex {
+            assert_eq!(activity.status(), AgentStatus::Unknown);
+            assert!(activity.uncertainty().is_some());
+            assert!(activity.observe_screen(screen(AgentStatus::Working)));
+            for _ in 0..4 {
+                activity.observe_screen(screen(AgentStatus::Idle));
+            }
+            assert_eq!(activity.status(), AgentStatus::Working);
+            assert!(activity.uncertainty().is_some());
+            assert_eq!(screen_notification(AgentStatus::Working, activity.status(), false), None);
+            continue;
+        }
         assert_eq!(activity.status(), AgentStatus::Idle, "opening a CLI did not finish a turn");
         activity.observe_screen(screen(AgentStatus::Working));
         activity.observe_screen(screen(AgentStatus::Idle));
@@ -346,7 +632,10 @@ fn runtime_submission_does_not_finish_on_the_previous_idle_frame() {
         for _ in 0..2 {
             activity.observe_screen(screen(AgentStatus::Idle));
         }
-        let expected = if matches!(agent, AgentKind::Claude | AgentKind::Codex) {
+        let expected = if agent == AgentKind::Codex {
+            assert!(activity.uncertainty().is_some());
+            AgentStatus::Working
+        } else if agent == AgentKind::Claude {
             AgentStatus::Idle
         } else {
             AgentStatus::Done
@@ -361,7 +650,7 @@ fn codex_screen_idle_cannot_certify_an_answer_or_failure() {
         "› Ask Codex to do anything\ngpt-6-astra medium · Context 4% used\n? for shortcuts";
     for preceding in [AgentStatus::Working, AgentStatus::Blocked] {
         for (output, expected) in [
-            ("Completed answer.", AgentStatus::Idle),
+            ("Completed answer.", preceding),
             (
                 "■ stream disconnected before completion: failed to send request",
                 AgentStatus::Failed,
@@ -369,7 +658,7 @@ fn codex_screen_idle_cannot_certify_an_answer_or_failure() {
             ("■ Rate limit exceeded", AgentStatus::Failed),
             ("■ 401 Unauthorized", AgentStatus::Failed),
             ("■ 503 Service Unavailable", AgentStatus::Failed),
-            ("■ Turn interrupted", AgentStatus::Idle),
+            ("■ Turn interrupted", preceding),
         ] {
             let mut activity = AgentActivity::default();
             activity.begin_command(true);
@@ -420,8 +709,9 @@ fn local_mode_command_keeps_activity_and_real_prompts_keep_the_submission_barrie
             }
         }
         let source = activity.source();
+        let status = activity.status();
         activity.submitted_text("codex", "/plan");
-        assert_eq!(activity.status(), AgentStatus::Idle);
+        assert_eq!(activity.status(), status);
         assert_eq!(activity.source(), source);
         assert!(!activity.pending_submit);
         activity.submitted_text("codex", "请问我一个选择题");

@@ -33,6 +33,7 @@ fn wsl_hook_from_a_previous_pty_generation_has_no_effect(cx: &mut TestAppContext
 #[cfg(windows)]
 #[gpui::test]
 fn wsl_hook_codex_failure_notifies_once_and_rejects_closed_generation(cx: &mut TestAppContext) {
+    use crate::ai_hook::lifecycle::CodexTerminalEvidence;
     use crate::platform::wsl_hooks::channel::{Channel, PIPE_ENV, TOKEN_ENV};
     use crate::runtime_api::RuntimeTaskState;
     let (view, window, _) = open(cx);
@@ -57,15 +58,18 @@ fn wsl_hook_codex_failure_notifies_once_and_rejects_closed_generation(cx: &mut T
         let start = crate::ai_hook::parse_remote_envelope(b"nebula-hook/1 source=codex process=20:200 codex_hooks=full\n{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"main\",\"turn_id\":\"first\",\"bridge_sequence\":1}", Some(42)).unwrap();
         view.handle_ai_hook(&start, cx);
         let target = view.agent_activity.codex_failure_target().unwrap();
-        view.apply_wsl_codex_failure("old-generation", &target, "temporary failure".into(), cx);
+        let input_epoch = view.prompt_input_epoch;
+        let failure = |error: &str| CodexTerminalEvidence::Failed { error: error.into() };
+        view.apply_wsl_codex_terminal("old-generation", input_epoch, &target, failure("temporary failure"), cx);
         assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running);
-        view.apply_wsl_codex_failure(&generation, &target, "temporary failure".into(), cx);
+        view.apply_wsl_codex_terminal(&generation, input_epoch, &target, failure("temporary failure"), cx);
         assert_eq!(view.runtime_task_state(), RuntimeTaskState::Failed);
-        view.apply_wsl_codex_failure(&generation, &target, "duplicate".into(), cx);
+        view.apply_wsl_codex_terminal(&generation, input_epoch, &target, failure("duplicate"), cx);
         view.agent_activity.begin_command(true);
-        view.handle_ai_hook(&start, cx);
+        let next = crate::ai_hook::parse_remote_envelope(b"nebula-hook/1 source=codex process=20:200 codex_hooks=full\n{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"main\",\"turn_id\":\"second\",\"bridge_sequence\":2}", Some(42)).unwrap();
+        assert!(view.handle_ai_hook(&next, cx));
         view.shutdown();
-        view.apply_wsl_codex_failure(&generation, &target, "late".into(), cx);
+        view.apply_wsl_codex_terminal(&generation, input_epoch, &target, failure("late"), cx);
         assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running);
     });
     let notes = notifications.borrow();
@@ -77,6 +81,133 @@ fn wsl_hook_codex_failure_notifies_once_and_rejects_closed_generation(cx: &mut T
             ..
         }
     ));
+}
+
+#[cfg(windows)]
+fn codex_terminal_fixture(
+    view: &mut TerminalView,
+    cx: &mut Context<'_, TerminalView>,
+    session_id: &str,
+) -> (String, crate::ai_hook::lifecycle::CodexFailureTarget) {
+    use crate::platform::wsl_hooks::channel::{Channel, PIPE_ENV, TOKEN_ENV};
+    let mut options = nebula_terminal::tty::Options::default();
+    options.shell = Some(nebula_terminal::tty::Shell::new(
+        "wsl.exe".into(),
+        vec!["--distribution".into(), "fixture".into()],
+    ));
+    let generation = format!(
+        r"\\.\pipe\pebrel-wsl-hook-terminal-{}",
+        crate::ai_hook::remote::new_token().unwrap()
+    );
+    options.env.extend([
+        (PIPE_ENV.into(), generation.clone()),
+        (TOKEN_ENV.into(), "a".repeat(32)),
+        (crate::ai_hook::PANE_ENV.into(), "42".into()),
+        (crate::agent_env::PROCESS_ENV.into(), "900".into()),
+    ]);
+    let (mut session, _) = session::test_session();
+    session.wsl_hook = Channel::start(&options, |_, _| true).unwrap();
+    view.session = Some(session);
+    let wire = format!(
+        "nebula-hook/1 source=codex process=20:200 codex_hooks=full\n{{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"{session_id}\",\"turn_id\":\"first\",\"bridge_sequence\":1}}"
+    );
+    let start = crate::ai_hook::parse_remote_envelope(wire.as_bytes(), Some(42)).unwrap();
+    assert!(view.handle_ai_hook(&start, cx));
+    (generation, view.agent_activity.codex_failure_target().unwrap())
+}
+
+#[cfg(windows)]
+#[gpui::test]
+fn wsl_hook_codex_structured_idle_is_silent_and_real_stop_notifies_once(cx: &mut TestAppContext) {
+    use crate::ai_hook::lifecycle::CodexTerminalEvidence;
+    use crate::runtime_api::RuntimeTaskState;
+    let (view, window, _) = open(cx);
+    let notifications = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let observed = notifications.clone();
+    let _subscription = view.update(window, |_, cx| {
+        cx.subscribe(&view, move |_, _, event, _| {
+            if let TerminalViewEvent::Notification(note) = event {
+                observed.borrow_mut().push(note.clone());
+            }
+        })
+    });
+    view.update(window, |view, cx| {
+        let (generation, target) = codex_terminal_fixture(view, cx, "terminal-idle");
+        let epoch = view.prompt_input_epoch;
+        view.apply_wsl_codex_terminal(&generation, epoch, &target, CodexTerminalEvidence::Finished {}, cx);
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Idle);
+        assert!(notifications.borrow().is_empty());
+        let stop = |sequence| crate::ai_hook::parse_remote_envelope(
+            format!("nebula-hook/1 source=codex process=20:200 codex_hooks=full\n{{\"hook_event_name\":\"Stop\",\"session_id\":\"terminal-idle\",\"turn_id\":\"first\",\"bridge_sequence\":{sequence}}}").as_bytes(),
+            Some(42),
+        ).unwrap();
+        view.handle_ai_hook(&stop(2), cx);
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Finished);
+        view.handle_ai_hook(&stop(3), cx);
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Finished);
+        view.shutdown();
+    });
+    assert_eq!(notifications.borrow().len(), 1);
+}
+
+#[cfg(windows)]
+#[gpui::test]
+fn wsl_hook_codex_terminal_result_requires_input_epoch_channel_and_current_turn(
+    cx: &mut TestAppContext,
+) {
+    use crate::ai_hook::lifecycle::CodexTerminalEvidence;
+    use crate::runtime_api::RuntimeTaskState;
+    let (view, window, _) = open(cx);
+    view.update(window, |view, cx| {
+        let (generation, target) = codex_terminal_fixture(view, cx, "terminal-guard");
+        let old_epoch = view.prompt_input_epoch;
+        view.prompt_input_epoch = view.prompt_input_epoch.wrapping_add(1);
+        view.apply_wsl_codex_terminal(
+            &generation,
+            old_epoch,
+            &target,
+            CodexTerminalEvidence::Finished {},
+            cx,
+        );
+        assert_eq!(
+            view.runtime_task_state(),
+            RuntimeTaskState::Running,
+            "input invalidates old probe even without a Hook"
+        );
+        let epoch = view.prompt_input_epoch;
+        view.apply_wsl_codex_terminal(
+            "retired-generation",
+            epoch,
+            &target,
+            CodexTerminalEvidence::Finished {},
+            cx,
+        );
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running);
+        let mut wrong = target.clone();
+        wrong.turn = "old-turn".into();
+        view.apply_wsl_codex_terminal(
+            &generation,
+            epoch,
+            &wrong,
+            CodexTerminalEvidence::Finished {},
+            cx,
+        );
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running);
+        view.agent_activity.input_sent();
+        view.apply_wsl_codex_terminal(
+            &generation,
+            epoch,
+            &target,
+            CodexTerminalEvidence::Cancelled {},
+            cx,
+        );
+        assert_eq!(
+            view.runtime_task_state(),
+            RuntimeTaskState::Running,
+            "new input cannot re-probe the old bound turn"
+        );
+        view.shutdown();
+    });
 }
 
 #[cfg(windows)]
@@ -302,7 +433,7 @@ fn command_end_clears_progress_and_stale_agent_state(cx: &mut TestAppContext) {
             view.suggest.last_committed = "pi update --extensions".into();
             view.on_command_start(cx);
             view.process_event(TermEvent::Progress { state: 3, value: None }, cx);
-            assert_eq!(view.sidebar_activity(), SidebarActivity::Running);
+            assert_eq!(view.sidebar_activity(), SidebarActivity::Unconfirmed);
             view.process_event(TermEvent::CommandDone { exit_code: Some(code) }, cx);
             screen(view, "◦ Working (1s • esc to interrupt)\n› Ask Codex to do anything");
             view.refresh_agent_screen_state(cx);
@@ -365,7 +496,7 @@ fn output_rule_source_does_not_turn_a_working_codex_into_attention(cx: &mut Test
     let (view, window, _) = open(cx);
     view.update(window, |view, cx| {
         view.running_program = Some("codex".into());
-        screen(view, "  { contains = [\"(y/n)\"] },\n  { contains = [\"[y/n]\"] },\n]\n\n◦ Working (12m 36s • esc to interrupt)\n\n› Ask Codex to do anything");
+        screen(view, "  { contains = [\"(y/n)\"] },\n  { contains = [\"[y/n]\"] },\n]\n\n◦ Working (12m 36s • esc to interrupt)\n\n› Ask Codex to do anything\ngpt-6-astra medium · Context 4% used\n? for shortcuts");
         view.refresh_agent_screen_state(cx);
         assert_eq!(view.agent_activity.status(), AgentStatus::Working);
         assert_eq!(view.sidebar_activity(), SidebarActivity::Running);
@@ -391,10 +522,10 @@ fn codex_screen_retry_and_idle_do_not_emit_completion(cx: &mut TestAppContext) {
     let footer =
         "› Ask Codex to do anything\ngpt-6-astra medium · Context 4% used\n? for shortcuts";
     for (output, expected) in [
-        ("Completed answer.", AgentStatus::Idle),
+        ("Completed answer.", AgentStatus::Working),
         ("■ stream disconnected before completion: failed to send request", AgentStatus::Failed),
         ("■ Rate limit exceeded", AgentStatus::Failed),
-        ("■ Turn interrupted", AgentStatus::Idle),
+        ("■ Turn interrupted", AgentStatus::Working),
     ] {
         notifications.borrow_mut().clear();
         view.update(window, |view, cx| {
@@ -422,12 +553,12 @@ fn codex_screen_retry_and_idle_do_not_emit_completion(cx: &mut TestAppContext) {
             let expected_runtime = if expected == AgentStatus::Failed {
                 RuntimeTaskState::Failed
             } else {
-                RuntimeTaskState::Idle
+                RuntimeTaskState::Running
             };
             let expected_sidebar = if expected == AgentStatus::Failed {
                 SidebarActivity::Failed
             } else {
-                SidebarActivity::Idle
+                SidebarActivity::Unconfirmed
             };
             assert_eq!(view.runtime_task_state(), expected_runtime);
             assert_eq!(view.sidebar_activity(), expected_sidebar);
@@ -772,6 +903,30 @@ fn codex_hooks_still_complete_once_after_screen_only_idle(cx: &mut TestAppContex
         assert_eq!(view.runtime_task_state(), RuntimeTaskState::Idle);
     });
     assert_eq!(notifications.borrow().len(), 1, "interrupt must not notify completion");
+}
+
+#[gpui::test]
+fn rejected_hook_does_not_report_an_applied_event_to_the_dispatcher(cx: &mut TestAppContext) {
+    let (view, window, _) = open(cx);
+    let event = |name: &str, turn: &str| {
+        let payload = serde_json::json!({
+            "hook_event_name": name, "session_id": "rejected-hook-result", "turn_id": turn,
+        });
+        crate::ai_hook::parse_remote_envelope(
+            format!("nebula-hook/1 source=codex codex_hooks=full pane=42\n{payload}").as_bytes(),
+            Some(42),
+        )
+        .unwrap()
+    };
+    view.update(window, |view, cx| {
+        assert!(view.handle_ai_hook(&event("UserPromptSubmit", "new"), cx));
+        let old = event("Stop", "old");
+        assert!(!view.agent_activity.accepts_hook(&old));
+        assert!(!view.handle_ai_hook(&old, cx), "routing is not evidence of applying a Hook");
+        assert_eq!(view.agent_activity.status(), AgentStatus::Working);
+        assert!(view.handle_ai_hook(&event("Stop", "new"), cx));
+        assert!(!view.handle_ai_hook(&event("Stop", "new"), cx), "duplicate is not applied");
+    });
 }
 
 #[gpui::test]

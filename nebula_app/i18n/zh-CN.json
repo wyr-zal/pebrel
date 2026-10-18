@@ -234,7 +234,13 @@
       "helper_missing": "缺少 hook 辅助程序，请修复 Pebrel 安装后再启用。",
       "needs_repair": "Hook 已安装 · 需修复",
       "initialize": "请先运行一次此工具以创建配置，然后刷新。",
-      "config_path": "配置：{path}"
+      "config_path": "配置：{path}",
+      "native_capability_checking": "本机 Hook helper：正在检查能力…",
+      "native_capability_compatible": "本机 Hook helper：支持所需协议",
+      "native_capability_unavailable": "本机 Hook helper：能力未核实，已启用的 Hook 保持启用。",
+      "wsl_capability_checking": "WSL 通道 helper：正在检查能力…",
+      "wsl_capability_compatible": "WSL 通道 helper：支持所需协议，实际投递情况见各窗格。",
+      "wsl_capability_unavailable": "WSL 通道 helper：所需能力不可用，请检查配套 helper 安装。"
     }
   },
   "provider": {
@@ -1072,6 +1078,7 @@
     "tab_color": "标签颜色"
   },
   "chrome": {
+    "agent_state_unconfirmed": "Agent 状态未确认，请查看终端；尚未据此判定任务完成。",
     "local_administrator": "本机 Pebrel 进程正以 Windows 管理员身份运行",
     "new_terminal_ctrl_shift_t": "新建终端 (Ctrl+Shift+T)",
     "more": "更多",

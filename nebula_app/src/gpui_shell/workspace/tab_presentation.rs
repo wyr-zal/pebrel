@@ -139,13 +139,22 @@ impl NebulaWorkspace {
                 .text(crate::i18n::Message::SettingsNotificationsScreenErrorBadge)
                 .into()
         });
-        let tooltip = self.tabs[ix]
-            .focused_view()
-            .map(|view| view.read(cx).tab_tooltip(&title).into());
+        let tooltip =
+            self.tabs[ix].focused_view().map(|view| view.read(cx).tab_tooltip(&title).into());
         let tooltip = match (tooltip, screen_error_label.as_ref()) {
             (Some(tooltip), Some(label)) => Some(format!("{tooltip}\n{label}").into()),
             (None, Some(label)) => Some(label.clone()),
             (tooltip, None) => tooltip,
+        };
+        let tooltip = if activity == SidebarActivity::Unconfirmed {
+            let label = crate::gpui_shell::config::ui_language(cx)
+                .text(crate::i18n::Message::ChromeAgentStateUnconfirmed);
+            Some(match tooltip {
+                Some(tooltip) => format!("{tooltip}\n{label}").into(),
+                None => label.into(),
+            })
+        } else {
+            tooltip
         };
         TabPresentation {
             title,
@@ -215,6 +224,23 @@ pub(super) fn administrator_badge(selector: SharedString, cx: &App) -> gpui::Sta
                 .size(px(TAB_LABEL_ICON_SIZE))
                 .text_color(cx.theme().warning),
         )
+        .tooltip(move |window, cx| tooltip(label.into(), window, cx))
+}
+
+pub(super) fn unconfirmed_status(selector: SharedString, cx: &App) -> gpui::Stateful<gpui::Div> {
+    let label = crate::gpui_shell::config::ui_language(cx)
+        .text(crate::i18n::Message::ChromeAgentStateUnconfirmed);
+    div()
+        .id(selector.clone())
+        .debug_selector(move || selector.to_string())
+        .role(gpui::accesskit::Role::Image)
+        .aria_label(label)
+        .flex_shrink_0()
+        .size(px(TAB_LABEL_ICON_SIZE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(Icon::new(IconName::Info).xsmall().text_color(cx.theme().warning))
         .tooltip(move |window, cx| tooltip(label.into(), window, cx))
 }
 

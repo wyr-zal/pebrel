@@ -12,6 +12,7 @@ mod codex_notify;
 mod config_guard;
 mod cursor;
 mod extended;
+pub(super) mod helper_health;
 mod kimi;
 mod managed_files;
 mod runtime_skills;

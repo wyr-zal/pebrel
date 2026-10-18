@@ -149,14 +149,15 @@ impl TerminalView {
                         args: shell.args().to_vec(),
                     },
                 );
-                let options = session::local_options(spawn_shell, pane_id, cwd);
+                let (options, wsl_hook_required) =
+                    session::local_options(spawn_shell, pane_id, cwd);
                 let history_cwd = startup_history_directory(&options, &suggest_env);
                 completion_cwd = history_cwd
                     .as_ref()
                     .map(|path| path.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 let exec_context = crate::runtime_exec::PaneExecContext::from_pty_options(&options);
-                let spawned = session::spawn(initial, term_config, options);
+                let spawned = session::spawn(initial, term_config, options, wsl_hook_required);
                 if spawned.is_ok()
                     && let Some(cwd) = history_cwd
                 {
@@ -301,6 +302,10 @@ impl TerminalView {
             agent_identity_probe_epoch: 0,
             last_agent_identity_probe: None,
             agent_identity_probe_cancel: None,
+            agent_identity_probe_closed: std::sync::atomic::AtomicBool::new(false),
+            agent_identity_probe_wake: true,
+            agent_identity_probe_misses: 0,
+            agent_identity_receipt: None,
             prompt_process_probe: None,
             prompt_input_epoch: 0,
             native_prompt_seen: false,
@@ -395,6 +400,7 @@ impl TerminalView {
             last_command_failed: false,
             completed_at: None,
             last_task_state: None,
+            last_wsl_hook_channel: None,
             bell_flash: false,
             bell_flash_epoch: 0,
         };

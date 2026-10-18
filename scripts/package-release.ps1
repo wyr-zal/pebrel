@@ -161,6 +161,8 @@ if ($missing.Count -ne 0) {
 $packagedExe = $manifest['pebrel.exe']
 . (Join-Path $PSScriptRoot 'windows-package-architecture.ps1')
 Assert-WindowsPackageArchitecture -Root $targetRoot -Architecture $Architecture
+. (Join-Path $PSScriptRoot 'windows-hook-capabilities.ps1')
+Assert-WindowsHookCapabilities -HelperPath $manifest['runtime/pebrel-hook.exe']
 Assert-FreshBinaries
 if ($PackageBrand -eq 'Pebrel' -and (Get-Item -LiteralPath $packagedExe).VersionInfo.ProductName -ne 'Pebrel') {
     throw 'Pebrel packages require a freshly built Pebrel executable, not renamed Nebula binaries.'

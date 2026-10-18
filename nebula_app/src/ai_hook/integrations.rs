@@ -53,6 +53,7 @@ pub(crate) fn hook_for(agent: AgentKind) -> Option<AgentHook> {
 }
 
 pub(crate) fn inspect() -> Vec<AgentIntegration> {
+    super::refresh_helper_health();
     let dirs = executable_directories();
     AGENTS
         .into_iter()

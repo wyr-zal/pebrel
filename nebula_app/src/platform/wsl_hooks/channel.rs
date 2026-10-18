@@ -9,6 +9,7 @@ use nebula_terminal::tty;
 use serde::{Deserialize, Serialize};
 
 use crate::ai_agents::AgentKind;
+use crate::ai_hook::lifecycle::CodexTerminalEvidence;
 
 #[cfg(test)]
 mod live_tests;
@@ -32,7 +33,7 @@ struct Evidence {
     anchor: Anchor,
     argv: Vec<[String; 3]>,
     #[serde(default)]
-    failure: Option<String>,
+    terminal: Option<CodexTerminalEvidence>,
 }
 
 #[derive(Clone)]
@@ -203,13 +204,13 @@ impl FailureProbe {
     pub(crate) fn run(
         &self,
         target: &crate::ai_hook::lifecycle::CodexFailureTarget,
-    ) -> Option<String> {
+    ) -> Option<CodexTerminalEvidence> {
         if self.stop.is_set() {
             return None;
         }
         let request = serde_json::json!({"pane":self.scope.pane,"instance":self.scope.instance,
             "token":self.scope.token,"user":self.scope.user,"owner":target.process,
-            "anchor":self.scope.anchor,"failure":{"session":target.session,"turn":target.turn}});
+            "anchor":self.scope.anchor,"terminal":{"session":target.session,"turn":target.turn}});
         let evidence = self.scope.probe_request(
             request,
             &self.stop,
@@ -219,7 +220,7 @@ impl FailureProbe {
         if self.stop.is_set() {
             return None;
         }
-        evidence.failure
+        evidence.terminal
     }
 }
 
@@ -315,6 +316,10 @@ impl Channel {
     pub(crate) fn accepts(&self, generation: &str) -> bool {
         !self.stop.is_set() && generation == self.generation
     }
+
+    pub(crate) fn diagnostics(&self) -> (bool, bool) {
+        (!self.stop.is_set(), self.authenticated.lock().is_ok_and(|scope| scope.is_some()))
+    }
 }
 
 impl Drop for Channel {
@@ -356,6 +361,7 @@ fn serve(
         let _ = endpoint.acknowledge(accepted, &stop, deadline);
         endpoint.disconnect();
     }
+    stop.set();
 }
 
 #[cfg(test)]
@@ -380,6 +386,48 @@ mod tests {
 
     fn evidence() -> Evidence {
         serde_json::from_value(json!({"anchor":{"pid":10,"start":"100","uid":1000,"tty":"42","session":"10"},"argv":[["claude","claude",""]]})).unwrap()
+    }
+
+    #[test]
+    fn wsl_hook_codex_terminal_response_preserves_explicit_kinds_and_missing_evidence() {
+        use crate::ai_hook::lifecycle::CodexTerminalEvidence;
+        let base = json!({"anchor":{"pid":10,"start":"100","uid":1000,"tty":"42","session":"10"},"argv":[["codex","codex",""]]});
+        for (terminal, expected) in [
+            (json!({"kind":"finished"}), CodexTerminalEvidence::Finished {}),
+            (json!({"kind":"cancelled"}), CodexTerminalEvidence::Cancelled {}),
+            (
+                json!({"kind":"failed","error":"failure"}),
+                CodexTerminalEvidence::Failed { error: "failure".into() },
+            ),
+        ] {
+            let mut value = base.clone();
+            value["terminal"] = terminal;
+            let parsed: Evidence = serde_json::from_value(value).unwrap();
+            assert_eq!(parsed.terminal, Some(expected));
+        }
+        for terminal in [None, Some(serde_json::Value::Null)] {
+            let mut value = base.clone();
+            if let Some(terminal) = terminal {
+                value["terminal"] = terminal;
+            }
+            let parsed: Evidence = serde_json::from_value(value).unwrap();
+            assert_eq!(parsed.terminal, None);
+        }
+    }
+
+    #[test]
+    fn wsl_hook_codex_terminal_response_rejects_unknown_or_malformed_outcomes() {
+        use crate::ai_hook::lifecycle::CodexTerminalEvidence;
+        for value in [
+            json!({}),
+            json!({"kind":"done"}),
+            json!({"kind":"failed"}),
+            json!({"kind":"failed","error":null}),
+            json!({"kind":"finished","error":"not an idle fact"}),
+            json!({"kind":"cancelled","error":"not an idle fact"}),
+        ] {
+            assert!(serde_json::from_value::<CodexTerminalEvidence>(value).is_err());
+        }
     }
 
     #[test]
@@ -460,7 +508,7 @@ mod tests {
                 .accept(&input, |_, _| Some(Evidence {
                     anchor: launched.anchor.clone(),
                     argv: launched.argv.clone(),
-                    failure: None
+                    terminal: None
                 }))
                 .is_some()
         );
@@ -470,7 +518,7 @@ mod tests {
                 .accept(&input, |_, _| Some(Evidence {
                     anchor: launched.anchor.clone(),
                     argv: launched.argv.clone(),
-                    failure: None
+                    terminal: None
                 }))
                 .is_none(),
             "a real outer Codex remains nested"

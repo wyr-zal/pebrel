@@ -116,21 +116,21 @@ impl Target {
 
 /// Called during local PTY preparation. Guest I/O belongs to one setup worker;
 /// the caller checks the local preference and prepares the pane environment.
-pub(crate) fn prepare(options: &mut tty::Options) {
-    let Some(target) = options.shell.as_ref().and_then(Target::from_shell) else { return };
+pub(crate) fn prepare(options: &mut tty::Options) -> bool {
+    let Some(target) = options.shell.as_ref().and_then(Target::from_shell) else { return false };
     let enabled = nebula_settings::RawSettings::load().bool_on("ai_hooks") != Some(false);
     #[cfg(feature = "gpui-shell")]
     if let Err(error) = super::channel::prepare(options, enabled) {
         log::warn!("ai_hook: WSL pipe preparation unavailable: {error}");
     }
     if !enabled {
-        return;
+        return false;
     }
     let token = match remote::new_token() {
         Ok(token) => token,
         Err(error) => {
             log::warn!("ai_hook: WSL channel unavailable: {error}");
-            return;
+            return true;
         },
     };
     options.env.insert(remote::TOKEN_ENV.into(), token);
@@ -145,6 +145,7 @@ pub(crate) fn prepare(options: &mut tty::Options) {
         Some(()) => {},
         None => log::warn!("ai_hook: WSL setup queue unavailable; retry with setup-ai --wsl"),
     }
+    true
 }
 
 fn worker() -> Option<&'static mpsc::SyncSender<Target>> {

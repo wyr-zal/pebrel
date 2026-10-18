@@ -213,10 +213,10 @@ impl TerminalView {
         // Entering a nested interactive shell is not itself a running task.
         // Local process evidence refines that case; ordinary commands retain
         // their shell boundary even when they have no child process.
-        let program_is_work = self
-            .running_program
-            .as_deref()
-            .is_some_and(|program| !crate::process_tree::is_interactive_shell_command(program));
+        let program_is_work = self.running_program.as_deref().is_some_and(|program| {
+            crate::ai_agents::AgentKind::parse(program).is_none()
+                && !crate::process_tree::is_interactive_shell_command(program)
+        });
         if (self.command_running && !self.command_running_disproved)
             || program_is_work
             || self
@@ -238,6 +238,25 @@ impl TerminalView {
             .or(self.running_program.as_deref())?;
         let kind = crate::ai_agents::AgentKind::parse(raw)?;
         Some(self.runtime_agent_for_kind(kind))
+    }
+
+    fn task_state_uncertainty(&self) -> Option<crate::ai_agents::AgentStatusUncertainty> {
+        let pane_failed = self.error.is_some()
+            || self.exited.is_some()
+            || matches!(self.ssh_stage.as_ref(), Some(crate::ssh_session::SshStage::Failed(_)));
+        let known_agent = self
+            .running_program
+            .as_deref()
+            .or_else(|| self.ai_session.as_ref().map(|identity| identity.source.as_str()))
+            .and_then(crate::ai_agents::AgentKind::parse)
+            .is_some();
+        (!pane_failed && known_agent).then(|| self.agent_activity.uncertainty()).flatten()
+    }
+
+    pub fn runtime_state_evidence(&self) -> crate::runtime_api::RuntimeStateEvidence {
+        let reason =
+            self.task_state_uncertainty().map(crate::ai_agents::AgentStatusUncertainty::as_str);
+        crate::runtime_api::RuntimeStateEvidence::from_uncertainty(reason)
     }
 
     /// Send-to-Chat 只能投递给当前仍占据 pane 的 Agent。`ai_session` 会为会话
@@ -283,6 +302,9 @@ impl TerminalView {
 
     pub fn sidebar_activity(&self) -> SidebarActivity {
         let state = self.runtime_task_state();
+        if self.task_state_uncertainty().is_some() {
+            return SidebarActivity::Unconfirmed;
+        }
         // pane 级故障永远优先；普通 CLI 才允许 OSC 9;4 覆盖弱推断。这里只改变
         // badge，不改变 RuntimeTaskState，避免进度协议干扰 agent.wait/自动回传。
         if state == crate::runtime_api::RuntimeTaskState::Failed {
@@ -329,6 +351,11 @@ impl TerminalView {
     /// 被看到、对勾实际停留 `COMPLETION_FLASH`..+1s——「短暂闪现」这个语义容得下
     /// 这个精度，换来的是零新增定时器。
     pub(crate) fn sync_activity_badges(&mut self, cx: &mut Context<Self>) {
+        let channel = self.runtime_wsl_hook_channel();
+        if self.last_wsl_hook_channel != channel {
+            self.last_wsl_hook_channel = channel;
+            cx.notify();
+        }
         let state = self.runtime_task_state();
         if self.last_task_state != Some(state) {
             self.last_task_state = Some(state);
@@ -405,6 +432,8 @@ impl TerminalView {
             self.exited.is_some(),
             self.exited.clone(),
         );
+        read.state_evidence = self.runtime_state_evidence();
+        read.wsl_hook_channel = self.runtime_wsl_hook_channel();
         if let Some(screen) = screen {
             let palette = |index| self.palette.query_reply(index, term.colors());
             let capture = match screen {
@@ -421,6 +450,37 @@ impl TerminalView {
             read.screen = Some(capture?);
         }
         Ok(read)
+    }
+
+    pub fn runtime_wsl_hook_channel(&self) -> Option<crate::runtime_api::RuntimeWslHookChannel> {
+        #[cfg(windows)]
+        {
+            let session = self.session.as_ref()?;
+            if !session.wsl_hook_required && session.wsl_hook.is_none() {
+                return None;
+            }
+            let (receiver_available, authenticated) = session
+                .wsl_hook
+                .as_ref()
+                .map(|channel| channel.diagnostics())
+                .unwrap_or((false, false));
+            let helper = session
+                .wsl_hook_helper
+                .as_deref()
+                .map(crate::ai_hook::cached_wsl_helper_health_for_path)
+                .unwrap_or(crate::ai_hook::HelperHealth {
+                    state: crate::ai_hook::HelperHealthState::Unavailable,
+                    reason: Some(crate::ai_hook::HelperHealthReason::MissingFile),
+                });
+            Some(crate::runtime_api::RuntimeWslHookChannel {
+                receiver_available,
+                authenticated,
+                lifecycle_seen: session.wsl_hook_lifecycle_seen,
+                helper,
+            })
+        }
+        #[cfg(not(windows))]
+        None
     }
 
     pub(crate) fn runtime_scroll(
@@ -1207,6 +1267,47 @@ mod tests {
         InputOrigin, SidebarActivity, local_context_refusal, probe_result_is_current,
         progress_sidebar_activity, runtime_chat_agent_kind,
     };
+
+    #[cfg(all(windows, feature = "gpui-test-support"))]
+    #[gpui::test]
+    fn wsl_channel_diagnostics_exist_before_an_agent_is_identified(cx: &mut gpui::TestAppContext) {
+        let (view, window, _) = super::super::startup_tests::open(cx);
+        view.update(window, |view, _| {
+            let (mut session, _) = crate::gpui_shell::terminal::session::test_session();
+            session.wsl_hook_required = true;
+            view.session = Some(session);
+            assert!(view.runtime_agent().is_none());
+            let value = serde_json::to_value(view.runtime_read(1, 24, None).unwrap()).unwrap();
+            assert_eq!(value["wsl_hook_channel"]["receiver_available"], false);
+            assert_eq!(value["wsl_hook_channel"]["authenticated"], false);
+            assert_eq!(value["wsl_hook_channel"]["lifecycle_seen"], false);
+            assert_eq!(value["wsl_hook_channel"]["helper"]["state"], "unavailable");
+            assert_eq!(value["wsl_hook_channel"]["helper"]["reason"], "missing_file");
+        });
+    }
+
+    #[cfg(feature = "gpui-test-support")]
+    #[gpui::test]
+    fn state_confirmation_does_not_spin_for_ambiguous_screen_or_identity_only(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::ai_agents::{AgentKind, AgentStatus, AgentStatusSource, Detection};
+        let (view, window, _) = super::super::startup_tests::open(cx);
+        view.update(window, |view, _| {
+            view.running_program = Some("codex".into());
+            view.agent_activity.identify(AgentStatusSource::Process);
+            assert_ne!(view.sidebar_activity(), SidebarActivity::Running, "identity is not work");
+            view.agent_activity.observe_screen(Some(Detection {
+                agent: AgentKind::Codex,
+                status: AgentStatus::Working,
+                rule_id: "working_status".into(),
+            }));
+            assert_eq!(view.sidebar_activity(), SidebarActivity::Running);
+            view.agent_activity.observe_screen(None);
+            assert_eq!(view.agent_activity.status(), AgentStatus::Working, "retain last evidence");
+            assert_ne!(view.sidebar_activity(), SidebarActivity::Running, "but expose uncertainty");
+        });
+    }
 
     #[test]
     fn osc_progress_drives_cli_badges_but_never_overrides_agent_hooks() {

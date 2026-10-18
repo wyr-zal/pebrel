@@ -7,4 +7,6 @@ mod windows;
 pub(crate) use windows::{prepare, setup_cli};
 
 #[cfg(not(windows))]
-pub(crate) fn prepare(_options: &mut nebula_terminal::tty::Options) {}
+pub(crate) fn prepare(_options: &mut nebula_terminal::tty::Options) -> bool {
+    false
+}

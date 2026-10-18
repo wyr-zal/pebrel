@@ -1009,7 +1009,7 @@ pub(super) fn wait_agent_ready(
             && let Ok(pane) = current.pane(Some(agent.window_id), agent.pane_id)
         {
             observed_state = Some(pane.task_state);
-            if agent.observed {
+            if agent.observed && pane.state_evidence.confirmed {
                 // 只有确认空闲才算就绪。此前判据是 `!= Running`，于是停在登录、
                 // 更新确认或任何交互提问上的 Agent 都被当成就绪，initial_prompt
                 // 直接打进那个弹窗。非空闲的驻留态一律带现场返回，不提交 prompt。

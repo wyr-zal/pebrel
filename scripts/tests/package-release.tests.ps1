@@ -43,6 +43,7 @@ try {
     }
     & (Join-Path $PSScriptRoot 'build-windows-product.tests.ps1')
     & (Join-Path $PSScriptRoot 'windows-package-architecture.tests.ps1')
+    & (Join-Path $PSScriptRoot 'windows-hook-capabilities.tests.ps1')
 
     if ($scriptBody -notmatch 'Assert-FreshBinaries') {
         throw 'Release packaging must refuse stale binaries (freshness guard missing).'

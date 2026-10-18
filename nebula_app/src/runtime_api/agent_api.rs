@@ -386,6 +386,7 @@ pub(super) fn agents_connection(
                     ssh_destination: pane.ssh_destination.clone(),
                     agent,
                     task_state: pane.task_state,
+                    state_evidence: pane.state_evidence.clone(),
                     state_change_seq: pane.state_change_seq,
                 });
             }

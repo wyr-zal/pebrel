@@ -234,7 +234,13 @@
       "helper_missing": "The hook helper is missing. Repair the Pebrel installation to enable hooks.",
       "needs_repair": "Hook installed · needs repair",
       "initialize": "Run this agent once to create its configuration, then refresh.",
-      "config_path": "Configuration: {path}"
+      "config_path": "Configuration: {path}",
+      "native_capability_checking": "Local hook helper: checking capabilities…",
+      "native_capability_compatible": "Local hook helper: required protocol supported",
+      "native_capability_unavailable": "Local hook helper: capabilities unverified. Existing hooks remain enabled.",
+      "wsl_capability_checking": "WSL channel helper: checking capabilities…",
+      "wsl_capability_compatible": "WSL channel helper: required protocol supported; delivery is reported per pane.",
+      "wsl_capability_unavailable": "WSL channel helper: required capabilities unavailable. Check the paired helper installation."
     }
   },
   "provider": {
@@ -1072,6 +1078,7 @@
     "tab_color": "Tab color"
   },
   "chrome": {
+    "agent_state_unconfirmed": "Agent state is unconfirmed. Check the terminal; no completion has been inferred.",
     "local_administrator": "Local Pebrel process is running as Windows administrator",
     "new_terminal_ctrl_shift_t": "New terminal (Ctrl+Shift+T)",
     "more": "More",

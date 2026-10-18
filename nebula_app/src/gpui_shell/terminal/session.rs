@@ -69,6 +69,12 @@ impl Dimensions for GridSize {
 pub struct TerminalSession {
     #[cfg(windows)]
     pub(super) wsl_hook: Option<crate::platform::wsl_hooks::channel::Channel>,
+    #[cfg(windows)]
+    pub(super) wsl_hook_required: bool,
+    #[cfg(windows)]
+    pub(super) wsl_hook_helper: Option<std::path::PathBuf>,
+    #[cfg(windows)]
+    pub(super) wsl_hook_lifecycle_seen: bool,
     pub term: Arc<FairMutex<Term<EventProxy>>>,
     pub notifier: Notifier,
     pub(super) native_prompt: super::event_mailbox::NativePromptState,
@@ -89,7 +95,7 @@ impl TerminalSession {
     pub(super) fn accepts_remote_hook(&self, bytes: &[u8]) -> bool {
         #[cfg(windows)]
         {
-            if self.wsl_hook.is_some() {
+            if self.wsl_hook_required || self.wsl_hook.is_some() {
                 let header = bytes.split(|byte| *byte == b'\n').next().unwrap_or_default();
                 if std::str::from_utf8(header).is_ok_and(|header| {
                     header
@@ -129,6 +135,12 @@ pub(super) fn test_session_with_events() -> (
         TerminalSession {
             #[cfg(windows)]
             wsl_hook: None,
+            #[cfg(windows)]
+            wsl_hook_required: false,
+            #[cfg(windows)]
+            wsl_hook_helper: None,
+            #[cfg(windows)]
+            wsl_hook_lifecycle_seen: false,
             term: Arc::new(FairMutex::new(term)),
             notifier: Notifier(sender),
             native_prompt: proxy.events.native_prompt.clone(),
@@ -159,7 +171,7 @@ pub(super) fn local_options(
     shell: Option<tty::Shell>,
     pane_id: u64,
     cwd: Option<std::path::PathBuf>,
-) -> tty::Options {
+) -> (tty::Options, bool) {
     let mut options = tty::Options::default();
     options.shell = shell;
     options.working_directory = cwd;
@@ -187,15 +199,31 @@ pub(super) fn local_options(
     // 身份契约必须最后写：它以环境表里 `WSLENV` 的现值为基准合并，才能同时
     // 保住上面那段的 cwd 上报条目。见 [`crate::agent_env`]。
     crate::agent_env::apply(&mut options.env, pane_id);
-    crate::platform::wsl_hooks::prepare(&mut options);
-    options
+    let wsl_hook_required = crate::platform::wsl_hooks::prepare(&mut options);
+    (options, wsl_hook_required)
 }
 
 pub fn spawn(
     window_size: WindowSize,
     term_config: Config,
     options: tty::Options,
+    wsl_hook_required: bool,
 ) -> std::io::Result<SpawnedSession> {
+    #[cfg(windows)]
+    let wsl_hook_helper = options
+        .env
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(crate::ai_hook::HOOK_EXE_ENV))
+        .map(|(_, value)| std::ffi::OsString::from(value))
+        .or_else(|| {
+            (!options.env_is_complete)
+                .then(|| std::env::var_os(crate::ai_hook::HOOK_EXE_ENV))
+                .flatten()
+        })
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from);
+    #[cfg(not(windows))]
+    let _ = wsl_hook_required;
     let (tx, rx) = super::event_mailbox::channel();
     let (stage_tx, stage_rx) = unbounded();
     let proxy = EventProxy { events: tx, stages: stage_tx, remote_reader: Default::default() };
@@ -247,6 +275,12 @@ pub fn spawn(
             remote_reader,
             #[cfg(windows)]
             wsl_hook,
+            #[cfg(windows)]
+            wsl_hook_required,
+            #[cfg(windows)]
+            wsl_hook_helper,
+            #[cfg(windows)]
+            wsl_hook_lifecycle_seen: false,
         },
         rx,
         stage_rx,
@@ -286,6 +320,12 @@ pub fn spawn_ssh(
         TerminalSession {
             #[cfg(windows)]
             wsl_hook: None,
+            #[cfg(windows)]
+            wsl_hook_required: false,
+            #[cfg(windows)]
+            wsl_hook_helper: None,
+            #[cfg(windows)]
+            wsl_hook_lifecycle_seen: false,
             term,
             notifier: Notifier(sender),
             native_prompt,
@@ -295,4 +335,72 @@ pub fn spawn_ssh(
         rx,
         stage_rx,
     ))
+}
+
+#[cfg(all(test, windows, feature = "gpui-test-support"))]
+mod channel_policy_tests {
+    use super::*;
+
+    fn envelope(source: &str) -> Vec<u8> {
+        let mode = if source == "codex" { " codex_hooks=full" } else { "" };
+        format!(
+            "nebula-hook/1 source={source} process=20:200{mode}\n{{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"policy-fixture\",\"bridge_sequence\":1}}"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn wsl_hook_policy_selected_unavailable_rejects_claude_osc() {
+        let (mut session, _input) = test_session();
+        session.wsl_hook_required = true;
+        assert!(session.wsl_hook.is_none());
+        assert!(crate::ai_hook::parse_remote_envelope(&envelope("claude"), Some(42)).is_some());
+        assert!(!session.accepts_remote_hook(&envelope("claude")));
+    }
+
+    #[test]
+    fn wsl_hook_policy_selected_unavailable_rejects_codex_osc() {
+        let (mut session, _input) = test_session();
+        session.wsl_hook_required = true;
+        assert!(session.wsl_hook.is_none());
+        assert!(crate::ai_hook::parse_remote_envelope(&envelope("codex"), Some(42)).is_some());
+        assert!(!session.accepts_remote_hook(&envelope("codex")));
+    }
+
+    #[test]
+    fn wsl_hook_policy_selection_survives_cancel_without_channel() {
+        let (mut session, _input) = test_session();
+        session.wsl_hook_required = true;
+        session.cancel_remote_hooks();
+        assert!(session.wsl_hook_required);
+        for source in ["claude", "codex"] {
+            assert!(!session.accepts_remote_hook(&envelope(source)));
+        }
+    }
+
+    #[test]
+    fn wsl_hook_policy_unselected_local_and_remote_keep_osc() {
+        let (mut session, _input) = test_session();
+        assert!(!session.wsl_hook_required);
+        for shell_pid in [0, 200] {
+            session.shell_pid = shell_pid;
+            for source in ["claude", "codex", "opencode"] {
+                assert!(session.accepts_remote_hook(&envelope(source)));
+            }
+        }
+    }
+
+    #[test]
+    fn wsl_hook_policy_other_providers_keep_osc_when_selected() {
+        let (mut session, _input) = test_session();
+        session.wsl_hook_required = true;
+        for source in ["opencode", "gemini", "pi"] {
+            assert!(session.accepts_remote_hook(&envelope(source)));
+        }
+        assert!(
+            session.accepts_remote_hook(
+                b"nebula-hook/1 source=opencode process=20:200\nsource=claude"
+            )
+        );
+    }
 }

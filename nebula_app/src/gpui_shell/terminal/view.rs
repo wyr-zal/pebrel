@@ -244,6 +244,7 @@ pub(crate) fn last_path_component(path: &str) -> Option<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarActivity {
     Idle,
+    Unconfirmed,
     Running,
     /// 程序通过 OSC 9;4 报告暂停。它仍是进行中状态，但不应继续驱动 spinner。
     Paused,
@@ -326,6 +327,10 @@ pub struct TerminalView {
     agent_identity_probe_epoch: u64,
     last_agent_identity_probe: Option<std::time::Instant>,
     agent_identity_probe_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    agent_identity_probe_closed: std::sync::atomic::AtomicBool,
+    agent_identity_probe_wake: bool,
+    agent_identity_probe_misses: u8,
+    agent_identity_receipt: Option<crate::platform::agent_process_identity::ForegroundAgent>,
     prompt_process_probe: Option<gpui::Task<()>>,
     prompt_input_epoch: u64,
     native_prompt_seen: bool,
@@ -475,6 +480,7 @@ pub struct TerminalView {
     completed_at: Option<std::time::Instant>,
     /// 上一次看门狗观察到的任务状态，用来认出「刚刚进入完成」这个边沿。
     last_task_state: Option<crate::runtime_api::RuntimeTaskState>,
+    last_wsl_hook_channel: Option<crate::runtime_api::RuntimeWslHookChannel>,
     /// BEL 视觉闪烁：整 pane 盖一层前景 12%，约 150ms。
     pub(super) bell_flash: bool,
     bell_flash_epoch: u64,
@@ -580,7 +586,11 @@ impl TerminalView {
                     .is_some_and(|channel| channel.accepts(&generation))
                     && let Some(hook) = crate::ai_hook::parse_remote_envelope(&envelope, None)
                 {
-                    self.handle_ai_hook(&hook, cx);
+                    if self.handle_ai_hook(&hook, cx)
+                        && let Some(session) = &mut self.session
+                    {
+                        session.wsl_hook_lifecycle_seen = true;
+                    }
                 }
                 return;
             },
@@ -599,6 +609,7 @@ impl TerminalView {
         }
         match event {
             TermEvent::Wakeup => {
+                self.wake_agent_identity_probe(false);
                 self.flush_pending_runtime_submit(cx);
                 self.flush_pending_shell_command(cx);
                 if self.output_visible {
@@ -774,6 +785,7 @@ impl TerminalView {
 
     /// `Exited` 只对宿主发一次；重复的退出信号（ChildExit 之后必然跟 Exit）只更新文案。
     fn mark_exited(&mut self, message: String, cx: &mut Context<Self>) {
+        self.stop_agent_identity_probe();
         if let Some(session) = &self.session {
             session.cancel_remote_hooks();
         }
@@ -792,6 +804,7 @@ impl TerminalView {
 
     /// 让 EventLoop 退出并回收 ConPTY/子进程。幂等：重复调用只会得到发送失败。
     pub fn shutdown(&self) {
+        self.stop_agent_identity_probe();
         if let Some(session) = &self.session {
             session.cancel_remote_hooks();
             let _ = session.notifier.0.send(Msg::Shutdown);
@@ -826,6 +839,7 @@ impl TerminalView {
         self.editor_query_task = None;
         self.cursor_animation.note_input(&bytes);
         self.prompt_input_epoch = self.prompt_input_epoch.wrapping_add(1);
+        self.wake_agent_identity_probe(true);
         self.path_drop.invalidate();
         self.image_paste.observe_input(&bytes);
         self.confirmation.observe_input(&bytes);

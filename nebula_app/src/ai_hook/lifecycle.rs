@@ -3,7 +3,9 @@
 //! Hook events are facts; screen matches are observations with limited authority.
 //! Command ownership ends at the shell boundary, never because output goes quiet.
 
-use crate::ai_agents::{AgentKind, AgentStatus, AgentStatusSource, Detection};
+use crate::ai_agents::{
+    AgentKind, AgentStatus, AgentStatusSource, AgentStatusUncertainty, Detection,
+};
 
 use super::{AiHookEvent, AiHookKind};
 
@@ -38,21 +40,33 @@ pub(crate) struct CodexFailureTarget {
     pub process: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum CodexTerminalEvidence {
+    // Empty struct variants also enforce deny_unknown_fields.
+    Finished {},
+    Cancelled {},
+    Failed { error: String },
+}
+
 /// Owns status and arbitration. Adapters may submit facts but cannot set fields.
 #[derive(Debug, Clone)]
 pub(crate) struct AgentActivity {
     status: AgentStatus,
     source: AgentStatusSource,
     rule: Option<String>,
+    uncertainty: Option<AgentStatusUncertainty>,
     coverage: HookCoverage,
     owner: Option<Owner>,
     idle_samples: u8,
     turn_observed: bool,
     pending_submit: bool,
+    pending_hook_prompt: bool,
     /// A completion-only hook latches its result until an idle screen or an
     /// explicit submission separates the old frame from a new turn.
     screen_armed: bool,
     command_ended: bool,
+    verified_foreground: bool,
     native_codex: bool,
     turn_id: Option<String>,
     last_remote_sequence: Option<u64>,
@@ -61,6 +75,8 @@ pub(crate) struct AgentActivity {
     cancel_requested: bool,
     turn_cancelled: bool,
     retired_codex_failure: Option<CodexFailureTarget>,
+    retired_codex_idle: Option<CodexFailureTarget>,
+    codex_input_pending: bool,
 }
 
 impl Default for AgentActivity {
@@ -69,13 +85,16 @@ impl Default for AgentActivity {
             status: AgentStatus::Unknown,
             source: AgentStatusSource::Unknown,
             rule: None,
+            uncertainty: None,
             coverage: HookCoverage::None,
             owner: None,
             idle_samples: 0,
             turn_observed: false,
             pending_submit: false,
+            pending_hook_prompt: false,
             screen_armed: true,
             command_ended: false,
+            verified_foreground: false,
             native_codex: false,
             turn_id: None,
             last_remote_sequence: None,
@@ -84,6 +103,8 @@ impl Default for AgentActivity {
             cancel_requested: false,
             turn_cancelled: false,
             retired_codex_failure: None,
+            retired_codex_idle: None,
+            codex_input_pending: false,
         }
     }
 }
@@ -98,6 +119,19 @@ impl AgentActivity {
     pub fn rule(&self) -> Option<&str> {
         self.rule.as_deref()
     }
+    pub fn uncertainty(&self) -> Option<AgentStatusUncertainty> {
+        self.uncertainty.or_else(|| {
+            (self.status == AgentStatus::Unknown).then_some(AgentStatusUncertainty::IdentityOnly)
+        })
+    }
+    pub fn mark_status_unconfirmed(&mut self, reason: AgentStatusUncertainty) -> bool {
+        let changed = self.uncertainty != Some(reason);
+        self.uncertainty = Some(reason);
+        changed
+    }
+    pub fn confirm_status(&mut self) {
+        self.uncertainty = None;
+    }
     pub fn hook_seen(&self) -> bool {
         self.coverage != HookCoverage::None
     }
@@ -105,14 +139,20 @@ impl AgentActivity {
         self.owner.as_ref().and_then(|owner| owner.pid)
     }
     pub fn allows_screen(&self) -> bool {
-        !self.command_ended && self.coverage != HookCoverage::Lifecycle
+        (!self.command_ended || self.verified_foreground)
+            && self.coverage != HookCoverage::Lifecycle
     }
 
     pub fn codex_failure_target(&self) -> Option<CodexFailureTarget> {
         if self.command_ended
             || !self.native_codex
             || self.pending_submit
+            || self.codex_input_pending
             || self.status != AgentStatus::Working
+            || self
+                .rule
+                .as_deref()
+                .is_some_and(|rule| rule.starts_with("hook.background_tasks.active="))
         {
             return None;
         }
@@ -122,7 +162,9 @@ impl AgentActivity {
             turn: self.turn_id.clone()?,
             process: owner.remote_process.clone()?,
         };
-        (self.retired_codex_failure.as_ref() != Some(&target)).then_some(target)
+        (self.retired_codex_failure.as_ref() != Some(&target)
+            && self.retired_codex_idle.as_ref() != Some(&target))
+        .then_some(target)
     }
 
     /// An authenticated process's structured terminal error can fill a missing
@@ -136,11 +178,53 @@ impl AgentActivity {
         self.source = AgentStatusSource::Process;
         self.rule = Some("codex.rollout.task_complete.error".into());
         self.screen_armed = false;
+        self.confirm_status();
+        true
+    }
+
+    pub fn observe_codex_terminal(
+        &mut self,
+        target: &CodexFailureTarget,
+        terminal: &CodexTerminalEvidence,
+    ) -> bool {
+        if self.codex_failure_target().as_ref() != Some(target) {
+            return false;
+        }
+        match terminal {
+            CodexTerminalEvidence::Failed { error } => {
+                if error.trim().is_empty() {
+                    return false;
+                }
+                return self.observe_codex_failure(target);
+            },
+            CodexTerminalEvidence::Finished {} | CodexTerminalEvidence::Cancelled {} => {
+                self.retired_codex_idle = Some(target.clone());
+                self.status = AgentStatus::Idle;
+                self.rule = Some(
+                    match terminal {
+                        CodexTerminalEvidence::Finished {} => {
+                            "codex.rollout.task_complete.finished"
+                        },
+                        _ => "codex.rollout.turn_aborted",
+                    }
+                    .into(),
+                );
+            },
+        }
+        self.source = AgentStatusSource::Process;
+        self.screen_armed = false;
+        self.confirm_status();
         true
     }
 
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    pub fn forget_unhooked_identity(&mut self) {
+        if !self.hook_seen() {
+            self.reset();
+        }
     }
 
     /// An explicit shell boundary also rejects delayed events from the old CLI.
@@ -153,14 +237,24 @@ impl AgentActivity {
     pub fn begin_command(&mut self, agent: bool) {
         self.reset();
         if agent {
-            self.status = AgentStatus::Working;
             self.source = AgentStatusSource::Process;
+            self.mark_status_unconfirmed(AgentStatusUncertainty::IdentityOnly);
         }
     }
 
     pub fn identify(&mut self, source: AgentStatusSource) {
         if !self.hook_seen() && self.status == AgentStatus::Unknown {
             self.source = source;
+            self.mark_status_unconfirmed(AgentStatusUncertainty::IdentityOnly);
+        }
+    }
+
+    /// A verified foreground receipt permits chrome observations without
+    /// reopening the old command's Hook gate or asserting an active turn.
+    pub fn identify_foreground_process(&mut self) {
+        if !self.hook_seen() {
+            self.verified_foreground = true;
+            self.identify(AgentStatusSource::Process);
         }
     }
 
@@ -173,6 +267,8 @@ impl AgentActivity {
         self.rule = None;
         self.turn_observed = true;
         self.pending_submit = true;
+        self.pending_hook_prompt =
+            self.native_codex || self.owner.as_ref().is_some_and(|owner| owner.source == "claude");
         self.input_sent();
     }
 
@@ -191,9 +287,11 @@ impl AgentActivity {
     /// Physical Enter alone can also dismiss a menu. It only permits observing a
     /// new turn; it is not itself a successful submission or a completion.
     pub fn input_sent(&mut self) {
+        self.codex_input_pending |= self.native_codex && self.turn_id.is_some();
         self.cancel_requested = false;
         self.screen_armed = true;
         self.idle_samples = 0;
+        self.mark_status_unconfirmed(AgentStatusUncertainty::PendingInput);
     }
 
     /// Check ownership before the ordering gate records this event. An ignored
@@ -214,6 +312,21 @@ impl AgentActivity {
         if self.native_codex && event.source == "codex" && event.codex_hooks.is_none() {
             return false;
         }
+        // A submitted prompt has no authoritative new turn yet. Old tool/end
+        // events, including a repeated SessionStart, cannot acknowledge it.
+        if self.pending_hook_prompt {
+            let new_session = event.kind == AiHookKind::SessionStart
+                && !event.session_compacted
+                && event.session_id.is_some()
+                && event.session_id.as_ref()
+                    != self.owner.as_ref().and_then(|owner| owner.session.as_ref());
+            let new_prompt = event.kind == AiHookKind::PromptSubmit
+                && (self.turn_id.is_none()
+                    || event.turn_id.is_some() && event.turn_id != self.turn_id);
+            if !new_session && !new_prompt {
+                return false;
+            }
+        }
         if !self.accepts_compaction(event) {
             return false;
         }
@@ -227,6 +340,32 @@ impl AgentActivity {
             )
         {
             return false;
+        }
+        if event.source == "codex"
+            && self.retired_codex_idle.as_ref().is_some_and(|target| {
+                event.turn_id.as_ref().is_none_or(|turn| turn == &target.turn)
+            })
+        {
+            if matches!(
+                event.kind,
+                AiHookKind::PromptSubmit
+                    | AiHookKind::ToolComplete
+                    | AiHookKind::NeedsAttention
+                    | AiHookKind::CompactionStart
+                    | AiHookKind::CompactionEnd
+            ) {
+                return false;
+            }
+            if event.kind == AiHookKind::TurnDone
+                && (self.codex_input_pending
+                    || self.source == AgentStatusSource::Hook
+                        && matches!(
+                            self.status,
+                            AgentStatus::Idle | AgentStatus::Done | AgentStatus::Failed
+                        ))
+            {
+                return false;
+            }
         }
         if self.turn_cancelled
             && matches!(
@@ -391,6 +530,7 @@ impl AgentActivity {
         self.pending_submit = false;
         self.screen_armed = false;
         self.status = AgentStatus::Idle;
+        self.confirm_status();
         self.source = AgentStatusSource::Screen;
         self.rule = Some(
             if compacting {
@@ -431,6 +571,20 @@ impl AgentActivity {
     pub fn apply_hook(&mut self, event: &AiHookEvent) -> bool {
         if !self.accepts_hook(event) {
             return false;
+        }
+        self.pending_hook_prompt = false;
+        let new_codex_turn = event.source == "codex"
+            && event.kind == AiHookKind::PromptSubmit
+            && event.turn_id.is_some()
+            && event.turn_id != self.turn_id;
+        let new_codex_session = event.source == "codex"
+            && event.kind == AiHookKind::SessionStart
+            && event.session_id.is_some()
+            && event.session_id.as_ref()
+                != self.owner.as_ref().and_then(|owner| owner.session.as_ref());
+        if new_codex_turn || new_codex_session {
+            self.codex_input_pending = false;
+            self.retired_codex_idle = None;
         }
         self.record_owner(event);
         if matches!(
@@ -477,6 +631,7 @@ impl AgentActivity {
         };
         self.coverage = coverage;
         self.source = AgentStatusSource::Hook;
+        self.confirm_status();
         self.rule = None;
         self.idle_samples = 0;
         if event.kind != AiHookKind::SessionStart && !compaction_event {
@@ -542,18 +697,26 @@ impl AgentActivity {
         true
     }
 
-    /// No match resets consecutive-idle evidence. Full lifecycle hooks never
-    /// consult screen rules, even if the current frame contains a real old form.
+    /// Missing chrome keeps the last observation but withdraws its certainty.
+    /// Full lifecycle hooks retain authority over ordinary screen observations.
     pub fn observe_screen(&mut self, detection: Option<Detection>) -> bool {
         if !self.allows_screen() {
             return false;
         }
         let Some(detection) = detection else {
             self.idle_samples = 0;
+            if !self.hook_seen() && self.status != AgentStatus::Failed {
+                return self.mark_status_unconfirmed(AgentStatusUncertainty::ScreenAmbiguous);
+            }
             return false;
         };
         let next = match detection.status {
             AgentStatus::Idle => {
+                if detection.agent == AgentKind::Codex {
+                    self.idle_samples = 0;
+                    return (!self.hook_seen() && self.status != AgentStatus::Failed)
+                        && self.mark_status_unconfirmed(AgentStatusUncertainty::ScreenAmbiguous);
+                }
                 // Keep an explicit provider failure visible until a new turn
                 // starts; the error screen commonly remains above the prompt.
                 if self.status == AgentStatus::Failed {
@@ -619,10 +782,11 @@ impl AgentActivity {
                 return false;
             },
         };
-        if next == self.status {
+        if next == self.status && self.uncertainty.is_none() {
             return false;
         }
         self.status = next;
+        self.confirm_status();
         self.source = AgentStatusSource::Screen;
         self.rule = Some(detection.rule_id);
         true

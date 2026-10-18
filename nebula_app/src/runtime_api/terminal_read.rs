@@ -17,6 +17,10 @@ pub struct RuntimePaneRead {
     pub history_available: usize,
     pub truncated: bool,
     pub task_state: RuntimeTaskState,
+    #[serde(flatten)]
+    pub state_evidence: super::RuntimeStateEvidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wsl_hook_channel: Option<super::RuntimeWslHookChannel>,
     pub exited: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_reason: Option<String>,
@@ -239,6 +243,8 @@ pub(crate) fn capture_terminal_tail<T: EventListener>(
             history_available,
             truncated: false,
             task_state,
+            state_evidence: Default::default(),
+            wsl_hook_channel: None,
             exited,
             exit_reason,
             screen: None,
@@ -281,6 +287,8 @@ pub(crate) fn capture_terminal_tail<T: EventListener>(
         history_available,
         truncated: returned_lines < total_lines || byte_truncated,
         task_state,
+        state_evidence: Default::default(),
+        wsl_hook_channel: None,
         exited,
         exit_reason,
         screen: None,
