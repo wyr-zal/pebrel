@@ -38,7 +38,6 @@ scan unrelated Issues, request reviews, approve/merge PRs, or publish releases.
   Include a minimal reproducer, results and the remaining uncertainty in the PR.
   Keep credentials, personal settings and private paths out of public evidence.
 
-Follow `AGENTS.md`, the nearest module instructions, `CONTRIBUTING.md`,
-`docs/architecture.md` and `docs/project-constraints.md`. Reuse existing contracts;
-never weaken required checks, raise budgets, delete coverage or hide failures.
-Deterministic CI and maintainer review remain the merge authority.
+Follow `AGENTS.md` and the nearest module instructions. Consult architecture,
+engineering contracts and UI text rules only when the assigned change needs them.
+Do not weaken required checks, raise budgets, delete coverage or hide failures.

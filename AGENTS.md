@@ -1,23 +1,19 @@
 @CONTEXT.md
-# Nebula 项目代理指引
+# Pebrel 项目指引
 
-## 全局规则
+- 产品名与命令用 `pebrel`；内部 Cargo 包名和源码目录保留 `nebula*`，不顺手重命名。
+- 修改前读取目标目录最近的 `AGENTS.md`；只处理当前需求，保留其他工作区改动。
+- 界面复用共享设置和生命周期；异步结果检查 pane、进程、会话与任务代次，不能让旧结果覆盖新状态。
+- 保留 Hook 的 owner/PID/session 校验；屏幕文本不能冒充可靠的完成事件。
+- 保持既有 CRLF。禁止 `cargo fmt --all`；需要格式化时只处理明确的单文件。
+- 只做受影响模块的验证，编译/状态单测不等于实际 UI 验收；未验证的路径明确说明。
+- 架构门禁用 `python3 scripts/check_architecture.py --base <共同基线>`；不抬预算、不删覆盖来通过检查。
 
-- 严禁利用 PR、Issue 及其评论进行广告宣传、商业推广或引流；核实任何未经授权的推广 PR 或 Issue 后直接关闭，无需再次确认。商业需求须通过项目邮箱沟通，已获批准的赞助按批准范围处理。完整范围、邮箱与审阅边界以 [贡献指南](CONTRIBUTING.md#commercial-promotion-policy) 为唯一权威说明；首次贡献者身份、改动小或 CI 通过不能代替需求审查。
-- 修改前阅读 `CONTRIBUTING.md`、`docs/architecture.md` 和 `docs/project-constraints.md`；新 UI 文案同时遵循 `docs/internationalization.md`。
-- 规则按目录分层：先遵守本文件，再读取目标文件路径上最近的 `AGENTS.md`。模块细节留在模块目录，不回填到根规则。
-- 行数预算与依赖方向由 `architecture/` 声明，使用 `python3 scripts/check_architecture.py --base <PR-base-commit>` 验证；800 行仅提示，2000 行是既有防灾上限。
-- 禁止靠抬高预算、删测试、压缩格式、机械分片或静默排除目录让门禁通过。规范存在缺陷时，先给可复现反例，补正反测试并记录经维护者审查的规则修订。
-- 核心规则保持单一权威实现；按职责和生命周期拆分，不因文件夹名称或历史模块别名推断耦合。新增长期依赖、跨层接口、持久化和线程模型变更须给出设计依据。
-- 普通翻译查询维持已测零分配合同；参数格式化和冷路径另行评估。不能把单机微基准写成普遍性能保证。
-- 不得声称仅加入 workflow 或 `CODEOWNERS` 就已启用 GitHub 强制保护；服务端设置及负例 PR 验证须另行获准并核验。
-- `docs/` 记录经过核验的当前事实；非平凡改动的决策、被否定方案和事故因果写入与代码职责同路径的 `architecture/notes/`。遵循 [note 规则](architecture/notes/AGENTS.md)，普通样式修改和单文件修复不写 note。
+## 按需查阅
 
-## 分层入口
-
-- 应用、窗口和 UI：遵循 [`nebula_app/AGENTS.md`](nebula_app/AGENTS.md)。
-- 终端核心、PTY、VT 和输入：遵循 [`nebula_terminal/AGENTS.md`](nebula_terminal/AGENTS.md)。
-- 设置、持久化和语言注册：遵循 [`nebula_settings/AGENTS.md`](nebula_settings/AGENTS.md)。
-- 检查器、门禁和治理脚本：遵循 [`scripts/AGENTS.md`](scripts/AGENTS.md)。
-- 文档事实与操作手册：遵循 [`docs/AGENTS.md`](docs/AGENTS.md)。
-- 版本号、构建、打包、自动更新、GitHub Release、Changelog 或 Release Note：先完整阅读 [`packaging/AGENTS.md`](packaging/AGENTS.md)、[`docs/release-notes/AGENTS.md`](docs/release-notes/AGENTS.md)。
+- 应用与 UI：`nebula_app/AGENTS.md`；终端：`nebula_terminal/AGENTS.md`；设置：`nebula_settings/AGENTS.md`。
+- 脚本：`scripts/AGENTS.md`；文档：`docs/AGENTS.md`。
+- 模块职责、公共接口或依赖变更：查 `docs/architecture.md`、`docs/project-constraints.md` 和 `architecture/` 中对应规则。
+- 新 UI 文案：查 `docs/internationalization.md`。
+- 版本、构建、打包或发布：读 `packaging/AGENTS.md`、`docs/release-notes/AGENTS.md`。
+- 仅在协议、所有权、持久化或生命周期有重要取舍时按 `architecture/notes/AGENTS.md` 记录原因；普通修复不另写说明。
