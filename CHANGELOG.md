@@ -4,6 +4,22 @@ Every release entry is provided in English and Simplified Chinese.
 
 每个版本条目均同时提供英文和简体中文说明。
 
+## 2.2.9 - 2026-10-18
+
+### English
+
+#### Fixed
+
+- Fixed: Claude history views with a return-to-bottom indicator no longer change the current Agent activity or reuse historical errors for automatic continuation. A pending failure confirmed by a Hook waits for the live view before continuing.
+- Fixed: Successful Agent completion clears the screen error warning. Errors already visible when a new prompt starts do not light the warning again; a new error or confirmed failure remains visible.
+
+### 中文
+
+#### 修复
+
+- 修复：Claude 显示返回底部提示的历史视图不再改变当前 Agent 状态，也不会利用历史错误自动续跑；Hook 已确认的失败重试等待返回实时视图后再执行。
+- 修复：Agent 成功完成后清除屏幕错误警示；新指令开始时已存在的旧错误不会重新点亮，新错误与已确认的失败仍保留显示。
+
 ## 2.2.8 - 2026-10-18
 
 ### English
