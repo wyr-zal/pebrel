@@ -306,6 +306,10 @@ impl TerminalView {
             agent_identity_probe_wake: true,
             agent_identity_probe_misses: 0,
             agent_identity_receipt: None,
+            #[cfg(windows)]
+            native_command_boundary: None,
+            shell_boundary_generation: 0,
+            shell_boundary_probe: None,
             prompt_process_probe: None,
             prompt_input_epoch: 0,
             native_prompt_seen: false,
@@ -321,6 +325,7 @@ impl TerminalView {
             auto_continue: Default::default(),
             auto_continue_task: None,
             screen_error_indicator: false,
+            screen_error_at_prompt: None,
             _auto_continue_subscription: cx.observe_global::<Settings>(|view, cx| {
                 if !cx.global::<Settings>().ai_auto_continue {
                     view.cancel_auto_continue();
@@ -330,6 +335,7 @@ impl TerminalView {
             pending_runtime_submit: None,
             pending_shell_command: None,
             recovery: startup_command::SessionRecovery::default(),
+            pending_recovery_hooks: Default::default(),
             session_launch,
             inline_images: super::super::inline_image::InlineImageStore::default(),
             image_paste: image_paste::ImagePasteState::default(),

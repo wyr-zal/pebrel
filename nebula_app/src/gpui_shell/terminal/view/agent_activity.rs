@@ -5,11 +5,35 @@ use nebula_terminal::grid::Dimensions as _;
 use nebula_terminal::index::{Column, Line, Point};
 
 use crate::ai_agents::{AgentStatus, AgentStatusSource};
+use crate::ai_hook::lifecycle::ShellOwnerStatus;
 #[cfg(windows)]
 use crate::ai_hook::lifecycle::CodexTerminalEvidence;
 use crate::ai_hook::{AiHookEvent, AiHookKind};
 
-use super::{TerminalView, TerminalViewEvent, notifications};
+use super::{
+    TerminalView, TerminalViewEvent,
+    startup_command::RecoveryHookGate,
+    notifications,
+};
+
+const MAX_PENDING_RECOVERY_HOOKS: usize = 32;
+const MAX_SHELL_BOUNDARY_PROBES: u8 = 5;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PendingShellBoundary {
+    pub(super) owner: crate::ai_hook::lifecycle::ShellHookOwner,
+    pub(super) exit_code: Option<i32>,
+    pub(super) attempts: u8,
+}
+
+fn shell_boundary_retry_delay(attempts: u8) -> Option<std::time::Duration> {
+    if attempts == 0 || attempts >= MAX_SHELL_BOUNDARY_PROBES {
+        return None;
+    }
+    Some(std::time::Duration::from_millis(
+        250u64.saturating_mul(1u64 << (attempts - 1).min(3)),
+    ))
+}
 
 impl TerminalView {
     /// True means the selected pane applied the Hook, not merely that it was routed here.
@@ -34,14 +58,53 @@ impl TerminalView {
         // can discover a new conversation selected inside the same CLI process.
         let keep_native_identity =
             event.source == "codex" && event.session_file.is_none() && self.ai_session_from_probe;
-        let target = event.session_id.as_ref().filter(|_| !keep_native_identity).map(|id| {
+        let mut target = event.session_id.as_ref().filter(|_| !keep_native_identity).map(|id| {
             crate::session::AgentSession {
                 source: event.source.clone(),
                 session_id: Some(id.clone()),
                 session_file: event.session_file.clone(),
             }
         });
-        if target.as_ref().is_some_and(|target| !self.recovery.accepts(target)) {
+        let event_target = target.clone().unwrap_or_else(|| crate::session::AgentSession {
+            source: event.source.clone(),
+            session_id: if keep_native_identity {
+                self.ai_session
+                    .as_ref()
+                    .filter(|identity| identity.source == event.source)
+                    .map(|identity| identity.session_id.clone())
+            } else {
+                event.session_id.clone()
+            },
+            session_file: event.session_file.clone(),
+        });
+        let process_confirmed = self.foreground_receipt_confirms(event, &event_target);
+        let requires_receipt = self.recovery.requires_foreground_receipt();
+        match self.recovery.gate_hook(event, process_confirmed) {
+            RecoveryHookGate::Apply => {},
+            RecoveryHookGate::AwaitReceipt => {
+                if self.agent_identity_receipt.is_none() {
+                    self.defer_recovery_hook(event.clone(), cx);
+                } else {
+                    log::warn!(
+                        "ai_hook: pane={} rejected recovery hook with mismatched process",
+                        self.pane_id
+                    );
+                }
+                return false;
+            },
+            RecoveryHookGate::Reject => {
+                log::debug!(
+                    "ai_hook: pane={} rejected source={} during pending recovery",
+                    self.pane_id,
+                    event.source
+                );
+                return false;
+            },
+        }
+        if target
+            .as_ref()
+            .is_some_and(|target| !self.recovery.accepts_live(target, process_confirmed))
+        {
             return false;
         }
         let verdict = crate::ai_hook::accept_for_pane(event, self.pane_id);
@@ -53,7 +116,16 @@ impl TerminalView {
             );
             return false;
         }
+        if requires_receipt {
+            target = Some(event_target);
+        }
         self.agent_activity.apply_hook(event);
+        if event.kind == AiHookKind::TurnDone
+            && event.active_background_tasks() == 0
+            && event.turn_outcome == crate::ai_hook::AiTurnOutcome::Succeeded
+        {
+            self.set_screen_error_indicator(false, cx);
+        }
         self.invalidate_agent_identity_probe();
         if matches!(
             event.kind,
@@ -77,9 +149,11 @@ impl TerminalView {
             );
         }
         if let Some(target) = target {
-            let previous = self.recovery.target.clone();
-            self.recovery.confirm(target);
-            if previous != self.recovery.target {
+            let previous = self.recovery.live.clone();
+            if !self.recovery.confirm_live(target, process_confirmed) {
+                return false;
+            }
+            if previous != self.recovery.live {
                 self.set_screen_error_indicator(false, cx);
                 cx.emit(TerminalViewEvent::SessionIdentityChanged);
             }
@@ -147,8 +221,200 @@ impl TerminalView {
         true
     }
 
+    fn defer_recovery_hook(&mut self, event: AiHookEvent, cx: &mut Context<Self>) {
+        if self.pending_recovery_hooks.len() == MAX_PENDING_RECOVERY_HOOKS {
+            // Retain the opening event: a finished command's gate can only be
+            // reopened by SessionStart, even if a busy provider fills the queue.
+            self.pending_recovery_hooks.remove(1);
+        }
+        self.pending_recovery_hooks.push_back(event);
+        self.wake_agent_identity_probe(false);
+        self.probe_agent_identity(cx);
+    }
+
+    pub(super) fn replay_pending_recovery_hooks(&mut self, cx: &mut Context<Self>) {
+        let pending = std::mem::take(&mut self.pending_recovery_hooks);
+        for event in pending {
+            self.handle_ai_hook(&event, cx);
+        }
+    }
+
+    fn foreground_receipt_confirms(
+        &self,
+        event: &AiHookEvent,
+        target: &crate::session::AgentSession,
+    ) -> bool {
+        if self.agent_activity.hook_seen() || event.source != target.source {
+            return false;
+        }
+        let Some(receipt) = &self.agent_identity_receipt else {
+            return false;
+        };
+        if receipt.kind.slug() != target.source {
+            return false;
+        }
+        let pid_matches = event.agent_pid.is_none_or(|pid| {
+            pid == receipt.process.pid
+                && event.agent_start_time == Some(receipt.process.start_time)
+        });
+        let remote_matches = event.remote_process.as_deref().is_none_or(|process| {
+            process.split_once(':').is_some_and(|(pid, start)| {
+                pid.parse::<u32>().ok() == Some(receipt.process.pid)
+                    && start.parse::<u64>().ok() == Some(receipt.process.start_time)
+            })
+        });
+        (event.agent_pid.is_some() || event.remote_process.is_some())
+            && pid_matches
+            && remote_matches
+    }
+
     pub(crate) fn screen_error_indicator(&self) -> bool {
         self.screen_error_indicator
+    }
+
+    #[cfg(windows)]
+    pub(super) fn probe_live_shell_owner(
+        &mut self,
+        exit_code: Option<i32>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(owner) = self.agent_activity.shell_boundary_owner() else {
+            return false;
+        };
+        if self.shell_boundary_probe.is_some() {
+            return true;
+        }
+        self.shell_boundary_probe = Some(PendingShellBoundary { owner, exit_code, attempts: 0 });
+        self.start_shell_boundary_probe(cx);
+        true
+    }
+
+    #[cfg(windows)]
+    fn start_shell_boundary_probe(&mut self, cx: &mut Context<Self>) {
+        let Some(pending) = self.shell_boundary_probe.clone() else {
+            return;
+        };
+        let Some(probe) = self
+            .session
+            .as_ref()
+            .and_then(|session| session.wsl_hook.as_ref())
+            .and_then(|channel| {
+                channel.owner_probe(&pending.owner.source, &pending.owner.process)
+            })
+        else {
+            self.resolve_probed_shell_boundary(
+                &pending.owner,
+                ShellOwnerStatus::Unavailable,
+                cx,
+            );
+            return;
+        };
+        self.shell_boundary_generation = self.shell_boundary_generation.wrapping_add(1);
+        let generation = self.shell_boundary_generation;
+        let work = cx.background_executor().spawn(async move { probe.current() });
+        cx.spawn(async move |this, cx| {
+            let status = work.await;
+            let _ = this.update(cx, |view, cx| {
+                if view.shell_boundary_generation != generation {
+                    return;
+                }
+                view.resolve_probed_shell_boundary(
+                    &pending.owner,
+                    status,
+                    cx,
+                );
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn resolve_probed_shell_boundary(
+        &mut self,
+        expected_owner: &crate::ai_hook::lifecycle::ShellHookOwner,
+        status: ShellOwnerStatus,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self.shell_boundary_probe.clone() else {
+            return;
+        };
+        if pending.owner != *expected_owner {
+            return;
+        }
+        if self.agent_activity.shell_boundary_owner().as_ref() != Some(expected_owner) {
+            self.shell_boundary_probe = None;
+            return;
+        }
+        match status {
+            ShellOwnerStatus::Alive if self.agent_activity.defer_shell_boundary() => {
+                self.shell_boundary_probe = None;
+                log::debug!(
+                    "agent_activity: pane={} retained {}/{} across a late shell boundary",
+                    self.pane_id,
+                    expected_owner.source,
+                    expected_owner.process
+                );
+            },
+            ShellOwnerStatus::Alive | ShellOwnerStatus::Ended => {
+                self.shell_boundary_probe = None;
+                self.finish_foreground_command(pending.exit_code, cx);
+            },
+            ShellOwnerStatus::Unavailable => {
+                let attempts = pending.attempts.saturating_add(1);
+                if let Some(current) = &mut self.shell_boundary_probe {
+                    current.attempts = attempts;
+                }
+                if shell_boundary_retry_delay(attempts).is_some() {
+                    #[cfg(windows)]
+                    self.schedule_shell_boundary_retry(expected_owner.clone(), attempts, cx);
+                } else {
+                    log::warn!(
+                        "agent_activity: pane={} kept owner {}/{} after {} unavailable probes",
+                        self.pane_id,
+                        expected_owner.source,
+                        expected_owner.process,
+                        attempts
+                    );
+                }
+            },
+        }
+    }
+
+    #[cfg(windows)]
+    fn schedule_shell_boundary_retry(
+        &mut self,
+        expected_owner: crate::ai_hook::lifecycle::ShellHookOwner,
+        attempts: u8,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(delay) = shell_boundary_retry_delay(attempts) else {
+            return;
+        };
+        let generation = self.shell_boundary_generation;
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            executor.timer(delay).await;
+            let _ = this.update(cx, |view, cx| {
+                if view.shell_boundary_generation != generation
+                    || view
+                        .shell_boundary_probe
+                        .as_ref()
+                        .is_none_or(|pending| pending.owner != expected_owner)
+                {
+                    return;
+                }
+                view.start_shell_boundary_probe(cx);
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn invalidate_shell_boundary_probe(&mut self) {
+        self.shell_boundary_generation = self.shell_boundary_generation.wrapping_add(1);
+        self.shell_boundary_probe = None;
+    }
+
+    pub(super) fn pending_shell_boundary(&self) -> Option<&PendingShellBoundary> {
+        self.shell_boundary_probe.as_ref()
     }
 
     #[cfg(windows)]
@@ -261,12 +527,12 @@ impl TerminalView {
             self.set_screen_error_indicator(false, cx);
             return;
         };
-        let (prompt_restored, screen) = {
+        let (prompt_restored, screen, display_offset) = {
             let term = session.term.lock();
             let lines = term.screen_lines();
             let columns = term.columns();
             if lines == 0 || columns == 0 {
-                (false, None)
+                (false, None, 0)
             } else {
                 let pending = self.command_running || self.running_program.is_some();
                 let prompt_restored = pending
@@ -298,7 +564,7 @@ impl TerminalView {
                         term.bounds_to_string(start, end)
                     }
                 });
-                (prompt_restored, screen)
+                (prompt_restored, screen, term.grid().display_offset())
             }
         };
         if prompt_restored
@@ -315,10 +581,26 @@ impl TerminalView {
             }
             return;
         }
+        if display_offset > 0 {
+            self.ignore_historical_screen_observation(cx);
+            return;
+        }
         let Some(screen) = screen else {
             self.set_screen_error_indicator(false, cx);
             return;
         };
+        if self.running_program.as_deref().is_some_and(|program| {
+            crate::ai_agents::screen_is_history_viewport(program, &screen)
+        }) {
+            self.ignore_historical_screen_observation(cx);
+            return;
+        }
+        if retry_source.as_deref().is_some_and(|program| {
+            !crate::ai_agents::screen_has_current_composer(program, &screen)
+        }) {
+            self.ignore_historical_screen_observation(cx);
+            return;
+        }
         let settings = cx.try_global::<crate::gpui_shell::config::Settings>();
         let screen_error_visible = retry_source.as_deref().is_some_and(|program| {
             settings.is_some_and(|settings| {
@@ -327,7 +609,14 @@ impl TerminalView {
                     &screen,
                     &settings.ai_auto_continue_error_patterns,
                 )
-                .is_some()
+                .is_some_and(|error| {
+                    !self.agent_activity.hook_seen()
+                        || (matches!(
+                            self.agent_activity.status(),
+                            AgentStatus::Working | AgentStatus::Failed
+                        ) && (self.agent_activity.status() == AgentStatus::Failed
+                            || self.screen_error_at_prompt.as_deref() != Some(error.as_str())))
+                })
             })
         });
         self.set_screen_error_indicator(screen_error_visible, cx);
@@ -392,5 +681,37 @@ impl TerminalView {
         );
         cx.emit(TerminalViewEvent::TitleChanged);
         cx.notify();
+    }
+
+    fn ignore_historical_screen_observation(&mut self, cx: &mut Context<Self>) {
+        // A historical viewport is not a fresh observation. Keep the last
+        // current-turn state, but discard evidence that would make an old
+        // screen error actionable.
+        self.set_screen_error_indicator(false, cx);
+        if self.auto_continue.pending()
+            == Some(crate::ai_hook::auto_continue::RetryEvidence::ScreenFailure)
+        {
+            self.auto_continue.take_pending(u8::MAX);
+            self.auto_continue_task = None;
+        }
+    }
+}
+
+#[cfg(test)]
+mod shell_boundary_tests {
+    use super::shell_boundary_retry_delay;
+
+    #[test]
+    fn unavailable_owner_probe_retries_are_bounded() {
+        assert_eq!(
+            shell_boundary_retry_delay(1),
+            Some(std::time::Duration::from_millis(250))
+        );
+        assert_eq!(
+            shell_boundary_retry_delay(4),
+            Some(std::time::Duration::from_secs(2))
+        );
+        assert_eq!(shell_boundary_retry_delay(0), None);
+        assert_eq!(shell_boundary_retry_delay(5), None);
     }
 }

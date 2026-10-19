@@ -52,6 +52,21 @@ impl TerminalView {
     }
 
     pub(super) fn on_command_start(&mut self, cx: &mut Context<Self>) {
+        #[cfg(windows)]
+        let launch_boundary = self.native_command_boundary.clone();
+        #[cfg(windows)]
+        let early_hooks = launch_boundary.as_ref().map(|_| std::mem::take(&mut self.pending_recovery_hooks));
+        self.pending_recovery_hooks.clear();
+        self.settle_shell_boundary_before_command_start(cx);
+        #[cfg(windows)]
+        {
+            // Late shell events retain the earlier pre-input boundary. Without
+            // one, fail closed for processes already running when C is read.
+            self.native_command_boundary = launch_boundary;
+            if let Some(early_hooks) = early_hooks { self.pending_recovery_hooks = early_hooks; }
+            if self.native_command_boundary.is_none() { self.capture_native_command_boundary(); }
+        }
+        self.invalidate_shell_boundary_probe();
         self.invalidate_agent_identity_probe();
         if !self.agent_activity.hook_seen() {
             self.answers.begin_command();
@@ -94,6 +109,36 @@ impl TerminalView {
         cx.notify();
     }
 
+    fn settle_shell_boundary_before_command_start(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let pending = self.pending_shell_boundary().cloned();
+        if pending.is_none() && !self.agent_activity.command_ended() {
+            return false;
+        }
+        if let Some(exit_code) = pending.as_ref().and_then(|pending| pending.exit_code) {
+            self.notify_command_done(Some(exit_code), cx);
+        }
+        let next_prompt = self.suggest.pending_command_prompt.take();
+        let next_submit = self.pending_runtime_submit.take();
+        self.invalidate_shell_boundary_probe();
+        if self.clear_foreground_agent_state(cx) {
+            cx.emit(TerminalViewEvent::TitleChanged);
+        }
+        self.suggest.pending_command_prompt = next_prompt;
+        self.pending_runtime_submit = next_submit;
+        if self.active_run.as_ref().is_some_and(|run| {
+            run.phase != crate::runtime_api::RuntimeRunPhase::Submitted
+        }) && let Some(run) = self.active_run.take() {
+            self.last_run = Some(crate::runtime_api::RuntimeRunOutcome::command_done(
+                run,
+                pending.as_ref().and_then(|pending| pending.exit_code),
+            ));
+        }
+        true
+    }
+
     pub(super) fn invalidate_ai_session_probe(&mut self) {
         self.ai_session_probe_epoch = self.ai_session_probe_epoch.wrapping_add(1);
         self.ai_session_probe_pending = false;
@@ -131,9 +176,14 @@ impl TerminalView {
     /// the primary edge; the cached-prompt path calls the same reset so the two
     /// lifecycle routes cannot drift apart.
     pub(super) fn clear_foreground_agent_state(&mut self, cx: &mut Context<Self>) -> bool {
+        self.pending_recovery_hooks.clear();
+        #[cfg(windows)]
+        { self.native_command_boundary = None; }
+        self.invalidate_shell_boundary_probe();
         self.invalidate_agent_identity_probe();
         self.cancel_auto_continue();
         self.auto_continue.reset();
+        self.screen_error_at_prompt = None;
         if let Some(session) = &self.session {
             session.term.lock().set_redraw_anchor_enabled(false);
         }
@@ -613,6 +663,8 @@ impl TerminalView {
             submit_bytes,
         });
         self.capture_runtime_prompt();
+        #[cfg(windows)]
+        self.capture_native_command_boundary();
         let run = crate::runtime_api::begin_runtime_run();
         let run_id = run.run_id;
         self.active_run = Some(run);
@@ -662,6 +714,8 @@ impl TerminalView {
         let codex_submit = submit && agent.as_ref().is_some_and(|agent| agent.kind == "codex");
         if submit {
             self.capture_runtime_prompt();
+            #[cfg(windows)]
+            if !self.command_running { self.capture_native_command_boundary(); }
         }
         let mut bytes = if codex_submit {
             crate::input::terminal_input::build_runtime_codex_submission(&text, self.term_mode())
@@ -810,6 +864,8 @@ impl TerminalView {
 
         let codex_submit =
             submit && self.runtime_agent().is_some_and(|agent| agent.kind == "codex");
+        #[cfg(windows)]
+        if submit && !self.command_running { self.capture_native_command_boundary(); }
         if submit && !codex_submit {
             let submit_bytes = self.runtime_key_sequence(
                 crate::runtime_api::RuntimeKey::Enter,
@@ -1108,6 +1164,9 @@ impl TerminalView {
     /// 那是脆弱推断：会话恢复、shell 别名、`npx codex` 这类间接启动都会让它
     /// 落空。进程树是客观事实，只是慢一拍——而慢一拍在 1 Hz 看门狗里无所谓。
     pub(super) fn reconcile_shell_activity(&mut self, cx: &mut Context<Self>) {
+        if self.recovery.requires_foreground_receipt() {
+            self.probe_agent_identity(cx);
+        }
         if !self.suggest.suggest_env.is_this_machine() {
             self.probe_agent_identity(cx);
             return;
@@ -1210,6 +1269,8 @@ impl TerminalView {
             return;
         }
         let pending = self.pending_runtime_submit.take().expect("checked above");
+        #[cfg(windows)]
+        if self.recovery.requires_foreground_receipt() { self.capture_native_command_boundary(); }
         self.write_input(pending.submit_bytes, cx);
     }
 }

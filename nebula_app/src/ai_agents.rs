@@ -648,8 +648,21 @@ fn refresh_overrides_if_needed() {
 
 /// Match one live screen snapshot. No match is `None`: callers retain their
 /// higher-confidence hook/process state rather than fabricating idle.
+pub(crate) fn screen_is_history_viewport(program: &str, screen: &str) -> bool {
+    AgentKind::parse(program)
+        .is_some_and(|agent| screen_context::is_history_viewport(agent, screen))
+}
+
+pub(crate) fn screen_has_current_composer(program: &str, screen: &str) -> bool {
+    AgentKind::parse(program)
+        .is_some_and(|agent| screen_context::has_current_composer(agent, screen))
+}
+
 pub fn detect(program: &str, screen: &str) -> Option<Detection> {
     let agent = AgentKind::parse(program)?;
+    if screen_context::is_history_viewport(agent, screen) {
+        return None;
+    }
     refresh_overrides_if_needed();
     let guard = cache().read().ok()?;
     let loaded = guard.manifests.get(&agent)?;
@@ -711,6 +724,7 @@ pub fn parse_auto_continue_error_patterns(raw: &str) -> Vec<String> {
 pub fn auto_continue_screen_is_safe(program: &str, screen: &str) -> bool {
     let Some(agent) = AgentKind::parse(program) else { return false };
     if !matches!(agent, AgentKind::Claude | AgentKind::Codex)
+        || screen_context::is_history_viewport(agent, screen)
         || screen_context::has_live_input_controls(screen_context::attention_region(agent, screen))
         || region(screen, "bottom_non_empty_lines(12)").to_lowercase().contains("esc to interrupt")
     {
@@ -758,7 +772,9 @@ pub fn auto_continue_error_text(
     patterns: &[String],
 ) -> Option<String> {
     let agent = AgentKind::parse(program)?;
-    if !matches!(agent, AgentKind::Claude | AgentKind::Codex) {
+    if !matches!(agent, AgentKind::Claude | AgentKind::Codex)
+        || screen_context::is_history_viewport(agent, screen)
+    {
         return None;
     }
     let mut fenced = false;
@@ -946,14 +962,10 @@ fn from_last_empty_prompt(screen: &str) -> &str {
             rest.starts_with(char::is_whitespace)
                 && !rest.trim_start().starts_with(|c: char| c.is_ascii_digit() || c == '[')
         });
-        let horizontal_rule = |line: &str| {
-            let row = line.trim();
-            row.chars().count() >= 3 && row.chars().all(|c| c == '─')
-        };
         if matches!(row, "›" | "»" | "❯" | ">")
             || (draft
-                && horizontal_rule(previous)
-                && lines.peek().is_some_and(|next| horizontal_rule(next)))
+                && screen_context::is_horizontal_rule(previous)
+                && lines.peek().is_some_and(|next| screen_context::is_horizontal_rule(next)))
         {
             start = offset;
         }
@@ -972,10 +984,10 @@ fn region<'a>(screen: &'a str, spec: &str) -> &'a str {
         return screen;
     }
     if spec == "claude_activity" {
-        return screen_context::claude_activity_region(region(
-            screen,
-            "bottom_non_empty_lines(16)",
-        ));
+        return screen_context::claude_activity_region(screen);
+    }
+    if spec == "claude_input" {
+        return screen_context::claude_input_region(screen);
     }
     if let Some(inner) =
         spec.strip_prefix("after_last_prompt_row(").and_then(|s| s.strip_suffix(')'))
@@ -1002,8 +1014,7 @@ fn region<'a>(screen: &'a str, spec: &str) -> &'a str {
         let mut last = 0;
         for line in screen.lines() {
             offset = (offset + line.len() + 1).min(screen.len());
-            let trimmed = line.trim();
-            if trimmed.chars().filter(|character| *character == '─').count() >= 3 {
+            if screen_context::is_horizontal_rule(line) {
                 last = offset;
             }
         }

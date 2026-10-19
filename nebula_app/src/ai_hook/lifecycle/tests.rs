@@ -35,6 +35,23 @@ fn identifying_an_agent_command_does_not_prove_a_running_turn() {
 }
 
 #[test]
+fn native_owner_rejects_a_recycled_pid_and_missing_kernel_stamp() {
+    let mut activity = AgentActivity::default();
+    let mut start = event("claude", "native-owner", "UserPromptSubmit");
+    start.agent_pid = Some(100);
+    start.agent_start_time = Some(200);
+    assert!(activity.apply_hook(&start));
+    let mut next = event("claude", "native-owner", "PostToolUse");
+    next.agent_pid = Some(100);
+    next.agent_start_time = Some(201);
+    assert!(!activity.apply_hook(&next));
+    next.agent_start_time = None;
+    assert!(!activity.apply_hook(&next));
+    next.agent_start_time = Some(200);
+    assert!(activity.apply_hook(&next));
+}
+
+#[test]
 fn wsl_hook_codex_rollout_failure_is_bound_to_current_turn_and_cannot_become_done() {
     let event = |name: &str, turn: &str, sequence: u64| {
         parse_remote_envelope(format!("nebula-hook/1 source=codex process=20:200 codex_hooks=full\n{{\"hook_event_name\":\"{name}\",\"session_id\":\"session\",\"turn_id\":\"{turn}\",\"bridge_sequence\":{sequence}}}").as_bytes(), Some(1)).unwrap()

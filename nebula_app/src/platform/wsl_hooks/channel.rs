@@ -9,7 +9,7 @@ use nebula_terminal::tty;
 use serde::{Deserialize, Serialize};
 
 use crate::ai_agents::AgentKind;
-use crate::ai_hook::lifecycle::CodexTerminalEvidence;
+use crate::ai_hook::lifecycle::{CodexTerminalEvidence, ShellOwnerStatus};
 
 #[cfg(test)]
 mod live_tests;
@@ -34,6 +34,13 @@ struct Evidence {
     argv: Vec<[String; 3]>,
     #[serde(default)]
     terminal: Option<CodexTerminalEvidence>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OwnerStateReply {
+    Evidence(Evidence),
+    Status(String),
 }
 
 #[derive(Clone)]
@@ -146,25 +153,54 @@ impl Scope {
         stop: &pipe::Signal,
         deadline: Instant,
     ) -> Option<Evidence> {
+        let output = self.run_request(request, "verify", stop, deadline, 32 * 1024)?;
+        serde_json::from_slice(&output).ok()
+    }
+
+    fn owner_status(
+        &self,
+        owner: &str,
+        anchor: Option<&Anchor>,
+        stop: &pipe::Signal,
+        deadline: Instant,
+    ) -> (ShellOwnerStatus, Option<Evidence>) {
+        if stop.is_set() {
+            return (ShellOwnerStatus::Unavailable, None);
+        }
+        let request = serde_json::json!({"pane":self.pane,"instance":self.instance,"token":self.token,
+            "user":self.user,"owner":owner,"anchor":anchor});
+        let Some(output) = self.run_request(request, "owner_state", stop, deadline, 32 * 1024) else {
+            return (ShellOwnerStatus::Unavailable, None);
+        };
+        parse_owner_status(&output)
+    }
+
+    fn run_request(
+        &self,
+        request: serde_json::Value,
+        evaluator: &str,
+        stop: &pipe::Signal,
+        deadline: Instant,
+        limit: usize,
+    ) -> Option<Vec<u8>> {
         let quoted = serde_json::to_string(&request.to_string()).ok()?;
         let mut input = tempfile::tempfile().ok()?;
         write!(
             input,
-            "{}\nprint(json.dumps(verify(json.loads({quoted}))))\n",
-            include_str!("../../../res/hooks/wsl_owner.py")
+            "{}\nprint(json.dumps({evaluator}(json.loads({quoted}))))\n",
+            include_str!("../../../res/hooks/wsl_owner.py"),
         )
         .ok()?;
         input.rewind().ok()?;
         let mut command = self.owner_command(&crate::platform::shell::wsl_executable()?);
         command.stdin(Stdio::from(input));
-        let output = crate::platform::process_output::read_cancellable_with_stdin(
+        crate::platform::process_output::read_cancellable_with_stdin(
             command,
             deadline.saturating_duration_since(Instant::now()),
-            32 * 1024,
+            limit,
             &|| stop.is_set(),
         )
-        .ok()?;
-        serde_json::from_slice(&output).ok()
+        .ok()
     }
 
     fn owner_command(&self, wsl: &str) -> Command {
@@ -198,6 +234,55 @@ pub(crate) struct FailureProbe {
     scope: Scope,
     stop: pipe::Signal,
     pub(crate) generation: String,
+}
+
+pub(crate) struct OwnerProbe {
+    scope: Scope,
+    stop: pipe::Signal,
+    source: String,
+    owner: String,
+}
+
+impl OwnerProbe {
+    /// Recheck the authenticated owner's exact PID start time, foreground
+    /// process group, pane ownership and shell ancestry.
+    pub(crate) fn current(&self) -> ShellOwnerStatus {
+        if self.stop.is_set() {
+            return ShellOwnerStatus::Unavailable;
+        }
+        let anchor = self.scope.anchor.as_ref();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (status, evidence) = self.scope.owner_status(
+            &self.owner,
+            anchor,
+            &self.stop,
+            deadline,
+        );
+        if self.stop.is_set() {
+            return ShellOwnerStatus::Unavailable;
+        }
+        match (status, evidence) {
+            (ShellOwnerStatus::Alive, Some(evidence))
+                if self.scope.accept_owner(&self.source, &evidence).is_some() =>
+            {
+                ShellOwnerStatus::Alive
+            },
+            (ShellOwnerStatus::Alive, _) => ShellOwnerStatus::Ended,
+            (status, _) => status,
+        }
+    }
+}
+
+fn parse_owner_status(output: &[u8]) -> (ShellOwnerStatus, Option<Evidence>) {
+    match serde_json::from_slice::<OwnerStateReply>(output) {
+        Ok(OwnerStateReply::Evidence(evidence)) => (ShellOwnerStatus::Alive, Some(evidence)),
+        Ok(OwnerStateReply::Status(status)) => match status.as_str() {
+            "ended" => (ShellOwnerStatus::Ended, None),
+            "unavailable" => (ShellOwnerStatus::Unavailable, None),
+            _ => (ShellOwnerStatus::Unavailable, None),
+        },
+        Err(_) => (ShellOwnerStatus::Unavailable, None),
+    }
 }
 
 impl FailureProbe {
@@ -309,6 +394,25 @@ impl Channel {
         })
     }
 
+    pub(crate) fn owner_probe(&self, source: &str, owner: &str) -> Option<OwnerProbe> {
+        if !matches!(source, "claude" | "codex")
+            || !owner.split_once(':').is_some_and(|(pid, start)| {
+                pid.parse::<u32>().is_ok_and(|pid| pid != 0)
+                    && !start.is_empty()
+                    && start.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        {
+            return None;
+        }
+        let scope = self.authenticated.lock().ok()?.clone()?;
+        self.accepts(&self.generation).then(|| OwnerProbe {
+            scope,
+            stop: self.stop.clone(),
+            source: source.to_owned(),
+            owner: owner.to_owned(),
+        })
+    }
+
     pub(crate) fn cancel(&self) {
         self.stop.set();
     }
@@ -412,6 +516,29 @@ mod tests {
             }
             let parsed: Evidence = serde_json::from_value(value).unwrap();
             assert_eq!(parsed.terminal, None);
+        }
+    }
+
+    #[test]
+    fn wsl_hook_owner_state_distinguishes_end_from_transport_failure() {
+        let evidence = serde_json::to_vec(&json!({
+            "anchor":{"pid":10,"start":"100","uid":1000,"tty":"42","session":"10"},
+            "argv":[["claude","claude",""]]
+        }))
+        .unwrap();
+        assert!(matches!(
+            parse_owner_status(&evidence),
+            (ShellOwnerStatus::Alive, Some(_))
+        ));
+        assert!(matches!(
+            parse_owner_status(br#""ended""#),
+            (ShellOwnerStatus::Ended, None)
+        ));
+        for output in [br#""unavailable""#.as_slice(), b"not-json"] {
+            assert!(matches!(
+                parse_owner_status(output),
+                (ShellOwnerStatus::Unavailable, None)
+            ));
         }
     }
 

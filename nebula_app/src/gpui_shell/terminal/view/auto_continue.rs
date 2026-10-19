@@ -27,12 +27,19 @@ impl TerminalView {
             .map(|settings| settings.ai_auto_continue_interval)
             .unwrap_or_else(|| nebula_settings::AutoContinueInterval::default().interval());
         if event.kind == AiHookKind::PromptSubmit {
-            let current_error = self.auto_continue_screen_snapshot().and_then(|screen| {
-                settings.and_then(|settings| {
-                    self.auto_continue_screen_error(&event.source, &screen, settings)
-                })
-            });
-            self.auto_continue.remember_screen_at_prompt(current_error);
+            let screen = self.auto_continue_screen_snapshot();
+            if !screen.as_deref().is_some_and(|screen| {
+                crate::ai_agents::screen_is_history_viewport(&event.source, screen)
+            }) {
+                let current_error = screen.and_then(|screen| {
+                    settings.and_then(|settings| {
+                        self.auto_continue_screen_error(&event.source, &screen, settings)
+                    })
+                });
+                self.screen_error_at_prompt = current_error.clone();
+            }
+            self.auto_continue.remember_screen_at_prompt(self.screen_error_at_prompt.clone());
+            self.set_screen_error_indicator(false, cx);
         }
         let delay = self.auto_continue.observe(event, Instant::now(), max_attempts, interval);
         if !cx.try_global::<Settings>().is_some_and(|settings| settings.ai_auto_continue) {
@@ -68,6 +75,9 @@ impl TerminalView {
             .map(|identity| identity.session_id.clone());
         let failure = settings
             .and_then(|settings| self.auto_continue_screen_error(program, screen, settings));
+        if failure.is_none() {
+            self.screen_error_at_prompt = None;
+        }
         let eligible = self.auto_continue_screen_can_retry(program, screen);
         let observation = self.auto_continue.observe_screen_failure_diagnostic(
             program,
@@ -115,12 +125,6 @@ impl TerminalView {
                 };
                 let pending_screen_failure =
                     view.auto_continue.pending_screen_failure().map(str::to_owned);
-                let Some(evidence) =
-                    view.auto_continue.take_pending(settings.ai_auto_continue_attempts)
-                else {
-                    log::debug!("auto_continue: send_cancelled reason=pending_missing_or_limit");
-                    return;
-                };
                 let identity_changed = !view.ai_session.as_ref().is_some_and(|identity| {
                     identity.source == program && identity.session_id == session_id
                 });
@@ -144,12 +148,33 @@ impl TerminalView {
                     None
                 };
                 if let Some(reason) = guard_reason {
+                    view.auto_continue.take_pending(settings.ai_auto_continue_attempts);
                     log::debug!("auto_continue: send_cancelled reason={reason}");
                     return;
                 }
                 let status = view.agent_activity.status();
                 let Some(screen) = view.auto_continue_screen_snapshot() else {
+                    view.auto_continue.take_pending(settings.ai_auto_continue_attempts);
                     log::debug!("auto_continue: send_cancelled reason=screen_unavailable");
+                    return;
+                };
+                if view.auto_continue.pending() == Some(RetryEvidence::HookFailure)
+                    && matches!(status, AgentStatus::Idle | AgentStatus::Failed)
+                    && view.last_command_failed
+                    && crate::ai_agents::screen_is_history_viewport(&program, &screen)
+                {
+                    view.schedule_auto_continue_send(
+                        program.clone(),
+                        session_id.clone(),
+                        std::time::Duration::from_secs(1),
+                        cx,
+                    );
+                    return;
+                }
+                let Some(evidence) =
+                    view.auto_continue.take_pending(settings.ai_auto_continue_attempts)
+                else {
+                    log::debug!("auto_continue: send_cancelled reason=pending_missing_or_limit");
                     return;
                 };
                 let current_screen_failure =

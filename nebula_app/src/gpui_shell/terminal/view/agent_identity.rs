@@ -48,6 +48,23 @@ fn additional_binding_is_current(
 }
 
 impl TerminalView {
+    /// Called only for a shell submission, before any bytes reach the PTY.
+    #[cfg(windows)]
+    pub(super) fn capture_native_command_boundary(&mut self) {
+        if !self.recovery.requires_foreground_receipt()
+            || !self.suggest.suggest_env.is_this_machine()
+            || self.ssh_destination.is_some()
+        {
+            self.native_command_boundary = None;
+            return;
+        }
+        self.invalidate_agent_identity_probe();
+        self.pending_recovery_hooks.clear();
+        self.native_command_boundary = self.session.as_ref().and_then(|session| {
+            agent_process_identity::NativeLaunchBoundary::capture(session.shell_pid)
+        });
+    }
+
     /// Invalidation requests cancellation; only the completed worker releases its slot.
     pub(super) fn invalidate_agent_identity_probe(&mut self) {
         self.agent_identity_probe_epoch = self.agent_identity_probe_epoch.wrapping_add(1);
@@ -89,6 +106,16 @@ impl TerminalView {
     }
 
     fn agent_identity_context(&self) -> Option<(crate::runtime_exec::PaneExecContext, String)> {
+        #[cfg(windows)]
+        if self.suggest.suggest_env.is_this_machine()
+            && self.recovery.requires_foreground_receipt()
+            && self.ssh_destination.is_none()
+        {
+            let context = self.exec_context.as_ref()?;
+            if context.wsl_distribution().is_none() {
+                return Some((context.clone(), String::new()));
+            }
+        }
         let crate::display::SuggestEnv::Wsl { distro } = &self.suggest.suggest_env else {
             return None;
         };
@@ -117,9 +144,10 @@ impl TerminalView {
     ) {
         match (expected, result) {
             (None, ProbeOutcome::Discovery(result))
-                if may_refine_process_identity(
+                if may_collect_process_receipt(
                     self.agent_activity.hook_seen(),
                     self.running_program.as_deref(),
+                    self.recovery.requires_foreground_receipt(),
                 ) =>
             {
                 match result {
@@ -128,6 +156,7 @@ impl TerminalView {
                         self.agent_identity_receipt = Some(receipt);
                         self.agent_identity_probe_misses = 0;
                         self.agent_activity.identify_foreground_process();
+                        self.replay_pending_recovery_hooks(cx);
                         // Identity is not activity; the shared lifecycle owns all task-state changes.
                         cx.emit(TerminalViewEvent::TitleChanged);
                         cx.notify();
@@ -178,6 +207,16 @@ pub(super) fn may_refine_process_identity(hook_seen: bool, running_program: Opti
     !hook_seen && running_program.and_then(crate::ai_agents::AgentKind::parse).is_none()
 }
 
+fn may_collect_process_receipt(
+    hook_seen: bool,
+    running_program: Option<&str>,
+    recovery_receipt_required: bool,
+) -> bool {
+    !hook_seen
+        && (may_refine_process_identity(hook_seen, running_program)
+            || recovery_receipt_required)
+}
+
 fn process_probe_result_is_current(
     current_epoch: u64,
     result_epoch: u64,
@@ -189,13 +228,18 @@ fn process_probe_result_is_current(
     running_program: Option<&str>,
     current_distribution: Option<&str>,
     result_distribution: &str,
+    recovery_receipt_required: bool,
 ) -> bool {
     current_epoch == result_epoch
         && !hook_seen
         && !exited
         && current_shell_pid == Some(result_shell_pid)
         && current_distribution == Some(result_distribution)
-        && may_refine_process_identity(hook_seen, running_program)
+        && may_collect_process_receipt(
+            hook_seen,
+            running_program,
+            recovery_receipt_required,
+        )
 }
 
 impl TerminalView {
@@ -217,7 +261,11 @@ impl TerminalView {
         }
         let expected = self.agent_identity_receipt.clone();
         if expected.is_none()
-            && !may_refine_process_identity(false, self.running_program.as_deref())
+            && !may_collect_process_receipt(
+                false,
+                self.running_program.as_deref(),
+                self.recovery.requires_foreground_receipt(),
+            )
         {
             return;
         }
@@ -246,10 +294,26 @@ impl TerminalView {
         self.agent_identity_probe_wake = false;
         self.last_agent_identity_probe = Some(Instant::now());
 
+        #[cfg(windows)]
+        let native_boundary = self.native_command_boundary.clone();
         let worker_cancelled = cancelled.clone();
         let worker_expected = expected.clone();
         let work = cx.background_executor().spawn(async move {
             let is_cancelled = || worker_cancelled.load(Ordering::Acquire);
+            #[cfg(windows)]
+            if context.wsl_distribution().is_none() {
+                if is_cancelled() {
+                    return ProbeOutcome::Discovery(AgentProbe::Unavailable);
+                }
+                return match worker_expected {
+                    Some(receipt) => ProbeOutcome::Recheck(
+                        agent_process_identity::recheck_native_receipt(&receipt, native_boundary.as_ref()),
+                    ),
+                    None => ProbeOutcome::Discovery(
+                        agent_process_identity::probe_native_receipt(shell_pid, native_boundary.as_ref()),
+                    ),
+                };
+            }
             match worker_expected {
                 Some(receipt) => {
                     ProbeOutcome::Recheck(agent_process_identity::recheck_foreground_agent(
@@ -301,6 +365,7 @@ impl TerminalView {
                     program,
                     current_context.as_ref().map(|(_, distro)| distro.as_str()),
                     &result_distribution,
+                    view.recovery.requires_foreground_receipt(),
                 ) {
                     view.agent_identity_probe_wake = true;
                     return;
@@ -314,7 +379,10 @@ impl TerminalView {
 
 #[cfg(test)]
 mod tests {
-    use super::{may_refine_process_identity, process_probe_result_is_current};
+    use super::{
+        may_collect_process_receipt, may_refine_process_identity,
+        process_probe_result_is_current,
+    };
 
     fn current(
         current_epoch: u64,
@@ -335,6 +403,7 @@ mod tests {
             running_program,
             Some("Debian"),
             "Debian",
+            false,
         )
     }
 
@@ -344,6 +413,9 @@ mod tests {
         assert!(may_refine_process_identity(false, None));
         assert!(!may_refine_process_identity(false, Some("codex")));
         assert!(!may_refine_process_identity(true, Some("cc")));
+        assert!(may_collect_process_receipt(false, Some("codex"), true));
+        assert!(!may_collect_process_receipt(false, Some("codex"), false));
+        assert!(!may_collect_process_receipt(true, Some("codex"), true));
     }
 
     #[test]
@@ -365,6 +437,7 @@ mod tests {
             Some("cc"),
             Some("Ubuntu"),
             "Debian",
+            false,
         ));
     }
 }
@@ -386,6 +459,7 @@ mod independent_probe_regressions {
             None,
             Some("Debian"),
             "Debian",
+            false,
         ));
         assert!(!process_probe_result_is_current(
             5,
@@ -398,6 +472,7 @@ mod independent_probe_regressions {
             None,
             Some("Debian"),
             "Debian",
+            false,
         ));
         assert!(!process_probe_result_is_current(
             4,
@@ -410,6 +485,7 @@ mod independent_probe_regressions {
             None,
             Some("Debian"),
             "Debian",
+            false,
         ));
     }
 
@@ -614,6 +690,171 @@ mod proof_contract_tests {
             assert_eq!(view.running_program.as_deref(), Some("codex"));
             assert_eq!(view.ai_session.as_ref().unwrap().session_id, "hook-new");
             assert!(view.agent_activity.hook_seen());
+        });
+    }
+
+    fn foreground_receipt(kind: crate::ai_agents::AgentKind, pid: u32, start: u64) -> ForegroundAgent {
+        ForegroundAgent {
+            kind,
+            process: agent_process_identity::ProcessStamp {
+                pid,
+                start_time: start,
+            },
+            shell: agent_process_identity::ProcessStamp {
+                pid: 8100,
+                start_time: 8100,
+            },
+            tty_nr: 34823,
+            process_group: pid,
+        }
+    }
+
+    fn failed_codex_recovery(view: &mut TerminalView) -> crate::session::AgentSession {
+        let target = crate::session::AgentSession {
+            source: "codex".into(),
+            session_id: Some("missing-codex".into()),
+            session_file: None,
+        };
+        view.recovery.target = Some(target.clone());
+        view.recovery.awaiting_confirmation = true;
+        view.recovery.mark_failed();
+        target
+    }
+
+    #[cfg(feature = "gpui-test-support")]
+    #[gpui::test]
+    fn direct_cli_after_failed_recovery_collects_the_takeover_receipt(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, window, _) = super::super::startup_tests::open(cx);
+        view.update(window, |view, cx| {
+            let failed = failed_codex_recovery(view);
+            view.suggest.last_committed = "claude".into();
+            view.on_command_start(cx);
+            assert_eq!(view.running_program.as_deref(), Some("claude"));
+            assert!(view.recovery.requires_foreground_receipt());
+            assert!(view.agent_identity_receipt.is_none());
+
+            let receipt = foreground_receipt(crate::ai_agents::AgentKind::Claude, 9523, 900);
+            view.apply_agent_identity_probe(
+                None,
+                ProbeOutcome::Discovery(AgentProbe::Found(receipt.clone())),
+                cx,
+            );
+            assert_eq!(view.agent_identity_receipt.as_ref(), Some(&receipt));
+
+            let event = crate::ai_hook::parse_remote_envelope(
+                b"nebula-hook/1 source=claude process=9523:900 pane=42\n{\"hook_event_name\":\"SessionStart\",\"session_id\":\"direct-claude\",\"bridge_sequence\":1}",
+                Some(view.pane_id),
+            )
+            .unwrap();
+            assert!(view.handle_ai_hook(&event, cx));
+            assert_eq!(view.session_agent().unwrap().source, "claude");
+            assert_eq!(
+                view.session_agent().unwrap().session_id.as_deref(),
+                Some("direct-claude")
+            );
+            assert_eq!(view.recovery.retry_candidate, Some(failed));
+        });
+    }
+
+    #[cfg(feature = "gpui-test-support")]
+    #[gpui::test]
+    fn no_id_hook_waits_for_a_matching_receipt_and_cannot_bypass_recovery(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, window, _) = super::super::startup_tests::open(cx);
+        view.update(window, |view, cx| {
+            let failed = failed_codex_recovery(view);
+            view.running_program = Some("claude".into());
+            let start = crate::ai_hook::parse_remote_envelope(
+                b"nebula-hook/1 source=claude process=9523:900 pane=42\n{\"hook_event_name\":\"SessionStart\",\"bridge_sequence\":1}",
+                Some(view.pane_id),
+            )
+            .unwrap();
+
+            assert!(!view.handle_ai_hook(&start, cx));
+            assert_eq!(view.session_agent(), Some(failed.clone()));
+            assert!(!view.agent_activity.hook_seen());
+            assert_eq!(view.pending_recovery_hooks.len(), 1);
+
+            let receipt = foreground_receipt(crate::ai_agents::AgentKind::Claude, 9523, 900);
+            view.apply_agent_identity_probe(
+                None,
+                ProbeOutcome::Discovery(AgentProbe::Found(receipt)),
+                cx,
+            );
+            assert!(view.pending_recovery_hooks.is_empty());
+            assert!(view.agent_activity.hook_seen());
+            assert_eq!(view.running_program.as_deref(), Some("claude"));
+            assert_eq!(view.session_agent().unwrap().source, "claude");
+            assert!(view.session_agent().unwrap().session_id.is_none());
+
+            let identified = crate::ai_hook::parse_remote_envelope(
+                b"nebula-hook/1 source=claude process=9523:900 pane=42\n{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"identified-claude\",\"bridge_sequence\":2}",
+                Some(view.pane_id),
+            )
+            .unwrap();
+            assert!(view.handle_ai_hook(&identified, cx));
+            assert_eq!(
+                view.session_agent().unwrap().session_id.as_deref(),
+                Some("identified-claude")
+            );
+            assert_eq!(view.recovery.retry_candidate, Some(failed));
+        });
+    }
+
+    #[cfg(feature = "gpui-test-support")]
+    #[gpui::test]
+    fn no_id_hook_from_a_different_process_cannot_establish_live_identity(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, window, _) = super::super::startup_tests::open(cx);
+        view.update(window, |view, cx| {
+            let failed = failed_codex_recovery(view);
+            view.running_program = Some("claude".into());
+            view.agent_identity_receipt = Some(foreground_receipt(
+                crate::ai_agents::AgentKind::Claude,
+                9523,
+                900,
+            ));
+            let foreign = crate::ai_hook::parse_remote_envelope(
+                b"nebula-hook/1 source=codex process=9001:500 codex_hooks=full pane=42\n{\"hook_event_name\":\"SessionStart\",\"bridge_sequence\":1}",
+                Some(view.pane_id),
+            )
+            .unwrap();
+
+            assert!(!view.handle_ai_hook(&foreign, cx));
+            assert!(view.pending_recovery_hooks.is_empty());
+            assert!(!view.agent_activity.hook_seen());
+            assert_eq!(view.session_agent(), Some(failed));
+        });
+    }
+
+    #[cfg(feature = "gpui-test-support")]
+    #[gpui::test]
+    fn native_recovery_takeover_requires_the_same_pid_and_kernel_creation_time(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, window, _) = super::super::startup_tests::open(cx);
+        view.update(window, |view, cx| {
+            failed_codex_recovery(view);
+            view.running_program = Some("claude".into());
+            view.agent_identity_receipt = Some(foreground_receipt(
+                crate::ai_agents::AgentKind::Claude, 9523, 900,
+            ));
+            let mut event = crate::ai_hook::parse_remote_envelope(
+                b"nebula-hook/1 source=claude pane=42\n{\"hook_event_name\":\"SessionStart\",\"session_id\":\"native-stamped\",\"agent_start_time\":900}",
+                Some(view.pane_id),
+            ).unwrap();
+            assert_eq!(event.agent_start_time, None, "payload cannot assert kernel identity");
+            event.agent_pid = Some(9523);
+            assert!(!view.handle_ai_hook(&event, cx), "PID alone cannot take over");
+            event.agent_start_time = Some(899);
+            assert!(!view.handle_ai_hook(&event, cx), "a recycled PID is a different process");
+            event.agent_start_time = Some(900);
+            assert!(view.handle_ai_hook(&event, cx));
+            assert_eq!(view.session_agent().unwrap().session_id.as_deref(), Some("native-stamped"));
         });
     }
 }

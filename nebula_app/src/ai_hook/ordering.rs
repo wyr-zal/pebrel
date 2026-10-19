@@ -23,6 +23,7 @@ impl AiHookEvent {
             },
             pane,
             agent_pid: self.agent_pid,
+            agent_start_time: self.agent_start_time,
             remote_process: self.remote_process.clone(),
         }
     }
@@ -36,6 +37,7 @@ struct AiHookStreamKey {
     /// agent 的进程身份。同一个 pane 里主 agent 与它 spawn 的子代理各占一条
     /// 流：两者的 session id 也不同，但那个值可能缺失，pid 不会。
     agent_pid: Option<u32>,
+    agent_start_time: Option<u64>,
     remote_process: Option<String>,
 }
 

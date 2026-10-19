@@ -363,7 +363,12 @@ fn send_local(endpoint: &std::ffi::OsStr, message: &[u8]) -> std::io::Result<()>
     }
     #[cfg(not(unix))]
     {
-        std::fs::OpenOptions::new().write(true).open(endpoint)?.write_all(message)
+        let mut pipe = std::fs::OpenOptions::new().write(true).open(endpoint)?;
+        pipe.write_all(message)?;
+        // FlushFileBuffers on a named pipe waits until the server consumes the
+        // message, keeping the kernel client identity alive for its owner probe.
+        // The existing whole-process FORWARD_TIMEOUT still bounds a stuck peer.
+        pipe.sync_all()
     }
 }
 

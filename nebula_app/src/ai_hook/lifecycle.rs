@@ -23,6 +23,7 @@ struct Owner {
     source: String,
     session: Option<String>,
     pid: Option<u32>,
+    start_time: Option<u64>,
     remote_process: Option<String>,
     bridge_instance: Option<String>,
 }
@@ -38,6 +39,19 @@ pub(crate) struct CodexFailureTarget {
     pub session: String,
     pub turn: String,
     pub process: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShellHookOwner {
+    pub source: String,
+    pub process: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShellOwnerStatus {
+    Alive,
+    Ended,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -138,6 +152,19 @@ impl AgentActivity {
     pub fn primary_pid(&self) -> Option<u32> {
         self.owner.as_ref().and_then(|owner| owner.pid)
     }
+    pub(crate) fn shell_boundary_owner(&self) -> Option<ShellHookOwner> {
+        if !matches!(self.coverage, HookCoverage::Turns | HookCoverage::Lifecycle) {
+            return None;
+        }
+        let owner = self.owner.as_ref()?;
+        Some(ShellHookOwner {
+            source: owner.source.clone(),
+            process: owner.remote_process.clone()?,
+        })
+    }
+    pub fn command_ended(&self) -> bool {
+        self.command_ended
+    }
     pub fn allows_screen(&self) -> bool {
         (!self.command_ended || self.verified_foreground)
             && self.coverage != HookCoverage::Lifecycle
@@ -233,6 +260,21 @@ impl AgentActivity {
         self.command_ended = true;
     }
 
+    /// A provider's lifecycle Hook proves that its process can outlive a late
+    /// shell edge (for example an initialization prompt or a queued 133;D).
+    /// Keep the hook-owned session and let SessionEnd or process exit close it.
+    pub fn defer_shell_boundary(&mut self) -> bool {
+        if self.owner.is_none()
+            || !matches!(self.coverage, HookCoverage::Turns | HookCoverage::Lifecycle)
+        {
+            return false;
+        }
+        self.command_ended = true;
+        self.verified_foreground = false;
+        self.idle_samples = 0;
+        true
+    }
+
     /// Launching an Agent is not evidence that it has answered a prompt.
     pub fn begin_command(&mut self, agent: bool) {
         self.reset();
@@ -297,7 +339,9 @@ impl AgentActivity {
     /// Check ownership before the ordering gate records this event. An ignored
     /// legacy notification must not reopen the gate's already completed stream.
     pub fn accepts_hook(&self, event: &AiHookEvent) -> bool {
-        if self.command_ended && (event.kind != AiHookKind::SessionStart || event.session_compacted)
+        if self.command_ended
+            && self.coverage == HookCoverage::None
+            && (event.kind != AiHookKind::SessionStart || event.session_compacted)
         {
             return false;
         }
@@ -404,6 +448,11 @@ impl AgentActivity {
         }
         if let Some(owner) = &self.owner {
             if owner.source != event.source {
+                return false;
+            }
+            if owner.start_time.is_some()
+                && (owner.pid != event.agent_pid || owner.start_time != event.agent_start_time)
+            {
                 return false;
             }
             if owner.remote_process.is_some()
@@ -546,6 +595,7 @@ impl AgentActivity {
     fn record_owner(&mut self, event: &AiHookEvent) {
         if let Some(owner) = &mut self.owner {
             owner.pid = owner.pid.or(event.agent_pid);
+            owner.start_time = owner.start_time.or(event.agent_start_time);
             if owner.remote_process.is_none() {
                 owner.remote_process = event.remote_process.clone();
             }
@@ -560,6 +610,7 @@ impl AgentActivity {
                 source: event.source.clone(),
                 session: event.session_id.clone(),
                 pid: event.agent_pid,
+                start_time: event.agent_start_time,
                 remote_process: event.remote_process.clone(),
                 bridge_instance: event.bridge_instance.clone(),
             });

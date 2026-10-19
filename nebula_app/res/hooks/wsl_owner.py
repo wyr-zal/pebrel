@@ -125,7 +125,7 @@ def process(root):
     uid = next(line.split()[1:5] for line in read(root / "status", 8192).decode().splitlines() if line.startswith("Uid:"))
     if len(set(uid)) != 1:
         raise ValueError("mixed process credentials")
-    return dict(pid=int(root.name), parent=int(fields[1]), group=fields[2],
+    return dict(pid=int(root.name), state=fields[0], parent=int(fields[1]), group=fields[2],
                 session=fields[3], tty=fields[4], foreground=fields[5],
                 start=fields[19], uid=int(uid[0]))
 
@@ -201,3 +201,37 @@ def verify(request, proc=Path("/proc")):
         return result
     except (OSError, ValueError, IndexError, KeyError, StopIteration):
         return None
+
+
+def owner_state(request, proc=Path("/proc")):
+    """Classify an existing owner without treating infrastructure failures as exit."""
+    try:
+        match = re.fullmatch(r"([1-9][0-9]*):([0-9]+)", request.get("owner", ""))
+        if match is None:
+            return "unavailable"
+        owner_pid, expected_start = match.groups()
+        root = proc / owner_pid
+        try:
+            before = process(root)
+        except (FileNotFoundError, ProcessLookupError):
+            return "ended"
+        if before["start"] != expected_start:
+            return "ended"
+        if before["state"] in ("Z", "X") or before["tty"] == "0":
+            return "ended"
+        if before["group"] != before["foreground"]:
+            return "ended"
+        evidence = verify(request, proc)
+        if evidence is not None:
+            return evidence
+        try:
+            after = process(root)
+        except (FileNotFoundError, ProcessLookupError):
+            return "ended"
+        if after["start"] != before["start"] or after["state"] in ("Z", "X"):
+            return "ended"
+        if after["tty"] == "0" or after["group"] != after["foreground"]:
+            return "ended"
+        return "unavailable"
+    except (OSError, ValueError, IndexError, KeyError, StopIteration):
+        return "unavailable"

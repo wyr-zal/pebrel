@@ -5,6 +5,11 @@ use std::time::{Duration, Instant};
 use crate::ai_agents::AgentKind;
 use crate::runtime_exec::PaneExecContext;
 
+#[cfg(windows)]
+mod native;
+#[cfg(windows)]
+pub(crate) use native::{NativeLaunchBoundary, NativeProcessIdentity, hook_owner};
+
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PROBE_OUTPUT: usize = 64 * 1024;
 const MAX_PROBE_RECORDS: usize = 128;
@@ -193,7 +198,7 @@ done
 echo_record E
 "###;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ProcessStamp {
     pub pid: u32,
     pub start_time: u64,
@@ -220,6 +225,92 @@ pub(crate) enum AgentRecheck {
     Current,
     Changed,
     Unavailable,
+}
+
+/// A native takeover needs a command launch boundary and exactly one provider
+/// in a shell branch created after it. Older background branches cannot take over.
+#[cfg(windows)]
+pub(crate) fn probe_native_receipt(
+    shell_pid: u32,
+    launched_after: Option<&NativeLaunchBoundary>,
+) -> AgentProbe {
+    let Some(boundary) = launched_after else { return AgentProbe::Unavailable };
+    let Ok(rows) = super::process_snapshot::snapshot() else { return AgentProbe::Unavailable };
+    native_receipt_from_rows(shell_pid, boundary, rows)
+}
+
+#[cfg(windows)]
+fn native_receipt_from_rows(
+    shell_pid: u32,
+    boundary: &NativeLaunchBoundary,
+    rows: Vec<super::process_snapshot::ProcessRow>,
+) -> AgentProbe {
+    let stamps: HashMap<_, _> = rows.iter().map(|row| (row.pid, row.created)).collect();
+    let Some(&shell_start) = stamps.get(&shell_pid).filter(|start| **start != 0) else {
+        return AgentProbe::Unavailable;
+    };
+    if boundary.shell != (ProcessStamp { pid: shell_pid, start_time: shell_start }) {
+        return AgentProbe::Unavailable;
+    }
+    let Ok(tree) = crate::process_tree::descendants_from_rows(shell_pid, rows) else {
+        return AgentProbe::Unavailable;
+    };
+    let mut candidates = Vec::new();
+    let mut current_branches = HashSet::new();
+    // descendants_from_rows is breadth first and verifies parent creation times.
+    for row in tree.iter().filter(|row| row.depth > 0) {
+        let Some(&created) = stamps.get(&row.pid).filter(|stamp| **stamp != 0) else {
+            return AgentProbe::Unavailable;
+        };
+        if created <= boundary.time
+            || boundary.existing_branches.contains(&ProcessStamp { pid: row.pid, start_time: created })
+            || (row.parent_pid != shell_pid && !current_branches.contains(&row.parent_pid))
+        {
+            continue;
+        }
+        current_branches.insert(row.pid);
+        // Codex's npm launcher directly owns its native CLI. The native child
+        // emits hooks, so it must also own the independently observed receipt.
+        if matches!(crate::process_tree::display_name(&row.executable).to_ascii_lowercase().as_str(), "node" | "nodejs")
+            && tree.iter().any(|child| {
+                child.parent_pid == row.pid
+                    && AgentKind::parse(&child.executable) == Some(AgentKind::Codex)
+            })
+        {
+            continue;
+        }
+        let Some(&created) = stamps.get(&row.pid) else { return AgentProbe::Unavailable };
+        match native::process_kind(row.pid, created, &row.executable) {
+            Ok(Some(kind)) => candidates.push((row, kind)),
+            Ok(None) => {},
+            Err(()) => return AgentProbe::Unavailable,
+        }
+    }
+    if candidates.is_empty() { return AgentProbe::NoAgent; }
+    let [(row, kind)] = candidates.as_slice() else { return AgentProbe::Unavailable };
+    let Some(&start_time) = stamps.get(&row.pid).filter(|start| **start != 0) else {
+        return AgentProbe::Unavailable;
+    };
+    AgentProbe::Found(ForegroundAgent {
+        kind: *kind,
+        process: ProcessStamp { pid: row.pid, start_time },
+        shell: ProcessStamp { pid: shell_pid, start_time: shell_start },
+        // These fields apply only to POSIX receipts; native checks use stamps.
+        tty_nr: 0,
+        process_group: 0,
+    })
+}
+
+#[cfg(windows)]
+pub(crate) fn recheck_native_receipt(
+    expected: &ForegroundAgent,
+    launched_after: Option<&NativeLaunchBoundary>,
+) -> AgentRecheck {
+    match probe_native_receipt(expected.shell.pid, launched_after) {
+        AgentProbe::Found(current) if current == *expected => AgentRecheck::Current,
+        AgentProbe::Found(_) | AgentProbe::NoAgent => AgentRecheck::Changed,
+        AgentProbe::Unavailable => AgentRecheck::Unavailable,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

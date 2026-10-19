@@ -104,6 +104,16 @@ fn serve(name: &str, sink: impl Fn(AiHookEvent) -> bool) {
                 let ok = unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) };
                 (ok != 0 && pid != 0).then_some(pid)
             };
+            // Pin the pipe client's kernel object while reading its message so
+            // a recycled client PID cannot bind old bytes to a new ancestor.
+            let client_identity = client_pid.and_then(
+                crate::platform::agent_process_identity::NativeProcessIdentity::open,
+            );
+            // Resolve ancestry while the helper still waits for its pipe write
+            // to be consumed. Waiting for EOF first loses short-lived clients.
+            let client_owner = client_identity.as_ref().and_then(|client| {
+                crate::platform::agent_process_identity::hook_owner(client.stamp())
+            });
             let mut buf = Vec::with_capacity(4096);
             let mut chunk = [0u8; 4096];
             loop {
@@ -134,9 +144,11 @@ fn serve(name: &str, sink: impl Fn(AiHookEvent) -> bool) {
                 // agent 的进程身份：helper 的父进程往往是执行 hook 命令的
                 // shell，agent 在更上一层，所以要沿祖先链找。用它区分嵌套
                 // 子代理，见 `AiHookEvent::agent_pid`。
-                event.agent_pid = client_pid
-                    .and_then(crate::process_tree::nearest_agent_ancestor)
-                    .map(|(pid, _)| pid);
+                if let Some((owner, kind)) = client_owner.filter(|(_, kind)| kind.slug() == event.source) {
+                    event.agent_pid = Some(owner.pid);
+                    event.agent_start_time = Some(owner.start_time);
+                    debug_assert_eq!(kind.slug(), event.source);
+                }
                 log::debug!("ai_hook: {event:?}");
                 if !sink(event) {
                     // Event loop gone: shutting down.

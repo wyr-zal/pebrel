@@ -118,7 +118,7 @@ fn shared_screen_error_retries_claude_and_codex_without_rewriting_hook_state(
         notifications.borrow_mut().clear();
 
         let frame = if program == "claude" {
-            "API Error: stream error: stream disconnected before completion: stream closed before response.completed\n✻ Worked for 5m 45s · done 8:45 AM\n❯ \n? for shortcuts"
+            "API Error: stream error: stream disconnected before completion: stream closed before response.completed\n✻ Worked for 5m 45s · done 8:45 AM\n────────\n❯ \n────────\n? for shortcuts"
         } else {
             "■ We’re currently experiencing high demand, which may cause temporary errors.\n› Ask Codex to do anything\ngpt-6-astra medium · Context 0% used"
         };
@@ -186,7 +186,7 @@ fn screen_before_terminal_hook_preserves_one_retry_and_its_deadline(cx: &mut Tes
             };
             assert!(view.handle_ai_hook(&prompt, cx));
             let frame = if program == "claude" {
-                "API Error: stream error: stream disconnected before completion\n❯ \n? for shortcuts"
+                "API Error: stream error: stream disconnected before completion\n────────\n❯ \n────────\n? for shortcuts"
             } else {
                 "■ We’re currently experiencing high demand, which may cause temporary errors.\n› Ask Codex to do anything\ngpt-6 medium · Context 2% used"
             };
@@ -364,6 +364,97 @@ fn working_frames_do_not_forget_an_unchanged_historical_error(cx: &mut TestAppCo
 }
 
 #[gpui::test]
+fn agent_scroll_history_revokes_screen_retry_without_forgetting_old_error(cx: &mut TestAppContext) {
+    let (view, window, receiver) = open(cx);
+    window.update(|_, cx| {
+        cx.update_global::<Settings, _>(|settings, _| {
+            settings.ai_auto_continue = true;
+            settings.ai_auto_continue_interval = Duration::from_secs(1);
+            settings.ai_auto_continue_error_patterns =
+                crate::ai_agents::parse_auto_continue_error_patterns(
+                    nebula_settings::DEFAULT_AUTO_CONTINUE_ERROR_PATTERNS,
+                );
+        })
+    });
+    view.update(window, |view, cx| {
+        let error = "API Error: stream error: stream disconnected before completion";
+        let composer = "────────\n❯ \n────────\n? for shortcuts";
+        assert!(view.handle_ai_hook(&hook("history-retry", "UserPromptSubmit", 1), cx));
+        screen(view, &format!("{error}\n{composer}"));
+        view.refresh_agent_screen_state(cx);
+        assert!(view.auto_continue_task.is_some());
+        screen(view, &format!("{error}\n1 new message (ctrl+End) ↓\n{composer}"));
+        view.refresh_agent_screen_state(cx);
+        assert!(view.auto_continue_task.is_none());
+        assert!(!view.screen_error_indicator());
+        screen(view, &format!("{error}\n{composer}"));
+        view.refresh_agent_screen_state(cx);
+        assert!(view.auto_continue_task.is_none(), "same error remains consumed");
+        assert!(view.handle_ai_hook(&hook("history-retry", "UserPromptSubmit", 2), cx));
+        screen(view, &format!("{error}\nJump to bottom (ctrl+End) ↓\n{composer}"));
+        view.refresh_agent_screen_state(cx);
+        screen(view, &format!("{error}\n{composer}"));
+        view.refresh_agent_screen_state(cx);
+        assert!(view.auto_continue_task.is_none(), "prompt baseline survives history");
+        screen(view, &format!("{error}\nJump to bottom (ctrl+End) ↓\n{composer}"));
+        assert!(view.handle_ai_hook(&hook("history-retry", "UserPromptSubmit", 3), cx));
+        view.refresh_agent_screen_state(cx);
+        screen(view, &format!("{error}\n{composer}"));
+        view.refresh_agent_screen_state(cx);
+        assert!(!view.screen_error_indicator(), "prompt in history retains error baseline");
+        assert!(view.auto_continue_task.is_none(), "prompt in history cannot reuse old error");
+        screen(view, composer);
+        view.refresh_agent_screen_state(cx);
+        screen(view, &format!("{error}\n{composer}"));
+        view.refresh_agent_screen_state(cx);
+        assert!(view.screen_error_indicator(), "error appearing after a clean frame is new");
+        assert!(view.auto_continue_task.is_some());
+        screen(view, &format!("{error}\nJump to bottom (ctrl+End) ↓\n{composer}"));
+        view.refresh_agent_screen_state(cx);
+    });
+    window.run_until_parked();
+    window.executor().advance_clock(Duration::from_secs(2));
+    window.run_until_parked();
+    assert!(!receiver.try_iter().any(|message| matches!(message, Msg::Input(_))));
+}
+
+#[gpui::test]
+fn agent_scroll_history_defers_hook_retry_until_live_screen(cx: &mut TestAppContext) {
+    let (view, window, receiver) = open(cx);
+    window.update(|_, cx| {
+        cx.update_global::<Settings, _>(|settings, _| {
+            settings.ai_auto_continue = true;
+            settings.ai_auto_continue_interval = Duration::from_secs(1);
+        })
+    });
+    view.update(window, |view, cx| {
+        assert!(view.handle_ai_hook(&hook("history-hook", "UserPromptSubmit", 1), cx));
+        assert!(view.handle_ai_hook(&hook("history-hook", "StopFailure", 2), cx));
+        screen(view, "1 new message (ctrl+End) ↓\n────────\n❯ \n────────\n? for shortcuts");
+        view.refresh_agent_screen_state(cx);
+    });
+    window.run_until_parked();
+    window.executor().advance_clock(Duration::from_secs(1));
+    window.run_until_parked();
+    assert!(!receiver.try_iter().any(|message| matches!(message, Msg::Input(_))));
+    view.read_with(window, |view, _| {
+        assert_eq!(view.auto_continue.pending(), Some(RetryEvidence::HookFailure));
+        assert_eq!(view.agent_activity.status(), AgentStatus::Failed);
+    });
+    view.update(window, |view, cx| {
+        screen(view, "────────\n❯ \n────────\n? for shortcuts");
+        view.refresh_agent_screen_state(cx);
+    });
+    window.executor().advance_clock(Duration::from_secs(1));
+    window.run_until_parked();
+    let inputs: Vec<_> = receiver.try_iter().filter_map(|message| match message {
+        Msg::Input(bytes) => Some(bytes.into_owned()),
+        _ => None,
+    }).collect();
+    assert_eq!(inputs, vec![b"continue\r".to_vec()]);
+}
+
+#[gpui::test]
 fn revoked_screen_candidate_does_not_consume_the_later_claude_hook(cx: &mut TestAppContext) {
     let (view, window, receiver) = open(cx);
     window.update(|_, cx| {
@@ -380,14 +471,14 @@ fn revoked_screen_candidate_does_not_consume_the_later_claude_hook(cx: &mut Test
         view.handle_ai_hook(&hook("screen-redraw", "UserPromptSubmit", 1), cx);
         screen(
             view,
-            "API Error: stream error: stream disconnected before completion\n❯ \n? for shortcuts",
+            "API Error: stream error: stream disconnected before completion\n────────\n❯ \n────────\n? for shortcuts",
         );
         let snapshot = view.auto_continue_screen_snapshot().unwrap();
         assert!(view.auto_continue_screen_error("claude", &snapshot, cx.global::<Settings>()).is_some());
         assert!(view.auto_continue_screen_can_retry("claude", &snapshot));
         view.refresh_agent_screen_state(cx);
         assert!(view.auto_continue_task.is_some());
-        screen(view, "Clean redraw.\n❯ \n? for shortcuts");
+        screen(view, "Clean redraw.\n────────\n❯ \n────────\n? for shortcuts");
         view.refresh_agent_screen_state(cx);
         assert!(view.auto_continue_task.is_none());
         view.handle_ai_hook(&hook("screen-redraw", "StopFailure", 2), cx);

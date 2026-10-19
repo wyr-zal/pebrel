@@ -618,6 +618,133 @@ fn claude_activity_chrome_projects_work_and_idle_without_success(cx: &mut TestAp
 }
 
 #[gpui::test]
+fn labeled_claude_form_and_task_chrome_reach_sidebar_activity(cx: &mut TestAppContext) {
+    use crate::runtime_api::RuntimeTaskState;
+
+    let (view, window, _) = open(cx);
+    view.update(window, |view, cx| {
+        view.running_program = Some("claude".into());
+        view.command_running = true;
+        view.agent_activity.begin_command(true);
+        let tasks = "\n\n  3 tasks (2 done, 1 in progress, 0 open)\n  ✔ classify\n  ◼ sync";
+        let form = format!(
+            "  Thought for 5m 35s, ran 4 shell commands\n────\n ☐ scope\n\n❯ 1. portable\n  2. all\n────\nEnter to select · Esc to cancel\n──── magpie ─{tasks}"
+        );
+        screen(view, &form);
+        for _ in 0..4 {
+            view.refresh_agent_screen_state(cx);
+        }
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Attention);
+        assert_eq!(view.sidebar_activity(), SidebarActivity::Attention);
+
+        let working = format!(
+            "✢ Compacting conversation… (2s)\n────\n❯ \n──── magpie ─{tasks}"
+        );
+        screen(view, &working);
+        for _ in 0..4 {
+            view.refresh_agent_screen_state(cx);
+        }
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running);
+        assert_eq!(view.sidebar_activity(), SidebarActivity::Running);
+
+        let idle = format!(
+            "✻ Baked for 15m 24s\n────\n❯ \n──── magpie ─{tasks}"
+        );
+        screen(view, &idle);
+        for _ in 0..4 {
+            view.refresh_agent_screen_state(cx);
+        }
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Idle);
+        assert_eq!(view.sidebar_activity(), SidebarActivity::Idle);
+    });
+}
+
+#[gpui::test]
+fn agent_scroll_history_viewport_preserves_activity_and_recovers_at_bottom(cx: &mut TestAppContext) {
+    use crate::runtime_api::RuntimeTaskState;
+    let (view, window, _) = open(cx);
+    view.update(window, |view, cx| {
+        view.running_program = Some("claude".into());
+        view.command_running = true;
+        view.agent_activity.begin_command(true);
+        let composer = "────────\n❯ \n────────\n? for shortcuts";
+        screen(view, &format!("✻ Thinking… (3m 11s · ↓ 122 tokens)\n\n{composer}"));
+        view.refresh_agent_screen_state(cx);
+        assert_eq!(view.sidebar_activity(), SidebarActivity::Running);
+        for banner in ["Jump to bottom (ctrl+End) ↓", "1 new message (ctrl+End) ↓"] {
+            screen(view, &format!("Old completed answer.\n{banner}\n{composer}"));
+            for _ in 0..4 {
+                view.refresh_agent_screen_state(cx);
+            }
+            assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running, "{banner}");
+            assert_eq!(view.sidebar_activity(), SidebarActivity::Running, "{banner}");
+            assert_eq!(view.running_program.as_deref(), Some("claude"));
+        }
+        screen(view, &format!("✻ Baked for 15m 24s\n{composer}"));
+        for _ in 0..4 {
+            view.refresh_agent_screen_state(cx);
+        }
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Idle);
+        assert_eq!(view.sidebar_activity(), SidebarActivity::Idle);
+    });
+}
+
+#[gpui::test]
+fn terminal_and_composerless_history_freeze_the_last_current_observation(
+    cx: &mut TestAppContext,
+) {
+    use crate::runtime_api::RuntimeTaskState;
+    let (view, window, _) = open(cx);
+    view.update(window, |view, cx| {
+        view.running_program = Some("claude".into());
+        view.command_running = true;
+        view.agent_activity.begin_command(true);
+        let composer = "────────\n❯ \n────────\n? for shortcuts";
+        screen(view, &format!("✻ Thinking… (3m 11s)\n{composer}"));
+        for _ in 0..4 {
+            view.refresh_agent_screen_state(cx);
+        }
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running);
+
+        screen(view, &format!("✻ Baked for 15m 24s\n{composer}"));
+        for row in 0..48 {
+            feed(view, format!("\r\nhistory row {row}").as_bytes());
+        }
+        {
+            let mut term = view.session.as_ref().unwrap().term.lock();
+            term.scroll_display(Scroll::Top);
+            assert!(term.grid().display_offset() > 0);
+        }
+        for _ in 0..4 {
+            view.refresh_agent_screen_state(cx);
+        }
+        assert_eq!(
+            view.runtime_task_state(),
+            RuntimeTaskState::Running,
+            "terminal scrollback is not current-turn evidence"
+        );
+        assert_eq!(view.sidebar_activity(), SidebarActivity::Running);
+
+        view.session
+            .as_ref()
+            .unwrap()
+            .term
+            .lock()
+            .scroll_display(Scroll::Bottom);
+        screen(view, "Old completed answer without current composer chrome.");
+        for _ in 0..4 {
+            view.refresh_agent_screen_state(cx);
+        }
+        assert_eq!(
+            view.runtime_task_state(),
+            RuntimeTaskState::Running,
+            "a viewport without the current composer must not erase live state"
+        );
+        assert_eq!(view.sidebar_activity(), SidebarActivity::Running);
+    });
+}
+
+#[gpui::test]
 fn wsl_hook_claude_turn_cancel_requires_own_escape_and_current_idle(cx: &mut TestAppContext) {
     use crate::runtime_api::RuntimeTaskState;
     let (view, window, input) = open(cx);
@@ -809,6 +936,216 @@ fn claude_compaction_cancel_requires_own_input_and_current_idle_chrome(cx: &mut 
 }
 
 #[gpui::test]
+fn live_shell_owner_survives_a_late_command_boundary_without_session_end(
+    cx: &mut TestAppContext,
+) {
+    use crate::runtime_api::RuntimeTaskState;
+
+    let (view, window, _) = open(cx);
+    let event = |name: &str, sequence: u64| {
+        let payload = serde_json::json!({
+            "hook_event_name": name,
+            "session_id": "stale-command-boundary",
+            "turn_id": "live-turn",
+            "bridge_sequence": sequence,
+        });
+        crate::ai_hook::parse_remote_envelope(
+            format!(
+                "nebula-hook/1 source=codex process=1316:7632 codex_hooks=full pane=42\n{payload}"
+            )
+            .as_bytes(),
+            Some(42),
+        )
+        .unwrap()
+    };
+
+    view.update(window, |view, cx| {
+        view.running_program = Some("codex".into());
+        view.command_running = true;
+        assert!(view.handle_ai_hook(&event("UserPromptSubmit", 1), cx));
+        assert!(view.agent_activity.hook_seen());
+        assert_eq!(view.agent_activity.status(), AgentStatus::Working);
+        assert_eq!(view.session_agent().unwrap().session_id.as_deref(), Some("stale-command-boundary"));
+
+        let owner = view.agent_activity.shell_boundary_owner().unwrap();
+        view.shell_boundary_probe = Some(super::agent_activity::PendingShellBoundary {
+            owner: owner.clone(),
+            exit_code: Some(0),
+            attempts: 0,
+        });
+        view.resolve_probed_shell_boundary(
+            &owner,
+            crate::ai_hook::lifecycle::ShellOwnerStatus::Alive,
+            cx,
+        );
+
+        assert!(view.agent_activity.hook_seen(), "a late shell edge must retain the live Hook owner");
+        assert_eq!(view.agent_activity.status(), AgentStatus::Working);
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running);
+        assert_eq!(view.running_program.as_deref(), Some("codex"));
+        assert_eq!(view.session_agent().unwrap().session_id.as_deref(), Some("stale-command-boundary"));
+
+        assert!(view.handle_ai_hook(&event("PostToolUse", 2), cx));
+        assert_eq!(view.agent_activity.status(), AgentStatus::Working);
+    });
+}
+
+#[gpui::test]
+fn dead_shell_owner_finishes_the_command_without_waiting_for_session_end(
+    cx: &mut TestAppContext,
+) {
+    use crate::runtime_api::RuntimeTaskState;
+
+    let (view, window, _) = open(cx);
+    let event = crate::ai_hook::parse_remote_envelope(
+        br#"nebula-hook/1 source=codex process=1316:7632 codex_hooks=full pane=42
+{"hook_event_name":"UserPromptSubmit","session_id":"real-command-end","turn_id":"live-turn","bridge_sequence":1}"#,
+        Some(42),
+    )
+    .unwrap();
+
+    view.update(window, |view, cx| {
+        view.running_program = Some("codex".into());
+        view.command_running = true;
+        assert!(view.handle_ai_hook(&event, cx));
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running);
+
+        let owner = view.agent_activity.shell_boundary_owner().unwrap();
+        view.shell_boundary_probe = Some(super::agent_activity::PendingShellBoundary {
+            owner: owner.clone(),
+            exit_code: Some(0),
+            attempts: 0,
+        });
+        view.resolve_probed_shell_boundary(
+            &owner,
+            crate::ai_hook::lifecycle::ShellOwnerStatus::Ended,
+            cx,
+        );
+
+        assert!(!view.agent_activity.hook_seen());
+        assert!(view.running_program.is_none());
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Idle);
+    });
+}
+
+#[gpui::test]
+fn next_command_releases_a_pending_shell_probe_before_the_new_hook(cx: &mut TestAppContext) {
+    let (view, window, _) = open(cx);
+    let old = crate::ai_hook::parse_remote_envelope(
+        b"nebula-hook/1 source=codex process=1316:7632 codex_hooks=full pane=42\n{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"old-codex\",\"turn_id\":\"old-turn\",\"bridge_sequence\":1}",
+        Some(42),
+    )
+    .unwrap();
+    let next = crate::ai_hook::parse_remote_envelope(
+        b"nebula-hook/1 source=claude process=9523:900 pane=42\n{\"hook_event_name\":\"SessionStart\",\"session_id\":\"new-claude\",\"bridge_sequence\":1}",
+        Some(42),
+    )
+    .unwrap();
+
+    view.update(window, |view, cx| {
+        view.running_program = Some("codex".into());
+        view.command_running = true;
+        assert!(view.handle_ai_hook(&old, cx));
+        let owner = view.agent_activity.shell_boundary_owner().unwrap();
+        view.shell_boundary_probe = Some(super::agent_activity::PendingShellBoundary {
+            owner,
+            exit_code: Some(0),
+            attempts: 0,
+        });
+        view.suggest.last_committed = "claude".into();
+
+        view.on_command_start(cx);
+
+        assert!(!view.agent_activity.hook_seen());
+        assert!(view.shell_boundary_probe.is_none());
+        assert_eq!(view.running_program.as_deref(), Some("claude"));
+        assert!(view.handle_ai_hook(&next, cx));
+        assert_eq!(
+            view.session_agent().and_then(|agent| agent.session_id),
+            Some("new-claude".into())
+        );
+    });
+}
+
+#[gpui::test]
+fn unavailable_shell_owner_probe_preserves_the_live_hook(cx: &mut TestAppContext) {
+    let (view, window, _) = open(cx);
+    let event = crate::ai_hook::parse_remote_envelope(
+        b"nebula-hook/1 source=codex process=1316:7632 codex_hooks=full pane=42\n{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"unavailable-boundary\",\"turn_id\":\"live-turn\",\"bridge_sequence\":1}",
+        Some(42),
+    )
+    .unwrap();
+
+    view.update(window, |view, cx| {
+        view.running_program = Some("codex".into());
+        view.command_running = true;
+        assert!(view.handle_ai_hook(&event, cx));
+        let owner = view.agent_activity.shell_boundary_owner().unwrap();
+        view.shell_boundary_probe = Some(super::agent_activity::PendingShellBoundary {
+            owner: owner.clone(),
+            exit_code: Some(0),
+            attempts: 4,
+        });
+
+        view.resolve_probed_shell_boundary(
+            &owner,
+            crate::ai_hook::lifecycle::ShellOwnerStatus::Unavailable,
+            cx,
+        );
+
+        assert!(view.agent_activity.hook_seen());
+        assert_eq!(
+            view.agent_activity
+                .shell_boundary_owner()
+                .as_ref(),
+            Some(&owner)
+        );
+        assert_eq!(
+            view.pending_shell_boundary().map(|pending| pending.attempts),
+            Some(5),
+            "the exhausted retry state stays unresolved instead of clearing evidence"
+        );
+    });
+}
+
+#[gpui::test]
+fn agent_scroll_success_retires_screen_error_and_next_prompt_baseline(cx: &mut TestAppContext) {
+    let (view, window, _) = open(cx);
+    window.update(|_, cx| {
+        cx.update_global::<crate::gpui_shell::config::Settings, _>(|settings, _| {
+            settings.ai_auto_continue = false;
+            settings.ai_auto_continue_error_patterns =
+                crate::ai_agents::parse_auto_continue_error_patterns(
+                    nebula_settings::DEFAULT_AUTO_CONTINUE_ERROR_PATTERNS,
+                );
+        })
+    });
+    view.update(window, |view, cx| {
+        let error = "API Error: stream error: stream disconnected before completion";
+        let composer = "────────\n❯ \n────────\n? for shortcuts";
+        assert!(view.handle_ai_hook(&hook("badge-lifecycle", "UserPromptSubmit", 1), cx));
+        screen(view, &format!("{error}\n{composer}"));
+        view.refresh_agent_screen_state(cx);
+        assert!(view.screen_error_indicator());
+        assert!(view.handle_ai_hook(&hook("badge-lifecycle", "Stop", 2), cx));
+        assert!(!view.screen_error_indicator(), "successful completion clears the badge");
+        for _ in 0..4 {
+            view.refresh_agent_screen_state(cx);
+        }
+        assert!(!view.screen_error_indicator(), "old error cannot relight after success");
+        assert!(view.handle_ai_hook(&hook("badge-lifecycle", "UserPromptSubmit", 3), cx));
+        view.refresh_agent_screen_state(cx);
+        assert!(!view.screen_error_indicator(), "new prompt does not inherit old error");
+        screen(view, &format!("{error}: another attempt failed\n{composer}"));
+        view.refresh_agent_screen_state(cx);
+        assert!(view.screen_error_indicator(), "a new current error remains visible");
+        assert!(view.handle_ai_hook(&hook("badge-lifecycle", "StopFailure", 4), cx));
+        view.refresh_agent_screen_state(cx);
+        assert!(view.screen_error_indicator(), "failure remains visible");
+    });
+}
+
+#[gpui::test]
 fn configured_screen_error_badge_preserves_hook_owned_activity(cx: &mut TestAppContext) {
     let (view, window, _) = open(cx);
     window.update(|_, cx| {
@@ -831,7 +1168,7 @@ fn configured_screen_error_badge_preserves_hook_owned_activity(cx: &mut TestAppC
         let hook_status = view.agent_activity.status();
         screen(
             view,
-            "■ We’re currently experiencing high demand, which may cause temporary errors.\n› Ask Codex to do anything",
+            "■ We’re currently experiencing high demand, which may cause temporary errors.\n› Ask Codex to do anything\ngpt-6 medium · Context 2% used",
         );
         view.refresh_agent_screen_state(cx);
         assert!(view.screen_error_indicator());
@@ -839,7 +1176,10 @@ fn configured_screen_error_badge_preserves_hook_owned_activity(cx: &mut TestAppC
         assert_eq!(view.agent_activity.status(), AgentStatus::Working);
         assert_eq!(view.agent_activity.source(), AgentStatusSource::Hook);
 
-        screen(view, "Working on the request...\n› Ask Codex to do anything");
+        screen(
+            view,
+            "Working on the request...\n› Ask Codex to do anything\ngpt-6 medium · Context 2% used",
+        );
         view.refresh_agent_screen_state(cx);
         assert!(!view.screen_error_indicator());
         assert_eq!(view.agent_activity.status(), AgentStatus::Working);

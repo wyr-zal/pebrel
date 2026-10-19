@@ -1,5 +1,78 @@
 use super::*;
 
+#[cfg(windows)]
+fn native_boundary(time: u64) -> NativeLaunchBoundary {
+    NativeLaunchBoundary {
+        time, shell: ProcessStamp { pid: 10, start_time: 100 },
+        existing_branches: HashSet::new(),
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn native_receipts_reject_ambiguous_or_unstamped_provider_trees() {
+    use crate::platform::process_snapshot::ProcessRow;
+    let row = |pid, parent, executable: &str, created| ProcessRow {
+        pid, parent, executable: executable.into(), created,
+    };
+    let base = || vec![row(10, 1, "pwsh.exe", 100), row(20, 10, "codex.exe", 200)];
+    let AgentProbe::Found(found) = native_receipt_from_rows(10, &native_boundary(150), base()) else {
+        panic!("unique stamped provider must yield a receipt");
+    };
+    assert_eq!(found.process, ProcessStamp { pid: 20, start_time: 200 });
+    assert_eq!(found.shell, ProcessStamp { pid: 10, start_time: 100 });
+    let mut ambiguous = base();
+    ambiguous.push(row(21, 10, "claude.exe", 210));
+    assert_eq!(native_receipt_from_rows(10, &native_boundary(150), ambiguous), AgentProbe::Unavailable);
+    let mut unknown_stamp = base();
+    unknown_stamp[1].created = 0;
+    assert_eq!(native_receipt_from_rows(10, &native_boundary(150), unknown_stamp), AgentProbe::Unavailable);
+    let reused_parent = vec![row(10, 1, "pwsh.exe", 300), row(20, 10, "codex.exe", 200)];
+    assert_eq!(native_receipt_from_rows(10, &native_boundary(150), reused_parent), AgentProbe::Unavailable);
+    let npm_codex = vec![row(10, 1, "pwsh.exe", 100), row(20, 10, "node.exe", 200), row(30, 20, "codex.exe", 300)];
+    let AgentProbe::Found(receipt) = native_receipt_from_rows(10, &native_boundary(150), npm_codex) else {
+        panic!("the native Codex child must own the npm launcher's receipt");
+    };
+    assert_eq!(receipt.process.pid, 30);
+}
+
+#[cfg(windows)]
+#[test]
+fn native_takeover_excludes_old_branches_even_when_the_new_agent_is_deeper() {
+    use crate::platform::process_snapshot::ProcessRow;
+    let row = |pid, parent, executable: &str, created| ProcessRow {
+        pid, parent, executable: executable.into(), created,
+    };
+    let tree = || vec![
+        row(10, 1, "pwsh.exe", 100),
+        row(20, 10, "codex.exe", 140), // old background Agent
+        row(30, 10, "cmd.exe", 200),   // current command wrapper
+        row(40, 30, "claude.exe", 300),
+        row(50, 20, "codex.exe", 400), // old branch's newly spawned Agent
+    ];
+    let AgentProbe::Found(found) = native_receipt_from_rows(10, &native_boundary(150), tree()) else {
+        panic!("the command's new branch must own the receipt");
+    };
+    assert_eq!(found.process.pid, 40);
+    assert_eq!(found.kind, AgentKind::Claude);
+    assert_eq!(probe_native_receipt(10, None), AgentProbe::Unavailable);
+    assert_eq!(native_receipt_from_rows(10, &native_boundary(500), tree()), AgentProbe::NoAgent);
+    let mut ambiguous = tree();
+    ambiguous.push(row(60, 10, "codex.exe", 250));
+    assert_eq!(native_receipt_from_rows(10, &native_boundary(150), ambiguous), AgentProbe::Unavailable,
+        "depth cannot decide ownership between two current branches");
+    let mut clock_rewound = native_boundary(110);
+    clock_rewound.existing_branches.insert(ProcessStamp { pid: 20, start_time: 140 });
+    let AgentProbe::Found(found) = native_receipt_from_rows(10, &clock_rewound, tree()) else {
+        panic!("preexisting branches must stay excluded after clock rollback");
+    };
+    assert_eq!(found.process.pid, 40);
+    let mut old_wrapper = tree();
+    old_wrapper[2].created = 145;
+    assert_eq!(native_receipt_from_rows(10, &native_boundary(150), old_wrapper), AgentProbe::NoAgent,
+        "an old wrapper's new child cannot establish current command ownership");
+}
+
 #[test]
 fn versioned_claude_argv_is_bound_to_the_current_shell() {
     assert_eq!(

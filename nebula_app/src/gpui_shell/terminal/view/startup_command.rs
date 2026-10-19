@@ -2,9 +2,18 @@
 
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RecoveryHookGate {
+    Apply,
+    AwaitReceipt,
+    Reject,
+}
+
 #[derive(Default)]
 pub(super) struct SessionRecovery {
     pub(super) target: Option<crate::session::AgentSession>,
+    pub(super) retry_candidate: Option<crate::session::AgentSession>,
+    pub(super) live: Option<crate::session::AgentSession>,
     pub(super) awaiting_confirmation: bool,
     resolving: bool,
     submitted: bool,
@@ -13,6 +22,30 @@ pub(super) struct SessionRecovery {
 }
 
 impl SessionRecovery {
+    pub(super) fn requires_foreground_receipt(&self) -> bool {
+        self.awaiting_confirmation && self.failed
+    }
+
+    pub(super) fn gate_hook(
+        &self,
+        event: &crate::ai_hook::AiHookEvent,
+        process_confirmed: bool,
+    ) -> RecoveryHookGate {
+        if self.requires_foreground_receipt() {
+            return if process_confirmed {
+                RecoveryHookGate::Apply
+            } else {
+                RecoveryHookGate::AwaitReceipt
+            };
+        }
+        if self.awaiting_confirmation
+            && self.target.as_ref().is_some_and(|target| target.source != event.source)
+        {
+            return RecoveryHookGate::Reject;
+        }
+        RecoveryHookGate::Apply
+    }
+
     pub(super) fn preparing(&self) -> bool {
         self.resolving || (self.awaiting_confirmation && !self.submitted && !self.failed)
     }
@@ -20,6 +53,7 @@ impl SessionRecovery {
     pub(super) fn accepts_choice_event(&self, event: &crate::ai_hook::AiHookEvent) -> bool {
         use crate::ai_hook::AiHookKind;
         !self.choosing_session
+            || self.failed
             || (event.source == "codex"
                 && (matches!(event.kind, AiHookKind::SessionStart | AiHookKind::PromptSubmit)
                     || (event.codex_hooks.is_none() && event.kind == AiHookKind::TurnDone)))
@@ -56,6 +90,31 @@ impl SessionRecovery {
             }))
     }
 
+    fn can_take_over(
+        &self,
+        process_confirmed: bool,
+    ) -> bool {
+        self.awaiting_confirmation && self.failed && process_confirmed
+    }
+
+    pub(super) fn accepts_live(
+        &self,
+        target: &crate::session::AgentSession,
+        process_confirmed: bool,
+    ) -> bool {
+        if self.awaiting_confirmation && self.failed {
+            return process_confirmed;
+        }
+        self.accepts(target)
+    }
+
+    pub(super) fn mark_failed(&mut self) {
+        self.failed = true;
+        if let Some(target) = &self.target {
+            self.retry_candidate = Some(target.clone());
+        }
+    }
+
     pub(super) fn confirm(&mut self, mut target: crate::session::AgentSession) -> bool {
         if !self.accepts(&target) {
             return false;
@@ -67,19 +126,45 @@ impl SessionRecovery {
         {
             target.session_file = previous.session_file.clone();
         }
-        self.target = Some(target);
+        let recovered_pending_target = self.awaiting_confirmation;
+        self.target = Some(target.clone());
+        if recovered_pending_target {
+            self.retry_candidate = None;
+        }
+        self.live = Some(target);
         self.awaiting_confirmation = false;
-        self.failed = false;
+        self.failed = self.retry_candidate.is_some();
+        self.choosing_session = false;
+        true
+    }
+
+    pub(super) fn confirm_live(
+        &mut self,
+        target: crate::session::AgentSession,
+        process_confirmed: bool,
+    ) -> bool {
+        if !self.requires_foreground_receipt() && self.accepts(&target) {
+            return self.confirm(target);
+        }
+        if !self.can_take_over(process_confirmed) {
+            return false;
+        }
+        self.mark_failed();
+        self.live = Some(target);
+        self.awaiting_confirmation = false;
+        self.resolving = false;
+        self.submitted = false;
         self.choosing_session = false;
         true
     }
 
     pub(super) fn command_ended(&mut self) {
-        if !self.awaiting_confirmation {
+        if self.awaiting_confirmation && self.submitted {
+            self.mark_failed();
+        } else if !self.awaiting_confirmation {
             self.target = None;
-        } else if self.submitted {
-            self.failed = true;
         }
+        self.live = None;
     }
 }
 
@@ -127,7 +212,11 @@ impl TerminalView {
 
     pub(crate) fn can_choose_recovery_session(&self) -> bool {
         self.can_retry_recovery()
-            && self.recovery.target.as_ref().is_some_and(|target| target.source == "codex")
+            && self
+                .recovery
+                .retry_candidate
+                .as_ref()
+                .is_some_and(|target| target.source == "codex")
     }
 
     pub(crate) fn choose_recovery_session(&mut self, cx: &mut Context<Self>) {
@@ -143,10 +232,9 @@ impl TerminalView {
     /// Keep a queued cold resume in the next snapshot without presenting it as
     /// a live foreground agent before the shell accepts the command.
     pub(crate) fn session_agent(&self) -> Option<crate::session::AgentSession> {
-        if let Some(target) = &self.recovery.target {
-            return Some(target.clone());
+        if let Some(live) = &self.recovery.live {
+            return Some(live.clone());
         }
-        let pending = self.pending_shell_command.as_ref();
         if let Some(identity) = &self.ai_session {
             return Some(crate::session::AgentSession {
                 source: identity.source.clone(),
@@ -154,6 +242,18 @@ impl TerminalView {
                 session_file: None,
             });
         }
+        if self.recovery.awaiting_confirmation
+            && let Some(target) = &self.recovery.target
+        {
+            return Some(target.clone());
+        }
+        if self.running_program.is_none()
+            && self.pending_shell_command.is_none()
+            && let Some(candidate) = &self.recovery.retry_candidate
+        {
+            return Some(candidate.clone());
+        }
+        let pending = self.pending_shell_command.as_ref();
         let kind = pending
             .and_then(|request| crate::ai_agents::AgentKind::parse_command(&request.text))
             .or_else(|| {
@@ -187,6 +287,7 @@ impl TerminalView {
                     session_id: Some(session_id),
                     session_file: None,
                 }),
+                live: None,
                 awaiting_confirmation: true,
                 ..SessionRecovery::default()
             };
@@ -203,6 +304,7 @@ impl TerminalView {
         agent.normalize_identity();
         self.recovery = SessionRecovery {
             target: Some(agent.clone()),
+            live: None,
             awaiting_confirmation: true,
             ..SessionRecovery::default()
         };
@@ -210,7 +312,7 @@ impl TerminalView {
             if let Some(command) = agent.resume_command() {
                 self.run_command(command, cx);
             } else {
-                self.recovery.failed = true;
+                self.recovery.mark_failed();
                 cx.emit(TerminalViewEvent::Notification(crate::notify::Notification::Text {
                     body: ui_language().text(crate::i18n::Message::SessionRestoreFailed).to_owned(),
                     program: Some(agent.source),
@@ -237,7 +339,7 @@ impl TerminalView {
                 }
                 if view.ai_session_probe_epoch != epoch {
                     view.recovery.resolving = false;
-                    view.recovery.failed = true;
+                    view.recovery.mark_failed();
                     return;
                 }
                 view.recovery.resolving = false;
@@ -254,12 +356,12 @@ impl TerminalView {
                         if let Some(command) = command {
                             view.run_command(command, cx);
                         } else {
-                            view.recovery.failed = true;
+                            view.recovery.mark_failed();
                         }
                     },
                     Err(error) => {
                         log::warn!("Pi recovery target could not be resolved: {error:?}");
-                        view.recovery.failed = true;
+                        view.recovery.mark_failed();
                         let message =
                             if error == crate::platform::pi_session::ResolveError::Ambiguous {
                                 crate::i18n::Message::SessionRestoreAmbiguous
@@ -308,14 +410,14 @@ impl TerminalView {
     pub(crate) fn can_retry_recovery(&self) -> bool {
         self.recovery.failed
             && !self.recovery.resolving
-            && self.recovery.target.is_some()
+            && self.recovery.retry_candidate.is_some()
             && self.running_program.is_none()
             && self.pending_shell_command.is_none()
     }
 
     pub(crate) fn retry_recovery(&mut self, cx: &mut Context<Self>) {
         if self.can_retry_recovery()
-            && let Some(target) = self.recovery.target.clone()
+            && let Some(target) = self.recovery.retry_candidate.clone()
         {
             self.restore_agent(target, cx);
         }

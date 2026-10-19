@@ -433,6 +433,23 @@ fn sequenced_batch_reorders_each_stream_without_mixing_streams() {
 }
 
 #[test]
+fn native_ordering_separates_recycled_pids_by_kernel_creation_time() {
+    let mut first = parse_remote_envelope(
+        b"nebula-hook/1 source=claude pane=3\n{\"hook_event_name\":\"SessionStart\",\"session_id\":\"resumed\",\"bridge_sequence\":10}", Some(3),
+    ).unwrap();
+    first.agent_pid = Some(100);
+    first.agent_start_time = Some(200);
+    let mut gate = AiHookEventGate::default();
+    assert!(gate.accept(&first, 3));
+    let mut next = first.clone();
+    next.agent_start_time = Some(201);
+    next.bridge_sequence = Some(1);
+    assert!(gate.accept(&next, 3), "a new kernel process owns a new ordered stream");
+    next.agent_start_time = Some(200);
+    assert!(!gate.accept(&next, 3), "the old process cannot reset its sequence");
+}
+
+#[test]
 fn late_pi_event_cannot_restore_the_previous_native_session_after_a_switch() {
     let event = |id: &str, sequence: u64| {
         let body = serde_json::json!({"kind":"session-start", "session_id":id,

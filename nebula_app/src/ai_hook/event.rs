@@ -300,6 +300,8 @@ pub struct AiHookEvent {
     /// 它的 session id 却是短命的——一旦被当成 pane 的会话身份，就会把真正活着
     /// 的那个顶掉。远端 SSH 没有本地进程，恒为 `None`。
     pub agent_pid: Option<u32>,
+    /// Kernel creation time captured by the Windows transport; never payload input.
+    pub(crate) agent_start_time: Option<u64>,
     /// Agent 自己声明的权限档位。与 [`AiHookKind::NeedsAttention`] 是两件事：
     /// 前者是持续状态，后者是瞬时事件。
     pub permission_mode: Option<AiPermissionMode>,

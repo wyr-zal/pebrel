@@ -752,7 +752,7 @@ fn pi_outcomes_emit_only_the_matching_notification(cx: &mut TestAppContext) {
     for (reason, status, expected_count) in [
         ("aborted", crate::ai_agents::AgentStatus::Idle, 0),
         ("unknown", crate::ai_agents::AgentStatus::Idle, 1),
-        ("error", crate::ai_agents::AgentStatus::Idle, 2),
+        ("error", crate::ai_agents::AgentStatus::Failed, 2),
         ("stop", crate::ai_agents::AgentStatus::Done, 3),
     ] {
         view.update(window, |view, cx| {
@@ -1249,6 +1249,134 @@ fn a_failed_restore_can_choose_a_conversation_without_recognizing_an_error_strin
 }
 
 #[gpui::test]
+fn failed_resume_target_cannot_hide_a_process_confirmed_live_provider(
+    cx: &mut TestAppContext,
+) {
+    use crate::platform::agent_process_identity::{ForegroundAgent, ProcessStamp};
+
+    let (view, window, receiver) = open(cx);
+    view.update(window, |view, cx| {
+        let saved = submit_codex_restore(view, &receiver, cx);
+        view.process_event(Event::CommandDone { exit_code: Some(1) }, cx);
+        assert!(view.can_retry_recovery());
+
+        let same_provider = crate::ai_hook::parse_remote_envelope(
+            format!(
+                "nebula-hook/1 source=codex process=9001:500 codex_hooks=full pane=42\n{}",
+                serde_json::json!({
+                    "hook_event_name": "SessionStart",
+                    "session_id": "saved-missing",
+                    "bridge_sequence": 1,
+                })
+            )
+            .as_bytes(),
+            Some(42),
+        )
+        .unwrap();
+        view.running_program = Some("codex".into());
+        assert!(
+            !view.handle_ai_hook(&same_provider, cx),
+            "a same-provider Hook without a foreground receipt is still a stale candidate"
+        );
+        view.agent_identity_receipt = Some(ForegroundAgent {
+            kind: crate::ai_agents::AgentKind::Codex,
+            process: ProcessStamp { pid: 9001, start_time: 901 },
+            shell: ProcessStamp { pid: 8100, start_time: 8100 },
+            tty_nr: 34823,
+            process_group: 9001,
+        });
+        assert!(
+            !view.handle_ai_hook(&same_provider, cx),
+            "a same-provider process with a different start identity cannot take over"
+        );
+        view.agent_identity_receipt = None;
+
+        let event = |name: &str, sequence: u64| {
+            crate::ai_hook::parse_remote_envelope(
+                format!(
+                    "nebula-hook/1 source=claude process=9523:900 pane=42\n{}",
+                    serde_json::json!({
+                        "hook_event_name": name,
+                        "session_id": "live-claude",
+                        "bridge_sequence": sequence,
+                    })
+                )
+                .as_bytes(),
+                Some(42),
+            )
+            .unwrap()
+        };
+        view.running_program = Some("codex".into());
+        assert!(
+            !view.handle_ai_hook(&event("SessionStart", 10), cx),
+            "the Hook source alone is not enough to replace a confirmed Codex process"
+        );
+
+        // The identity probe has confirmed which provider really owns the pane.
+        view.running_program = Some("claude".into());
+        assert!(
+            !view.handle_ai_hook(&event("SessionStart", 11), cx),
+            "a command-line provider name without a foreground receipt is not enough"
+        );
+        view.agent_identity_receipt = Some(ForegroundAgent {
+            kind: crate::ai_agents::AgentKind::Claude,
+            process: ProcessStamp { pid: 9523, start_time: 901 },
+            shell: ProcessStamp { pid: 8100, start_time: 8100 },
+            tty_nr: 34823,
+            process_group: 9523,
+        });
+        assert!(
+            !view.handle_ai_hook(&event("SessionStart", 11), cx),
+            "a same-provider process with a different start identity cannot take over"
+        );
+        view.agent_identity_receipt = Some(ForegroundAgent {
+            kind: crate::ai_agents::AgentKind::Claude,
+            process: ProcessStamp { pid: 9523, start_time: 900 },
+            shell: ProcessStamp { pid: 8100, start_time: 8100 },
+            tty_nr: 34823,
+            process_group: 9523,
+        });
+        assert!(
+            view.handle_ai_hook(&event("SessionStart", 11), cx),
+            "a failed Codex candidate must not reject a process-confirmed Claude session"
+        );
+
+        let live = view.session_agent().unwrap();
+        assert_eq!(live.source, "claude");
+        assert_eq!(live.session_id.as_deref(), Some("live-claude"));
+        assert_eq!(view.ai_session.as_ref().unwrap().source, "claude");
+        assert_eq!(view.ai_session.as_ref().unwrap().session_id, "live-claude");
+        assert!(!view.recovery_pending());
+
+        let stale_codex = crate::ai_hook::parse_remote_envelope(
+            format!(
+                "nebula-hook/1 source=codex process=9001:500 codex_hooks=full pane=42\n{}",
+                serde_json::json!({
+                    "hook_event_name": "SessionStart",
+                    "session_id": "saved-missing",
+                    "bridge_sequence": 12,
+                })
+            )
+            .as_bytes(),
+            Some(42),
+        )
+        .unwrap();
+        assert!(
+            !view.handle_ai_hook(&stale_codex, cx),
+            "a failed retry candidate must never replace a live provider"
+        );
+        assert_eq!(view.session_agent(), Some(live));
+
+        assert!(view.handle_ai_hook(&event("SessionEnd", 13), cx));
+        assert!(view.running_program.is_none());
+        assert_eq!(view.session_agent(), Some(saved.clone()));
+        assert!(view.can_retry_recovery());
+        view.retry_recovery(cx);
+        assert!(view.pending_shell_command.is_some());
+    });
+}
+
+#[gpui::test]
 fn lifecycle_only_hook_cannot_replace_a_verified_rollout_id(cx: &mut TestAppContext) {
     let (view, window, _) = open(cx);
     view.update(window, |view, cx| {
@@ -1507,5 +1635,78 @@ fn accept_tab_passes_right_to_the_shell_and_tab_accepts_the_ghost(cx: &mut TestA
                 .collect();
             assert_eq!(input, b"andidate.txt", "tab keeps accepting the inline ghost");
         });
+    });
+}
+
+#[cfg(windows)]
+#[gpui::test]
+fn native_launch_boundary_survives_late_start_and_expires_with_the_command(
+    cx: &mut TestAppContext,
+) {
+    let (view, window, receiver) = open(cx);
+    view.update(window, |view, cx| {
+        submit_codex_restore(view, &receiver, cx);
+        view.process_event(Event::CommandDone { exit_code: Some(1) }, cx);
+        view.suggest.suggest_env = crate::display::SuggestEnv::Local;
+        view.session.as_mut().unwrap().shell_pid = std::process::id();
+        view.capture_native_command_boundary();
+        let first = view.native_command_boundary.clone().unwrap();
+        view.on_command_start(cx);
+        assert_eq!(view.native_command_boundary, Some(first.clone()));
+        view.clear_foreground_agent_state(cx);
+        assert_eq!(view.native_command_boundary, None);
+        view.on_command_start(cx);
+        assert!(view.native_command_boundary.as_ref().unwrap().time >= first.time);
+        view.clear_foreground_agent_state(cx);
+        view.capture_native_command_boundary();
+        let second = view.native_command_boundary.as_ref().unwrap().time;
+        view.agent_identity_probe_epoch = 900;
+        view.capture_native_command_boundary();
+        assert_ne!(view.agent_identity_probe_epoch, 900);
+        assert!(view.native_command_boundary.as_ref().unwrap().time >= second);
+    });
+}
+
+#[cfg(windows)]
+#[gpui::test]
+fn failed_recovery_runtime_paste_captures_enter_boundary_and_keeps_early_hook(
+    cx: &mut TestAppContext,
+) {
+    use crate::platform::agent_process_identity::{ForegroundAgent, ProcessStamp};
+    let (view, window, receiver) = open(cx);
+    view.update(window, |view, cx| {
+        submit_codex_restore(view, &receiver, cx);
+        view.process_event(Event::CommandDone { exit_code: Some(1) }, cx);
+        view.suggest.suggest_env = crate::display::SuggestEnv::Local;
+        view.session.as_mut().unwrap().shell_pid = std::process::id();
+        feed(view, b"\x1b[?2004h");
+        view.runtime_paste("claude".into(), true, InputOrigin::Program, cx).unwrap();
+        let before_enter = view.native_command_boundary.clone().unwrap();
+        assert!(view.pending_runtime_submit.is_some());
+        feed(view, b"claude");
+        view.flush_pending_runtime_submit(cx);
+        assert!(view.pending_runtime_submit.is_none());
+        let boundary = view.native_command_boundary.clone().unwrap();
+        assert!(boundary.time >= before_enter.time);
+        let mut hook = crate::ai_hook::parse_remote_envelope(
+            b"nebula-hook/1 source=claude pane=42\n{\"hook_event_name\":\"SessionStart\",\"session_id\":\"pasted-live\"}",
+            Some(42),
+        ).unwrap();
+        hook.agent_pid = Some(9001);
+        hook.agent_start_time = Some(boundary.time + 1);
+        assert!(!view.handle_ai_hook(&hook, cx));
+        assert_eq!(view.pending_recovery_hooks.len(), 1);
+        view.on_command_start(cx);
+        assert_eq!(view.native_command_boundary, Some(boundary.clone()));
+        assert_eq!(view.pending_recovery_hooks.len(), 1, "late C must retain this submission's early Hook");
+        view.running_program = Some("claude".into());
+        view.agent_identity_receipt = Some(ForegroundAgent {
+            kind: crate::ai_agents::AgentKind::Claude,
+            process: ProcessStamp { pid: 9001, start_time: boundary.time + 1 },
+            shell: boundary.shell, tty_nr: 0, process_group: 0,
+        });
+        view.replay_pending_recovery_hooks(cx);
+        assert_eq!(view.recovery.live.as_ref().unwrap().session_id.as_deref(), Some("pasted-live"));
+        assert!(view.agent_activity.hook_seen());
     });
 }

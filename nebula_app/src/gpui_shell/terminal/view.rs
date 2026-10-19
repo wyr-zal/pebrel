@@ -331,6 +331,10 @@ pub struct TerminalView {
     agent_identity_probe_wake: bool,
     agent_identity_probe_misses: u8,
     agent_identity_receipt: Option<crate::platform::agent_process_identity::ForegroundAgent>,
+    #[cfg(windows)]
+    native_command_boundary: Option<crate::platform::agent_process_identity::NativeLaunchBoundary>,
+    shell_boundary_generation: u64,
+    shell_boundary_probe: Option<agent_activity::PendingShellBoundary>,
     prompt_process_probe: Option<gpui::Task<()>>,
     prompt_input_epoch: u64,
     native_prompt_seen: bool,
@@ -347,6 +351,7 @@ pub struct TerminalView {
     auto_continue: crate::ai_hook::auto_continue::AutoContinue,
     auto_continue_task: Option<gpui::Task<()>>,
     screen_error_indicator: bool,
+    screen_error_at_prompt: Option<String>,
     _auto_continue_subscription: gpui::Subscription,
     /// 程序上报的任务进度（OSC 9;4）。存在 pane 上、由宿主投到任务栏：一个
     /// 窗口只有一个任务栏按钮，谁被看着只有宿主知道。
@@ -354,6 +359,7 @@ pub struct TerminalView {
     pending_runtime_submit: Option<crate::display::state::RuntimeSubmitBarrier>,
     pending_shell_command: Option<startup_command::PendingShellCommand>,
     recovery: startup_command::SessionRecovery,
+    pending_recovery_hooks: std::collections::VecDeque<crate::ai_hook::AiHookEvent>,
     pub(crate) session_launch: crate::session::LaunchSession,
     /// OSC 1337 图片的串行后台解码队列和有界像素缓存。图片不进入字符网格，
     /// 只用事件携带的绝对行锚定到对应的 scrollback 位置。
@@ -722,6 +728,12 @@ impl TerminalView {
                     || self.recovery.preparing()
                 {
                     return;
+                }
+                #[cfg(windows)]
+                {
+                    if self.probe_live_shell_owner(exit_code, cx) {
+                        return;
+                    }
                 }
                 self.finish_foreground_command(exit_code, cx);
             },

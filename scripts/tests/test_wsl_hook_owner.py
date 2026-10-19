@@ -29,12 +29,31 @@ class WslHookOwnerTests(unittest.TestCase):
         env = {"PEBREL_PANE_ID": "17", "PEBREL_PROCESS_ID": "900", "PEBREL_WSL_HOOK_TOKEN": "a" * 32}
         (root / "environ").write_bytes(b"\0".join(f"{k}={v}".encode() for k, v in env.items()))
 
-    def verify(self):
+    def module(self):
         path = Path(__file__).resolve().parents[2] / "nebula_app/res/hooks/wsl_owner.py"
         spec = importlib.util.spec_from_file_location("wsl_owner", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        return module.verify(self.request, self.root)
+        return module
+
+    def verify(self):
+        return self.module().verify(self.request, self.root)
+
+    def test_owner_state_keeps_unknown_separate_from_a_confirmed_end(self):
+        module = self.module()
+        self.assertIsInstance(module.owner_state(self.request, self.root), dict)
+        for changed in [dict(start=201), dict(foreground=999), dict(tty=0)]:
+            fields = dict(pid=20, parent=10, start=200, name="claude")
+            fields.update(changed)
+            self.process(**fields)
+            self.assertEqual(module.owner_state(self.request, self.root), "ended")
+        self.process(20, 10, 200, "claude")
+        with mock.patch.object(module, "verify", return_value=None):
+            self.assertEqual(module.owner_state(self.request, self.root), "unavailable")
+        with mock.patch.object(module, "process", side_effect=PermissionError):
+            self.assertEqual(module.owner_state(self.request, self.root), "unavailable")
+        self.request["owner"] = "999:200"
+        self.assertEqual(module.owner_state(self.request, self.root), "ended")
 
     def test_wsl_hook_freezes_real_pty_root_and_preserves_process_evidence(self):
         result = self.verify()

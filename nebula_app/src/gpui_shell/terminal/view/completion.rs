@@ -171,6 +171,8 @@ impl TerminalView {
     }
 
     fn mark_submitted_command(&mut self, native_submission: bool) {
+        #[cfg(windows)]
+        self.capture_native_command_boundary();
         if native_submission && self.command_running {
             // 前一条的进程检查可能尚未返回；保留外层 Runtime run，
             // 但下一次提交必须使旧命令/输入的异步结果失效。
