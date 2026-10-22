@@ -53,6 +53,8 @@ const LEGACY_BIN_DIR_ENV: &str = "NEBULA_BIN_DIR";
 /// 当前 Pebrel 进程的 PID。和 pane id 一起构成进程归属，避免两个同时运行的
 /// Pebrel 实例各自的 pane 1 被身份探测混在一起；数字值可原样穿过 WSL。
 pub const PROCESS_ENV: &str = "PEBREL_PROCESS_ID";
+/// Random id for the currently submitted PowerShell command, forwarded only to WSL.
+pub const COMMAND_ID_ENV: &str = "PEBREL_COMMAND_ID";
 
 const TERM_PROGRAM_ENV: &str = "TERM_PROGRAM";
 const TERM_PROGRAM_VERSION_ENV: &str = "TERM_PROGRAM_VERSION";
@@ -76,6 +78,7 @@ pub fn apply(env: &mut HashMap<String, String>, pane_id: impl Display) {
     insert_env(env, PANE_ENV, pane_id.clone());
     insert_env(env, crate::ai_hook::LEGACY_PANE_ENV, pane_id);
     insert_env(env, PROCESS_ENV, std::process::id().to_string());
+    insert_env(env, COMMAND_ID_ENV, String::new());
     insert_env(env, TERM_PROGRAM_ENV, TERM_PROGRAM.to_owned());
     insert_env(env, TERM_PROGRAM_VERSION_ENV, env!("VERSION").to_owned());
 
@@ -178,6 +181,7 @@ const WSLENV_ENTRIES: &[&str] = &[
     "PEBREL_BIN_DIR/p",
     "PEBREL_HOOK_EXE/p",
     PROCESS_ENV,
+    "PEBREL_COMMAND_ID/u",
     crate::runtime_api::ENDPOINT_ENV,
     "NEBULA_CLI/p",
     "NEBULA_BIN_DIR/p",
@@ -235,6 +239,7 @@ mod tests {
         assert_eq!(env.get(crate::ai_hook::LEGACY_PANE_ENV), env.get(PANE_ENV));
         let process_id = std::process::id().to_string();
         assert_eq!(env.get(PROCESS_ENV).map(String::as_str), Some(process_id.as_str()));
+        assert_eq!(env.get(COMMAND_ID_ENV).map(String::as_str), Some(""));
         assert_eq!(env.get(LEGACY_CLI_ENV), env.get(CLI_ENV));
         assert_eq!(env.get(LEGACY_BIN_DIR_ENV), env.get(BIN_DIR_ENV));
         assert_eq!(env.get("TERM_PROGRAM").map(String::as_str), Some(TERM_PROGRAM));
@@ -330,6 +335,7 @@ mod tests {
                 "{hook_exe} missing from WSLENV passthrough: {names:?}"
             );
             assert!(names.contains(&PROCESS_ENV), "{PROCESS_ENV} missing: {names:?}");
+            assert!(names.contains(&COMMAND_ID_ENV), "{COMMAND_ID_ENV} missing: {names:?}");
             assert!(names.contains(&crate::runtime_api::ENDPOINT_ENV));
             assert!(names.contains(&"COLORTERM"));
         }

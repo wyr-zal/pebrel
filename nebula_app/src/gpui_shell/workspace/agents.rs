@@ -211,6 +211,8 @@ impl NebulaWorkspace {
                         for view in batch {
                             let _ = view.update(cx, |view, cx| {
                                 view.refresh_agent_screen_state(cx);
+                                #[cfg(windows)]
+                                view.refresh_wsl_cwd_observation(cx);
                                 view.sync_activity_badges(cx);
                             });
                         }

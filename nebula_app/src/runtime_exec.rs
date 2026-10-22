@@ -86,6 +86,21 @@ impl PaneExecContext {
         Some(context)
     }
 
+    pub(crate) fn for_observed_wsl(
+        &self,
+        distro: &str,
+        user: Option<&str>,
+        command_id: &str,
+    ) -> Self {
+        let mut context = self.clone();
+        context.location = ExecLocation::Wsl {
+            distro: Some(distro.to_owned()),
+            user: user.map(str::to_owned),
+        };
+        context.env.insert(crate::agent_env::COMMAND_ID_ENV.into(), command_id.to_owned());
+        context
+    }
+
     pub(crate) fn wsl_user(&self) -> Option<&str> {
         match &self.location {
             ExecLocation::Host => None,
@@ -98,6 +113,17 @@ impl PaneExecContext {
             .get(crate::agent_env::PROCESS_ENV)
             .map(String::as_str)
             .filter(|value| !value.is_empty())
+    }
+
+    pub(crate) fn command_id(&self) -> Option<&str> {
+        self.env
+            .get(crate::agent_env::COMMAND_ID_ENV)
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+    }
+
+    pub(crate) fn wslenv(&self) -> Option<&str> {
+        self.env.get("WSLENV").map(String::as_str)
     }
 
     pub(crate) fn from_pty_options(options: &nebula_terminal::tty::Options) -> Self {
@@ -433,6 +459,17 @@ mod tests {
             Some(Some("Debian"))
         );
         assert_eq!(PaneExecContext::from_pty_options(&options).wsl_user(), Some("hello"));
+    }
+
+    #[test]
+    fn observed_wsl_scope_does_not_change_the_pane_launch_scope() {
+        let host = PaneExecContext::host(PathBuf::from("C:/work"));
+        let command_id = "a".repeat(32);
+        let observed = host.for_observed_wsl("Ubuntu-22.04", None, &command_id);
+        assert_eq!(host.wsl_distribution(), None);
+        assert_eq!(observed.wsl_distribution(), Some(Some("Ubuntu-22.04")));
+        assert_eq!(observed.command_id(), Some(command_id.as_str()));
+        assert_eq!(host.command_id(), None);
     }
 
     /// 启动目录和直接执行参数是不同的解析边界。

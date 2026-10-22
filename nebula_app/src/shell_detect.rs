@@ -542,6 +542,8 @@ pub(crate) struct WslOptions<'a> {
     selects_distribution: bool,
     /// The launch picks its own start directory: a leading `~`, `--cd` or `--cd=`.
     pub(crate) chooses_directory: bool,
+    invalid_scope: bool,
+    unsupported_distribution_selector: bool,
 }
 
 impl WslOptions<'_> {
@@ -550,6 +552,14 @@ impl WslOptions<'_> {
     /// `--distribution-id` and `--system` stay unknown until a GUID maps to a name.
     pub(crate) fn spawn_distro(&self, default: impl FnOnce() -> Option<String>) -> Option<String> {
         if self.selects_distribution { self.distro.map(str::to_owned) } else { default() }
+    }
+
+    fn explicit_scope(&self) -> Option<(String, Option<String>)> {
+        if self.invalid_scope || self.unsupported_distribution_selector {
+            return None;
+        }
+        let distro = self.distro.filter(|distro| !distro.is_empty())?;
+        Some((distro.to_owned(), self.user.map(str::to_owned)))
     }
 }
 
@@ -574,11 +584,24 @@ fn wsl_options(args: &[String]) -> WslOptions<'_> {
         index += 2;
         match arg.as_str() {
             "-d" | "--distribution" => {
+                if value.is_none()
+                    || options.distro.is_some_and(|previous| Some(previous) != value)
+                {
+                    options.invalid_scope = true;
+                }
                 options.distro = value;
                 options.selects_distribution = true;
             },
-            "-u" | "--user" => options.user = value,
-            "--distribution-id" => options.selects_distribution = true,
+            "-u" | "--user" => {
+                if value.is_none() || options.user.is_some_and(|previous| Some(previous) != value) {
+                    options.invalid_scope = true;
+                }
+                options.user = value;
+            },
+            "--distribution-id" => {
+                options.selects_distribution = true;
+                options.unsupported_distribution_selector = true;
+            },
             "--cd" => options.chooses_directory = true,
             "--shell-type" => {},
             "--" | "-e" | "--exec" => break,
@@ -586,10 +609,19 @@ fn wsl_options(args: &[String]) -> WslOptions<'_> {
                 index -= 1;
                 if option == "--system" || option.starts_with("--distribution-id=") {
                     options.selects_distribution = true;
+                    options.unsupported_distribution_selector = true;
                 } else if let Some(distro) = option.strip_prefix("--distribution=") {
+                    if distro.is_empty()
+                        || options.distro.is_some_and(|previous| previous != distro)
+                    {
+                        options.invalid_scope = true;
+                    }
                     options.distro = non_empty(distro);
                     options.selects_distribution = true;
                 } else if let Some(user) = option.strip_prefix("--user=") {
+                    if user.is_empty() || options.user.is_some_and(|previous| previous != user) {
+                        options.invalid_scope = true;
+                    }
                     options.user = non_empty(user);
                 } else if option.starts_with("--cd=") {
                     options.chooses_directory = true;
@@ -624,6 +656,15 @@ pub(crate) fn is_wsl_launcher(program: &str) -> bool {
 /// Codex 的 `/proc`。
 pub fn wsl_launch_user<'a>(program: &str, args: &'a [String]) -> Option<&'a str> {
     wsl_launch(program, args)?.user
+}
+
+/// A probe must pin a distribution that the launcher selected explicitly.
+/// Looking up the current default after launch could route it to another distro.
+pub(crate) fn wsl_explicit_scope(
+    program: &str,
+    args: &[String],
+) -> Option<(String, Option<String>)> {
+    wsl_launch(program, args)?.explicit_scope()
 }
 
 /// 终端报的 cwd 是来宾侧的绝对路径吗（`/home/x`）。宿主路径（`D:\…`）不需要
@@ -977,6 +1018,27 @@ mod tests {
         assert_eq!(detected.name, "Zellij");
         assert_eq!(detected.shell().program(), program.to_str().unwrap());
         assert!(detected.shell().args().is_empty(), "Zellij must not receive shell login flags");
+    }
+
+    #[test]
+    fn observed_wsl_scope_requires_one_explicit_supported_distribution() {
+        let scope = |args: &[&str]| {
+            super::wsl_explicit_scope("wsl.exe", &args.iter().map(|arg| (*arg).into()).collect::<Vec<_>>())
+        };
+        assert_eq!(scope(&["-d", "Ubuntu-22.04", "--cd", "/mnt/f/ProjectLearn", "-e", "sh"]),
+            Some(("Ubuntu-22.04".into(), None)));
+        assert_eq!(scope(&["--distribution=Ubuntu", "--user", "wyr", "--exec", "sh"]),
+            Some(("Ubuntu".into(), Some("wyr".into()))));
+        for args in [
+            vec!["--exec", "sh"],
+            vec!["--system", "--exec", "sh"],
+            vec!["--distribution-id", "{id}", "--exec", "sh"],
+            vec!["-d", "Ubuntu", "--distribution-id", "{id}", "--exec", "sh"],
+            vec!["-d", "Ubuntu", "-d", "Debian", "--exec", "sh"],
+            vec!["--distribution=", "--exec", "sh"],
+        ] {
+            assert_eq!(scope(&args), None, "unsupported or ambiguous WSL options: {args:?}");
+        }
     }
 
     /// WSL 位置识别：发行版只认显式 `-d` / `--distribution`。裸 `wsl` 用的是

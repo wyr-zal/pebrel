@@ -2,6 +2,8 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+#[cfg(windows)]
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use gpui::{Context, EventEmitter as _};
@@ -36,6 +38,18 @@ fn process_scope(
     )
 }
 
+#[cfg(windows)]
+fn shell_reports_command_identity(program: Option<&str>) -> bool {
+    program.is_none_or(|program| {
+        Path::new(program)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| {
+                stem.eq_ignore_ascii_case("powershell") || stem.eq_ignore_ascii_case("pwsh")
+            })
+    })
+}
+
 fn additional_binding_is_current(
     current_input: u64,
     request_input: u64,
@@ -51,6 +65,30 @@ impl TerminalView {
     /// Called only for a shell submission, before any bytes reach the PTY.
     #[cfg(windows)]
     pub(super) fn capture_native_command_boundary(&mut self) {
+        let wsl_boundary = if self.suggest.suggest_env.is_this_machine()
+            && self.ssh_destination.is_none()
+            && self
+                .exec_context
+                .as_ref()
+                .is_some_and(|context| {
+                    context.wsl_distribution().is_none()
+                        && shell_reports_command_identity(context.shell_program())
+                })
+        {
+            self.session.as_ref().and_then(|session| {
+                (session.shell_pid != 0)
+                    .then(|| agent_process_identity::NativeLaunchBoundary::capture(session.shell_pid))
+                    .flatten()
+            })
+        } else {
+            None
+        };
+        self.wsl_cwd_observer.prepare_submission(wsl_boundary);
+        self.capture_native_recovery_boundary();
+    }
+
+    #[cfg(windows)]
+    pub(super) fn capture_native_recovery_boundary(&mut self) {
         if !self.recovery.requires_foreground_receipt()
             || !self.suggest.suggest_env.is_this_machine()
             || self.ssh_destination.is_some()
@@ -530,6 +568,17 @@ mod proof_contract_tests {
         assert_eq!(probe_interval(false, 255, false), MAX_IDLE_INTERVAL);
         assert_eq!(probe_interval(false, 255, true), PROBE_INTERVAL);
         assert_eq!(probe_interval(true, 0, false), RECHECK_INTERVAL);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn command_boundary_capture_is_limited_to_integrated_powershell_shells() {
+        assert!(super::shell_reports_command_identity(None), "the Windows default is PowerShell");
+        assert!(super::shell_reports_command_identity(Some(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")));
+        assert!(super::shell_reports_command_identity(Some(r"C:\Program Files\PowerShell\7\pwsh.exe")));
+        for unsupported in ["bash.exe", "wsl.exe", "cmd.exe", "nu.exe"] {
+            assert!(!super::shell_reports_command_identity(Some(unsupported)), "{unsupported}");
+        }
     }
 
     #[cfg(feature = "gpui-test-support")]

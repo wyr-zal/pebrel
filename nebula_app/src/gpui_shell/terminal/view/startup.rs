@@ -308,6 +308,8 @@ impl TerminalView {
             agent_identity_receipt: None,
             #[cfg(windows)]
             native_command_boundary: None,
+            #[cfg(windows)]
+            wsl_cwd_observer: Default::default(),
             shell_boundary_generation: 0,
             shell_boundary_probe: None,
             prompt_process_probe: None,

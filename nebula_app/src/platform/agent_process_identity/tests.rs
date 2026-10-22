@@ -173,6 +173,107 @@ fn probe_rechecks_identity_after_reading_argv() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn process_scan_parses_each_tty_candidate_environment_once() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let proc = root.path().join("proc");
+    let bin = root.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let stat = |pid: u32, parent: u32, group: u32, tty: u32, foreground: u32, start: u64| {
+        format!("{pid} (fixture) S {parent} {group} 100 {tty} {foreground} 0 0 0 0 0 0 0 0 0 0 0 0 {start}\n")
+    };
+    let environment = b"PEBREL_PANE_ID=4\0PEBREL_PROCESS_ID=10404\0PEBREL_COMMAND_ID=0123456789abcdef0123456789abcdef\0";
+    for (pid, parent, group, tty, foreground, start, name, owned) in [
+        (100, 1, 100, 34823, 200, 1000, "bash", true),
+        (200, 100, 200, 34823, 200, 2000, "claude", true),
+        (300, 1, 300, 999, 300, 3000, "sleep", false),
+        (301, 1, 301, 999, 301, 3001, "sleep", false),
+        (302, 1, 302, 999, 302, 3002, "sleep", false),
+    ] {
+        let directory = proc.join(pid.to_string());
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("stat"),
+            stat(pid, parent, group, tty, foreground, start),
+        )
+        .unwrap();
+        std::fs::write(directory.join("comm"), format!("{name}\n")).unwrap();
+        std::fs::write(directory.join("cmdline"), format!("{name}\0--resume\0")).unwrap();
+        std::fs::write(
+            directory.join("environ"),
+            if owned { environment.as_slice() } else { b"OTHER=1\0" },
+        )
+        .unwrap();
+    }
+    for pid in 400..500 {
+        let directory = proc.join(pid.to_string());
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("stat"), stat(pid, 1, pid, 0, 0, u64::from(pid))).unwrap();
+        std::fs::write(directory.join("comm"), "sleep\n").unwrap();
+        std::fs::write(directory.join("cmdline"), b"sleep\0").unwrap();
+        std::fs::write(directory.join("environ"), b"OTHER=1\0").unwrap();
+    }
+    let cwd = root.path().join("working-directory");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::os::unix::fs::symlink(cwd, proc.join("200/cwd")).unwrap();
+    let grep_count = root.path().join("grep-count");
+    let grep_wrapper = bin.join("grep");
+    std::fs::write(
+        &grep_wrapper,
+        "#!/bin/sh\nprintf x >> \"$GREP_COUNT\"\nexec /usr/bin/grep \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&grep_wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let script = PROCESS_PROBE_SCRIPT.replace("/proc/", &format!("{}/", proc.display()));
+    let output = Command::new("/bin/sh")
+        .args(["-c", &script, "fixture", "4", "10404", "discover"])
+        .env(crate::agent_env::COMMAND_ID_ENV, "0123456789abcdef0123456789abcdef")
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("GREP_COUNT", &grep_count)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(std::fs::read(grep_count).unwrap().len(), 8);
+}
+
+#[cfg(unix)]
+#[test]
+fn process_scan_rejects_a_cwd_whose_final_character_is_a_newline() {
+    let root = tempfile::tempdir().unwrap();
+    let proc = root.path().join("proc");
+    let stat = |pid: u32, parent: u32, group: u32, start: u64| {
+        format!("{pid} (fixture) S {parent} {group} 100 34823 200 0 0 0 0 0 0 0 0 0 0 0 0 {start}\n")
+    };
+    for (pid, parent, group, start, name) in
+        [(100, 1, 100, 1000, "bash"), (200, 100, 200, 2000, "claude")]
+    {
+        let directory = proc.join(pid.to_string());
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("stat"), stat(pid, parent, group, start)).unwrap();
+        std::fs::write(directory.join("comm"), format!("{name}\n")).unwrap();
+        std::fs::write(directory.join("cmdline"), format!("{name}\0--resume\0")).unwrap();
+        std::fs::write(
+            directory.join("environ"),
+            b"PEBREL_PANE_ID=4\0PEBREL_PROCESS_ID=10404\0PEBREL_COMMAND_ID=0123456789abcdef0123456789abcdef\0",
+        )
+        .unwrap();
+    }
+    let cwd = root.path().join("directory\n");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::os::unix::fs::symlink(cwd, proc.join("200/cwd")).unwrap();
+    let script = PROCESS_PROBE_SCRIPT.replace("/proc/", &format!("{}/", proc.display()));
+    let output = Command::new("/bin/sh")
+        .args(["-c", &script, "fixture", "4", "10404", "discover"])
+        .env(crate::agent_env::COMMAND_ID_ENV, "0123456789abcdef0123456789abcdef")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+}
+
 #[test]
 fn foreground_receipt_keeps_owner_and_anchor_stamps() {
     let snapshot = "S\t100\t1\nM\t100\t1\t1000\t34823\t100\t200\nP\t200\t100\tcodex\tcodex\t\nM\t200\t100\t2000\t34823\t200\t200\nE\n";
@@ -196,6 +297,61 @@ fn foreground_receipt_keeps_owner_and_anchor_stamps() {
     ] {
         assert_eq!(parse_probe(&invalid), AgentProbe::Unavailable, "{invalid}");
     }
+}
+
+#[test]
+fn location_probe_returns_only_the_selected_agent_cwd() {
+    use base64::Engine as _;
+    let cwd = base64::engine::general_purpose::STANDARD.encode("/mnt/f/Project Learn");
+    let snapshot = format!(
+        "S\t100\t1\nP\t200\t100\tclaude\tclaude\t--resume\nD\t200\t2000\t{cwd}\nM\t100\t1\t1000\t34823\t100\t200\nM\t200\t100\t2000\t34823\t200\t200\nE\n"
+    );
+    let parsed = parse_probe_snapshot(&snapshot).expect("valid location snapshot");
+    assert_eq!(
+        parsed,
+        (
+            AgentProbe::Found(ForegroundAgent {
+                kind: AgentKind::Claude,
+                process: ProcessStamp { pid: 200, start_time: 2000 },
+                shell: ProcessStamp { pid: 100, start_time: 1000 },
+                tty_nr: 34823,
+                process_group: 200,
+            }),
+            Some("/mnt/f/Project Learn".into()),
+        )
+    );
+
+    let wrong_owner = snapshot.replace("D\t200\t2000\t", "D\t201\t2000\t");
+    assert_eq!(parse_probe_snapshot(&wrong_owner).unwrap().1, None);
+
+    let reused_pid = snapshot.replace("M\t200\t100\t2000\t", "M\t200\t100\t2001\t");
+    let (probe, cwd) = parse_probe_snapshot(&reused_pid).expect("reused process snapshot parses");
+    let AgentProbe::Found(agent) = probe else { panic!("foreground Agent identity remains observable") };
+    assert_eq!(agent.process, ProcessStamp { pid: 200, start_time: 2001 });
+    assert!(cwd.is_none(), "cwd from the old PID instance must not be reused");
+}
+
+#[test]
+fn expired_location_probe_deadline_returns_unavailable_without_starting_a_child() {
+    let mut options = nebula_terminal::tty::Options::default();
+    options.env.insert(crate::agent_env::PROCESS_ENV.into(), "10404".into());
+    let context = PaneExecContext::from_pty_options(&options);
+    let mut remaining = MAX_PROBE_OUTPUT;
+    assert!(read_probe(
+        &context,
+        4,
+        &["discover".into()],
+        Instant::now() - Duration::from_millis(1),
+        &mut remaining,
+        &|| false,
+    )
+    .is_none());
+}
+
+#[test]
+fn command_token_without_a_matching_guest_process_is_a_complete_no_agent_result() {
+    assert_eq!(parse_probe_snapshot("N\nE\n"), Some((AgentProbe::NoAgent, None)));
+    assert_eq!(parse_probe_snapshot("N\nS\t100\t1\nE\n"), None);
 }
 
 #[test]

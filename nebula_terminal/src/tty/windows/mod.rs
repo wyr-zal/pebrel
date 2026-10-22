@@ -801,6 +801,10 @@ if (Get-Command Set-PSReadLineOption -ErrorAction SilentlyContinue) {
         if (-not [string]::IsNullOrWhiteSpace($line)) {
             # The accepted PSReadLine text also sees recall, paste and native
             # completion. Resolve a simple PowerShell alias for scope tracking.
+            $commandId = [Guid]::NewGuid().ToString('N')
+            $env:PEBREL_COMMAND_ID = $commandId
+            $commandId64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($commandId))
+            [Console]::Write("$([char]27)]1337;SetUserVar=pebrel_command_id=$commandId64$([char]7)")
             $scopeLine = $line
             try {
                 $first = ($line.Trim() -split '\s+', 2)[0]
@@ -1282,6 +1286,26 @@ mod test {
             prompt < toggle + start,
             "the powerline-off prompt and ReadLine wrapper must both stay"
         );
+    }
+
+    #[test]
+    fn command_identity_is_reported_before_the_command_start_marker() {
+        let id = NEBULA_PROMPT_PS1
+            .find("$env:PEBREL_COMMAND_ID = $commandId")
+            .expect("command id is inherited by child processes");
+        let report = NEBULA_PROMPT_PS1
+            .find("SetUserVar=pebrel_command_id=")
+            .expect("command id is reported to the pane");
+        let input = NEBULA_PROMPT_PS1
+            .find("SetUserVar=pebrel_input=")
+            .expect("accepted input is reported");
+        let command = NEBULA_PROMPT_PS1
+            .find("SetUserVar=pebrel_command=")
+            .expect("resolved command is reported");
+        let start = NEBULA_PROMPT_PS1
+            .find("]133;C")
+            .expect("command start marker follows metadata");
+        assert!(id < report && report < input && input < command && command < start);
     }
 
     #[test]

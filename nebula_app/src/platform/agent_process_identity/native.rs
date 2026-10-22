@@ -117,6 +117,41 @@ impl NativeProcessIdentity {
         let command = String::from_utf16(raw).ok()?;
         (self.creation_time() == Some(self.1.start_time)).then_some(command)
     }
+
+    pub(crate) fn command_line_arguments(&self) -> Option<Vec<String>> {
+        let command = self.command_line()?;
+        let mut count = 0;
+        let raw = unsafe { CommandLineToArgvW(wide(&command).as_ptr(), &mut count) };
+        if raw.is_null() || count <= 0 || count > 256 {
+            if !raw.is_null() {
+                unsafe { LocalFree(raw.cast()) };
+            }
+            return None;
+        }
+        struct Arguments(*mut *mut u16);
+        impl Drop for Arguments {
+            fn drop(&mut self) {
+                unsafe { LocalFree(self.0.cast()) };
+            }
+        }
+        let _arguments = Arguments(raw);
+        (0..count)
+            .map(|index| {
+                let pointer = unsafe { ptr::read(raw.add(index as usize)) };
+                (!pointer.is_null()).then(|| unsafe {
+                    let mut length = 0usize;
+                    while *pointer.add(length) != 0 {
+                        length += 1;
+                    }
+                    String::from_utf16(std::slice::from_raw_parts(pointer, length)).ok()
+                })?
+            })
+            .collect()
+    }
+}
+
+fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 fn entrypoint_kind(executable: &str, command: &str) -> Option<AgentKind> {
@@ -215,6 +250,7 @@ mod tests {
         let process = NativeProcessIdentity::open(std::process::id()).unwrap();
         assert_ne!(process.stamp().start_time, 0);
         assert!(process.command_line().is_some());
+        assert!(!process.command_line_arguments().unwrap().is_empty());
         assert_eq!(
             process_kind(std::process::id(), process.stamp().start_time + 1, "node.exe"),
             Err(())

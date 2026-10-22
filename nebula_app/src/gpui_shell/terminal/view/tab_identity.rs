@@ -10,6 +10,11 @@ fn ssh_label(destination: Option<&str>, directory: &std::path::Path) -> Option<S
     profiles.labels().remove(destination)
 }
 
+#[cfg(windows)]
+fn observed_wsl_tab_label(distro: &str, cwd: &str) -> String {
+    last_path_component(cwd).unwrap_or_else(|| distro.to_owned())
+}
+
 impl TerminalView {
     pub(crate) fn inherits_windows_host_token(&self) -> bool {
         self.ssh_destination.is_none()
@@ -60,6 +65,10 @@ impl TerminalView {
         if let Some(destination) = &self.ssh_destination {
             return self.ssh_label.as_ref().unwrap_or(destination).clone();
         }
+        #[cfg(windows)]
+        if let Some(location) = self.wsl_cwd_observer.observed() {
+            return observed_wsl_tab_label(&location.distro, &location.cwd);
+        }
         last_path_component(&self.cwd)
             .or_else(|| {
                 std::env::current_dir()
@@ -83,6 +92,16 @@ impl TerminalView {
                 lines.push(destination.clone());
             }
         }
+        #[cfg(windows)]
+        if let Some(location) = self.wsl_cwd_observer.observed() {
+            let guest_location = format!("{} · {}", location.distro, location.cwd);
+            if !lines.contains(&guest_location) {
+                lines.push(guest_location);
+            }
+        } else if !self.cwd.trim().is_empty() && !lines.contains(&self.cwd) {
+            lines.push(self.cwd.clone());
+        }
+        #[cfg(not(windows))]
         if !self.cwd.trim().is_empty() && !lines.contains(&self.cwd) {
             lines.push(self.cwd.clone());
         }
@@ -121,6 +140,12 @@ impl TerminalView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn observed_wsl_root_uses_distribution_as_tab_label() {
+        assert_eq!(observed_wsl_tab_label("Ubuntu-22.04", "/"), "Ubuntu-22.04");
+    }
 
     #[test]
     fn saved_ssh_names_are_loaded_from_the_selected_configuration() {

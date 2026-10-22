@@ -64,7 +64,10 @@ impl TerminalView {
             // one, fail closed for processes already running when C is read.
             self.native_command_boundary = launch_boundary;
             if let Some(early_hooks) = early_hooks { self.pending_recovery_hooks = early_hooks; }
-            if self.native_command_boundary.is_none() { self.capture_native_command_boundary(); }
+            if self.native_command_boundary.is_none() { self.capture_native_recovery_boundary(); }
+            if self.wsl_cwd_observer.start_command() {
+                cx.emit(TerminalViewEvent::TitleChanged);
+            }
         }
         self.invalidate_shell_boundary_probe();
         self.invalidate_agent_identity_probe();
@@ -219,6 +222,10 @@ impl TerminalView {
         exit_code: Option<i32>,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(windows)]
+        if self.wsl_cwd_observer.finish_command() {
+            cx.emit(TerminalViewEvent::TitleChanged);
+        }
         let choose_codex_session = self.codex_restore_target_missing(exit_code);
         self.notify_command_done(exit_code, cx);
         self.last_command_failed = exit_code.is_some_and(|code| code != 0);

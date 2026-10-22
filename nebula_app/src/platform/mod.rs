@@ -60,6 +60,8 @@ pub(crate) mod window_material;
 #[cfg(all(unix, feature = "gpui-shell"))]
 pub(crate) mod window_visibility;
 pub(crate) mod wsl_hooks;
+#[cfg(windows)]
+pub(crate) mod wsl_location;
 
 pub use capabilities::CAPABILITIES;
 

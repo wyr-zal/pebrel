@@ -30,6 +30,8 @@ mod startup_command;
 pub(super) mod startup_tests;
 mod tab_identity;
 mod typography;
+#[cfg(windows)]
+mod wsl_cwd_observer;
 
 pub use broadcast::TerminalInput;
 pub use runtime::InputOrigin;
@@ -333,6 +335,8 @@ pub struct TerminalView {
     agent_identity_receipt: Option<crate::platform::agent_process_identity::ForegroundAgent>,
     #[cfg(windows)]
     native_command_boundary: Option<crate::platform::agent_process_identity::NativeLaunchBoundary>,
+    #[cfg(windows)]
+    wsl_cwd_observer: wsl_cwd_observer::WslCwdObserver,
     shell_boundary_generation: u64,
     shell_boundary_probe: Option<agent_activity::PendingShellBoundary>,
     prompt_process_probe: Option<gpui::Task<()>>,
@@ -773,6 +777,17 @@ impl TerminalView {
                 {
                     self.on_native_cmd_prompt(cx);
                 }
+                #[cfg(windows)]
+                {
+                    if name == "pebrel_command_id" {
+                        self.wsl_cwd_observer.accept_command_id(&value);
+                    } else if name == "pebrel_command" {
+                        self.wsl_cwd_observer.accept_command_line(&value);
+                    }
+                    if self.wsl_cwd_observer.take_title_change() {
+                        cx.emit(TerminalViewEvent::TitleChanged);
+                    }
+                }
                 self.suggest.completion_shell_report(&name, &value);
                 self.handle_completion_editor_report(&name, &value, cx);
                 cx.notify();
@@ -800,6 +815,10 @@ impl TerminalView {
     /// `Exited` 只对宿主发一次；重复的退出信号（ChildExit 之后必然跟 Exit）只更新文案。
     fn mark_exited(&mut self, message: String, cx: &mut Context<Self>) {
         self.stop_agent_identity_probe();
+        #[cfg(windows)]
+        if self.wsl_cwd_observer.finish_command() {
+            cx.emit(TerminalViewEvent::TitleChanged);
+        }
         if let Some(session) = &self.session {
             session.cancel_remote_hooks();
         }
@@ -819,6 +838,8 @@ impl TerminalView {
     /// 让 EventLoop 退出并回收 ConPTY/子进程。幂等：重复调用只会得到发送失败。
     pub fn shutdown(&self) {
         self.stop_agent_identity_probe();
+        #[cfg(windows)]
+        self.wsl_cwd_observer.stop();
         if let Some(session) = &self.session {
             session.cancel_remote_hooks();
             let _ = session.notifier.0.send(Msg::Shutdown);

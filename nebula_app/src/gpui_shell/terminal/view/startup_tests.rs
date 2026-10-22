@@ -678,6 +678,96 @@ fn ai_tab_hover_shows_full_directory_and_reported_task_but_not_stale_task(cx: &m
     });
 }
 
+#[cfg(windows)]
+#[gpui::test]
+fn observed_wsl_directory_drives_only_the_automatic_tab_label(cx: &mut TestAppContext) {
+    use crate::ai_agents::AgentKind;
+    use crate::platform::{agent_process_identity::{ForegroundAgent, ProcessStamp}, wsl_location::ObservedWslLocation};
+
+    let (view, window, _) = open(cx);
+    window.update(|_, cx| view.update(cx, |view, _| {
+        view.cwd = r"C:\mnt\c\Users\12704".into();
+        view.wsl_cwd_observer.set_observed_for_test(Some(ObservedWslLocation {
+            distro: "Ubuntu-22.04".into(),
+            user: None,
+            cwd: "/mnt/f/Project Learn".into(),
+            launcher: ProcessStamp { pid: 10, start_time: 100 },
+            agent: ForegroundAgent {
+                kind: AgentKind::Claude,
+                process: ProcessStamp { pid: 20, start_time: 200 },
+                shell: ProcessStamp { pid: 30, start_time: 300 },
+                tty_nr: 4,
+                process_group: 20,
+            },
+        }));
+        assert_eq!(view.tab_label(), "Project Learn");
+        assert!(view.tab_tooltip("手动命名").starts_with("手动命名\n"));
+        let tooltip = view.tab_tooltip("Project Learn");
+        assert!(tooltip.contains("Ubuntu-22.04 · /mnt/f/Project Learn"));
+        assert!(!tooltip.contains(r"C:\mnt\c\Users\12704"));
+        assert_eq!(view.cwd, r"C:\mnt\c\Users\12704");
+        assert!(view.wsl_cwd_observer.finish_command());
+        assert_eq!(view.tab_label(), "12704");
+    }));
+}
+
+#[cfg(windows)]
+#[gpui::test]
+fn accepted_wsl_probe_updates_the_tab_label_and_emits_a_title_change(
+    cx: &mut TestAppContext,
+) {
+    use std::{cell::RefCell, rc::Rc, time::Instant};
+
+    use crate::ai_agents::AgentKind;
+    use crate::platform::{
+        agent_process_identity::{ForegroundAgent, NativeLaunchBoundary, ProcessStamp},
+        wsl_location::{ObservedWslLocation, WslLocationProbe},
+    };
+
+    let (view, window, _) = open(cx);
+    let received = Rc::new(RefCell::new(Vec::new()));
+    let _subscription = window.update(|_, cx| {
+        let received = received.clone();
+        cx.subscribe(&view, move |_, event, _| {
+            if matches!(event, TerminalViewEvent::TitleChanged) {
+                received.borrow_mut().push("title");
+            }
+        })
+    });
+
+    view.update(window, |view, cx| {
+        view.cwd = r"C:\mnt\c\Users\12704".into();
+        let boundary = NativeLaunchBoundary {
+            time: 100,
+            shell: ProcessStamp { pid: 10, start_time: 90 },
+            existing_branches: Default::default(),
+        };
+        view.wsl_cwd_observer.prepare_submission(Some(boundary));
+        view.wsl_cwd_observer.accept_command_id("0123456789abcdef0123456789abcdef");
+        view.wsl_cwd_observer.accept_command_line("shell-token\nwsl.exe -d Ubuntu-22.04");
+        view.wsl_cwd_observer.start_command();
+        let ticket = view.wsl_cwd_observer.begin_probe(Instant::now()).unwrap();
+        let location = ObservedWslLocation {
+            distro: "Ubuntu-22.04".into(),
+            user: None,
+            cwd: "/mnt/f/Project Learn".into(),
+            launcher: ProcessStamp { pid: 20, start_time: 200 },
+            agent: ForegroundAgent {
+                kind: AgentKind::Claude,
+                process: ProcessStamp { pid: 30, start_time: 300 },
+                shell: ProcessStamp { pid: 40, start_time: 400 },
+                tty_nr: 4,
+                process_group: 30,
+            },
+        };
+        view.apply_wsl_cwd_probe_result(&ticket, WslLocationProbe::Found(location), true, cx);
+        assert_eq!(view.tab_label(), "Project Learn");
+        assert!(view.tab_tooltip("Project Learn").contains("Ubuntu-22.04 · /mnt/f/Project Learn"));
+        assert_eq!(view.cwd, r"C:\mnt\c\Users\12704");
+    });
+    assert_eq!(*received.borrow(), ["title"]);
+}
+
 #[gpui::test]
 fn review_regression_cold_resume_survives_initial_prompt_and_clears_on_exit(
     cx: &mut TestAppContext,
