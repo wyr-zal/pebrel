@@ -18,8 +18,9 @@ const MAX_PROCESS_FIELD: usize = 4096;
 const PROCESS_PROBE_SCRIPT: &str = r###"
 pane_id=$1
 process_instance=$2
-mode=${3:-discover}
-command_id=${PEBREL_COMMAND_ID:-}
+command_id=$3
+mode=${4:-discover}
+shift 4
 records=0
 owned_any=0
 tab=$(printf '\t')
@@ -117,7 +118,7 @@ is_pty_root() (
 )
 
 check_owner() {
-    owner=$4; owner_start=$5; shell=$6; shell_start=$7; tty=$8; group=$9
+    owner=$1; owner_start=$2; shell=$3; shell_start=$4; tty=$5; group=$6
     for pid in "$owner" "$shell"; do
         [ -d "/proc/$pid" ] || return 1
         owned_process "/proc/$pid" || return $?
@@ -588,25 +589,17 @@ fn probe_command(context: &PaneExecContext, pane_id: u64, args: &[String]) -> Op
     let mut command = Command::new("/bin/sh");
     #[cfg(any(windows, target_os = "linux"))]
     {
-        command.env(crate::agent_env::PANE_ENV, pane_id.to_string());
-        command.env(
-            crate::agent_env::PROCESS_ENV,
+        configure_process_probe(
+            &mut command,
+            pane_id,
             context.process_instance()?,
+            context.command_id(),
+            args,
         );
-        if let Some(command_id) = context.command_id() {
-            if let Some(wslenv) = context.wslenv() {
-                command.env("WSLENV", wslenv);
-            }
-            command.env(crate::agent_env::COMMAND_ID_ENV, command_id);
+        #[cfg(windows)]
+        if let Some(wslenv) = context.wslenv() {
+            command.env("WSLENV", wslenv);
         }
-        command.args([
-            "-c",
-            PROCESS_PROBE_SCRIPT,
-            "pebrel-agent-process-probe",
-            &pane_id.to_string(),
-            context.process_instance()?,
-        ]);
-        command.args(args);
         crate::platform::process::hidden_command(&mut command);
         Some(command)
     }
@@ -615,6 +608,30 @@ fn probe_command(context: &PaneExecContext, pane_id: u64, args: &[String]) -> Op
         let _ = (context, pane_id, args);
         None
     }
+}
+
+fn configure_process_probe(
+    command: &mut Command,
+    pane_id: u64,
+    process_instance: &str,
+    command_id: Option<&str>,
+    args: &[String],
+) {
+    clear_probe_identity_environment(command);
+    command
+        .args(["-c", PROCESS_PROBE_SCRIPT, "pebrel-agent-process-probe"])
+        .arg(pane_id.to_string())
+        .arg(process_instance)
+        .arg(command_id.unwrap_or_default());
+    command.args(args);
+}
+
+fn clear_probe_identity_environment(command: &mut Command) {
+    command
+        .env_remove(crate::agent_env::PANE_ENV)
+        .env_remove(crate::ai_hook::LEGACY_PANE_ENV)
+        .env_remove(crate::agent_env::PROCESS_ENV)
+        .env_remove(crate::agent_env::COMMAND_ID_ENV);
 }
 
 #[cfg(any(windows, target_os = "macos"))]

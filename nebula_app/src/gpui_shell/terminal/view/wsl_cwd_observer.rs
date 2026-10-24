@@ -71,14 +71,13 @@ impl WslCwdObserver {
     pub(super) fn accept_command_id(&mut self, command_id: &str) {
         self.invalidate();
         self.command_id = valid_command_id(command_id).then(|| command_id.to_owned());
-        self.command_candidate = false;
         self.active = false;
         self.reset_probe_state();
         self.pending_title_changed |= self.clear_observed();
     }
 
     pub(super) fn accept_command_line(&mut self, value: &str) {
-        self.command_candidate = command_line_targets_wsl(value);
+        self.command_candidate = command_line_contains_wsl(value);
         if !self.command_candidate {
             self.active = false;
             self.pending_title_changed |= self.clear_observed();
@@ -195,8 +194,22 @@ impl WslCwdObserver {
         now: Instant,
     ) -> bool {
         if !self.finish_probe(ticket) {
+            crate::logging::debug_log(
+                "wsl_cwd_observer event=probe_complete accepted=false reason=stale_or_cancelled",
+            );
             return false;
         }
+        let outcome = match &result {
+            WslLocationProbe::Found(_) => "found",
+            WslLocationProbe::NoLauncher => "no_launcher",
+            WslLocationProbe::NoAgent { .. } => "no_agent",
+            WslLocationProbe::Unavailable { .. } => "unavailable",
+            WslLocationProbe::Ambiguous => "ambiguous",
+            WslLocationProbe::Unknown { .. } => "unknown",
+        };
+        crate::logging::debug_log(format!(
+            "wsl_cwd_observer event=probe_complete outcome={outcome} binding_current={binding_is_current}"
+        ));
         if !binding_is_current {
             return self.finish_command();
         }
@@ -282,9 +295,12 @@ fn valid_command_id(command_id: &str) -> bool {
     command_id.len() == 32 && command_id.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn command_line_targets_wsl(value: &str) -> bool {
-    let Some((_, command)) = value.split_once('\n') else { return false };
-    let command = command.trim_start();
+fn command_line_contains_wsl(value: &str) -> bool {
+    let command = if let Some((_, after_newline)) = value.split_once('\n') {
+        after_newline
+    } else {
+        value
+    };
     let executable =
         if let Some(quote) = command.chars().next().filter(|quote| matches!(quote, '\'' | '"')) {
             let rest = &command[quote.len_utf8()..];
@@ -306,7 +322,6 @@ impl TerminalView {
         if self.exited.is_some()
             || self.error.is_some()
             || self.ssh_destination.is_some()
-            || !self.suggest.suggest_env.is_this_machine()
             || self.session.is_none()
         {
             return;
@@ -320,6 +335,7 @@ impl TerminalView {
             return;
         };
         let Some(ticket) = self.wsl_cwd_observer.begin_probe(now) else { return };
+        crate::logging::debug_log("wsl_cwd_observer event=probe_start");
         let Some(session) = &self.session else { return };
         let shell_pid = session.shell_pid;
         if shell_pid == 0 {
@@ -436,6 +452,19 @@ mod tests {
         observer.accept_command_line("shell-token\nGet-ChildItem");
         observer.start_command();
         assert!(!observer.active);
+    }
+
+    #[test]
+    fn pasted_wsl_command_is_retained_until_the_shell_command_id_arrives() {
+        let mut observer = WslCwdObserver::default();
+        observer.prepare_submission(Some(boundary()));
+        observer.accept_command_line("wsl.exe -d Ubuntu-22.04 --cd /mnt/e/ProjectOrder/VoiceRecite");
+        observer.start_command();
+        assert!(!observer.active);
+
+        observer.accept_command_id("abcdef0123456789abcdef0123456789");
+        observer.start_command();
+        assert!(observer.active);
     }
 
     #[test]

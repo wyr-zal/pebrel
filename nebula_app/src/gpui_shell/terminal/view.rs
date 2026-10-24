@@ -779,12 +779,16 @@ impl TerminalView {
                 }
                 #[cfg(windows)]
                 {
-                    if name == "pebrel_command_id" {
+                    let title_changed = if name == "pebrel_command_id" {
                         self.wsl_cwd_observer.accept_command_id(&value);
+                        self.wsl_cwd_observer.start_command()
                     } else if name == "pebrel_command" {
                         self.wsl_cwd_observer.accept_command_line(&value);
-                    }
-                    if self.wsl_cwd_observer.take_title_change() {
+                        self.wsl_cwd_observer.start_command()
+                    } else {
+                        false
+                    };
+                    if title_changed || self.wsl_cwd_observer.take_title_change() {
                         cx.emit(TerminalViewEvent::TitleChanged);
                     }
                 }
@@ -1172,6 +1176,10 @@ impl TerminalView {
         // `nebula_input_text` 的防注入契约一致）。
         if !self.term_mode().contains(TermMode::ALT_SCREEN) {
             crate::display::nebula_input_text(&mut self.suggest, &normalized);
+            self.wsl_cwd_observer.accept_command_line(&normalized);
+            if self.wsl_cwd_observer.start_command() {
+                cx.emit(TerminalViewEvent::TitleChanged);
+            }
         }
         let bytes = if self.term_mode().contains(TermMode::BRACKETED_PASTE) {
             let mut b = b"\x1b[200~".to_vec();

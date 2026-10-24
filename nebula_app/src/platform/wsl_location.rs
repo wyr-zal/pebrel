@@ -31,6 +31,17 @@ pub(crate) enum WslLocationProbe {
     Unknown { launcher: Option<ProcessStamp> },
 }
 
+fn probe_outcome(result: &WslLocationProbe) -> &'static str {
+    match result {
+        WslLocationProbe::Found(_) => "found",
+        WslLocationProbe::NoLauncher => "no_launcher",
+        WslLocationProbe::NoAgent { .. } => "no_agent",
+        WslLocationProbe::Unavailable { .. } => "unavailable",
+        WslLocationProbe::Ambiguous => "ambiguous",
+        WslLocationProbe::Unknown { .. } => "unknown",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WslLauncher {
     stamp: ProcessStamp,
@@ -68,24 +79,48 @@ pub(crate) fn probe(
         return WslLocationProbe::Unavailable { launcher: None };
     }
     let launcher = match select_launcher(shell_pid, boundary) {
-        LauncherSelection::One(launcher) => launcher,
-        LauncherSelection::None => return WslLocationProbe::NoLauncher,
-        LauncherSelection::Ambiguous => return WslLocationProbe::Ambiguous,
+        LauncherSelection::One(launcher) => {
+            crate::logging::debug_log("wsl_location stage=launcher outcome=selected");
+            launcher
+        },
+        LauncherSelection::None => {
+            crate::logging::debug_log("wsl_location stage=launcher outcome=none");
+            return WslLocationProbe::NoLauncher;
+        },
+        LauncherSelection::Ambiguous => {
+            crate::logging::debug_log("wsl_location stage=launcher outcome=ambiguous");
+            return WslLocationProbe::Ambiguous;
+        },
         LauncherSelection::Unavailable => {
+            crate::logging::debug_log("wsl_location stage=launcher outcome=unavailable");
             return WslLocationProbe::Unavailable { launcher: None };
         },
-        LauncherSelection::Unknown(launcher) => return WslLocationProbe::Unknown { launcher },
+        LauncherSelection::Unknown(launcher) => {
+            crate::logging::debug_log("wsl_location stage=launcher outcome=unknown");
+            return WslLocationProbe::Unknown { launcher };
+        },
     };
     if Instant::now() >= deadline || cancelled() {
         return WslLocationProbe::Unavailable { launcher: Some(launcher.stamp) };
     }
     match running_distros(deadline, cancelled) {
         Some(distros) if distros.iter().any(|name| name.eq_ignore_ascii_case(&launcher.distro)) => {
+            crate::logging::debug_log("wsl_location stage=distro outcome=running");
         },
-        Some(_) => return WslLocationProbe::Unavailable { launcher: Some(launcher.stamp) },
-        None => return WslLocationProbe::Unavailable { launcher: Some(launcher.stamp) },
+        Some(_) => {
+            crate::logging::debug_log("wsl_location stage=distro outcome=not_running");
+            return WslLocationProbe::Unavailable { launcher: Some(launcher.stamp) };
+        },
+        None => {
+            crate::logging::debug_log("wsl_location stage=distro outcome=unavailable");
+            return WslLocationProbe::Unavailable { launcher: Some(launcher.stamp) };
+        },
     }
     if let Err(result) = confirm_launcher(shell_pid, boundary, &launcher) {
+        crate::logging::debug_log(format!(
+            "wsl_location stage=launcher_recheck outcome={}",
+            probe_outcome(&result)
+        ));
         return result;
     }
     if cancelled() || Instant::now() >= deadline {
@@ -100,7 +135,19 @@ pub(crate) fn probe(
     if cancelled() {
         return WslLocationProbe::Unavailable { launcher: Some(launcher.stamp) };
     }
+    crate::logging::debug_log(format!(
+        "wsl_location stage=foreground_agent outcome={}",
+        match &result {
+            ForegroundAgentLocationProbe::Found(_, _) => "found",
+            ForegroundAgentLocationProbe::NoAgent => "no_agent",
+            ForegroundAgentLocationProbe::Unavailable => "unavailable",
+        }
+    ));
     if let Err(result) = confirm_launcher(shell_pid, boundary, &launcher) {
+        crate::logging::debug_log(format!(
+            "wsl_location stage=launcher_final_check outcome={}",
+            probe_outcome(&result)
+        ));
         return result;
     }
     match result {

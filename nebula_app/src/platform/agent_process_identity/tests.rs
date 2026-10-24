@@ -1,5 +1,54 @@
 use super::*;
 
+#[test]
+fn process_probe_command_passes_identity_arguments_and_removes_identity_environment() {
+    let mut command = Command::new("wsl.exe");
+    for name in [
+        crate::agent_env::PANE_ENV,
+        crate::ai_hook::LEGACY_PANE_ENV,
+        crate::agent_env::PROCESS_ENV,
+        crate::agent_env::COMMAND_ID_ENV,
+    ] {
+        command.env(name, "probe-self");
+    }
+    let operation_args = ["check", "70", "700", "80", "800", "34820", "70"]
+        .map(str::to_owned);
+    let mut expected_args = ["7", "process-instance", "abcdef0123456789abcdef0123456789"]
+        .map(str::to_owned)
+        .to_vec();
+    configure_process_probe(
+        &mut command,
+        7,
+        "process-instance",
+        Some("abcdef0123456789abcdef0123456789"),
+        &operation_args,
+    );
+
+    let actual_args: Vec<_> = command
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(actual_args[0], "-c");
+    assert_eq!(actual_args[1], PROCESS_PROBE_SCRIPT);
+    assert_eq!(actual_args[2], "pebrel-agent-process-probe");
+    expected_args.extend(operation_args);
+    assert_eq!(&actual_args[3..], expected_args.as_slice());
+
+    for name in [
+        crate::agent_env::PANE_ENV,
+        crate::ai_hook::LEGACY_PANE_ENV,
+        crate::agent_env::PROCESS_ENV,
+        crate::agent_env::COMMAND_ID_ENV,
+    ] {
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == std::ffi::OsStr::new(name) && value.is_none()),
+            "probe child must not inherit {name}"
+        );
+    }
+}
+
 #[cfg(windows)]
 fn native_boundary(time: u64) -> NativeLaunchBoundary {
     NativeLaunchBoundary {
@@ -159,7 +208,7 @@ fn probe_rechecks_identity_after_reading_argv() {
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let script = PROCESS_PROBE_SCRIPT.replace("/proc/", &format!("{}/", proc.display()));
     let output = Command::new("/bin/sh")
-        .args(["-c", &script, "fixture", "4", "10404"])
+        .args(["-c", &script, "fixture", "4", "10404", "", "discover"])
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .env("PROBE_INPUT", root.path().join("input"))
         .env("NEXT_STAT", next_stat)
@@ -230,8 +279,18 @@ fn process_scan_parses_each_tty_candidate_environment_once() {
 
     let script = PROCESS_PROBE_SCRIPT.replace("/proc/", &format!("{}/", proc.display()));
     let output = Command::new("/bin/sh")
-        .args(["-c", &script, "fixture", "4", "10404", "discover"])
-        .env(crate::agent_env::COMMAND_ID_ENV, "0123456789abcdef0123456789abcdef")
+        .args([
+            "-c",
+            &script,
+            "fixture",
+            "4",
+            "10404",
+            "0123456789abcdef0123456789abcdef",
+            "discover",
+        ])
+        .env(crate::agent_env::PANE_ENV, "999")
+        .env(crate::agent_env::PROCESS_ENV, "99999")
+        .env(crate::agent_env::COMMAND_ID_ENV, "wrong-command-id")
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .env("GREP_COUNT", &grep_count)
         .output()
@@ -267,8 +326,15 @@ fn process_scan_rejects_a_cwd_whose_final_character_is_a_newline() {
     std::os::unix::fs::symlink(cwd, proc.join("200/cwd")).unwrap();
     let script = PROCESS_PROBE_SCRIPT.replace("/proc/", &format!("{}/", proc.display()));
     let output = Command::new("/bin/sh")
-        .args(["-c", &script, "fixture", "4", "10404", "discover"])
-        .env(crate::agent_env::COMMAND_ID_ENV, "0123456789abcdef0123456789abcdef")
+        .args([
+            "-c",
+            &script,
+            "fixture",
+            "4",
+            "10404",
+            "0123456789abcdef0123456789abcdef",
+            "discover",
+        ])
         .output()
         .unwrap();
     assert!(!output.status.success());

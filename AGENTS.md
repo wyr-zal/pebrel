@@ -9,6 +9,15 @@
 - 只做受影响模块的验证，编译/状态单测不等于实际 UI 验收；未验证的路径明确说明。
 - 架构门禁用 `python3 scripts/check_architecture.py --base <共同基线>`；不抬预算、不删覆盖来通过检查。
 
+## Windows Debug 构建与 WSL 标签修复验收
+
+- 使用正式源码工作树 `F:/ProjectsWork/pebrel-personal-merge-20261010` 构建 Windows 产品；从 WSL 执行：
+  `/mnt/c/Users/12704/AppData/Local/Microsoft/WindowsApps/pwsh.exe -NoProfile -File F:/ProjectsWork/pebrel-personal-merge-20261010/scripts/build-windows-product.ps1 -Configuration debug`
+- 该脚本按 `nebula/gpui-shell` 构建 `pebrel.exe` 和 `pebrel-hook.exe`；`.cargo/config.toml` 将共享 target 固定到 `F:/ProjectsWork/pebrel-debug-daily-20261013/cargo-target`。不得中断正在此 target 中运行的 Cargo/linker。
+- Debug 产物位于 `cargo-target/debug/`：`pebrel.exe`、`pebrel.pdb`、`pebrel-hook.exe`、`pebrel_hook.pdb`。部署时将前两项放目标根目录，后两项放 `runtime/`。
+- WSL 标签修复的构建和交付目标是测试 bundle `F:/ProjectsWork/pebrel-debug-daily-20261013`：覆盖前将四个旧文件备份到 `F:/12704/temp-backups/yyyyMMdd/<task>/bundle/`，再复制构建产物并逐项比对 SHA256。`F:/Dev/Tools/Pebrel` 是用户的个人日用安装；除非用户本轮明确要求，否则不得备份、替换、重启或向它发送运行时命令。
+- 隔离 UI 验收使用单独 EXE 副本、独立 `APPDATA`/`PEBREL_CONFIG_DIR`，清除继承的 `PEBREL_`/`NEBULA_`/`WSL_`、`WSLENV`、`TERM_PROGRAM`，并核对进程可执行路径。`F:/ProjectsWork` 的 Low Integrity 标签会令进程无法启动 WSL；测试 bundle 和候选副本中的 `pebrel.exe` 需单独设为 Medium Integrity，不改整个目录标签。验收用假 Agent 检查 guest cwd 标签变化、cwd 跟随、其他标签不变及命令退出后的宿主 cwd 恢复；真实 Claude/Codex 会话不用于测试。
+
 ## 按需查阅
 
 - 应用与 UI：`nebula_app/AGENTS.md`；终端：`nebula_terminal/AGENTS.md`；设置：`nebula_settings/AGENTS.md`。
