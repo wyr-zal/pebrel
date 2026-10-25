@@ -79,6 +79,7 @@ impl WslCwdObserver {
     pub(super) fn accept_command_line(&mut self, value: &str) {
         self.command_candidate = command_line_contains_wsl(value);
         if !self.command_candidate {
+            self.invalidate();
             self.active = false;
             self.pending_title_changed |= self.clear_observed();
         }
@@ -296,11 +297,10 @@ fn valid_command_id(command_id: &str) -> bool {
 }
 
 fn command_line_contains_wsl(value: &str) -> bool {
-    let command = if let Some((_, after_newline)) = value.split_once('\n') {
-        after_newline
-    } else {
-        value
-    };
+    // PowerShell prefixes its text with the shell owner; Bash reports raw text.
+    let command = value.split_once('\n')
+        .filter(|(owner, _)| owner.starts_with("pwsh:"))
+        .map_or(value, |(_, command)| command);
     let executable =
         if let Some(quote) = command.chars().next().filter(|quote| matches!(quote, '\'' | '"')) {
             let rest = &command[quote.len_utf8()..];
@@ -326,12 +326,7 @@ impl TerminalView {
         {
             return;
         }
-        let Some(context) = self
-            .exec_context
-            .as_ref()
-            .filter(|context| context.wsl_distribution().is_none())
-            .cloned()
-        else {
+        let Some(context) = self.exec_context.as_ref().cloned() else {
             return;
         };
         let Some(ticket) = self.wsl_cwd_observer.begin_probe(now) else { return };
@@ -439,17 +434,17 @@ mod tests {
         let mut observer = WslCwdObserver::default();
         observer.prepare_submission(Some(boundary()));
         observer.accept_command_id("0123456789abcdef0123456789abcdef");
-        observer.accept_command_line("shell-token\nwsl.exe -d Ubuntu-22.04");
+        observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
         observer.start_command();
         assert!(observer.active);
 
         observer.prepare_submission(Some(boundary()));
         observer.accept_command_id("not-a-guid");
-        observer.accept_command_line("shell-token\nwsl.exe -d Ubuntu-22.04");
+        observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
         observer.start_command();
         assert!(!observer.active);
         observer.accept_command_id("0123456789abcdef0123456789abcdef");
-        observer.accept_command_line("shell-token\nGet-ChildItem");
+        observer.accept_command_line("pwsh:fixture\nGet-ChildItem");
         observer.start_command();
         assert!(!observer.active);
     }
@@ -468,11 +463,37 @@ mod tests {
     }
 
     #[test]
+    fn multiline_bash_command_keeps_its_first_line() {
+        assert!(command_line_contains_wsl("wsl.exe -d Ubuntu-22.04 \\\n  --cd /mnt/f/ProjectLearn"));
+        assert!(command_line_contains_wsl("pwsh:fixture\nwsl.exe -d Ubuntu-22.04"));
+        assert!(!command_line_contains_wsl("printf 'first\nwsl.exe -d Ubuntu-22.04'"));
+    }
+
+    #[test]
+    fn non_wsl_metadata_cancels_a_probe_started_after_the_command_id() {
+        let mut observer = WslCwdObserver::default();
+        observer.prepare_submission(Some(boundary()));
+        observer.accept_command_line("wsl.exe -d Ubuntu-22.04");
+        observer.accept_command_id("0123456789abcdef0123456789abcdef");
+        observer.start_command();
+        let now = Instant::now();
+        let ticket = observer.begin_probe(now).unwrap();
+
+        observer.accept_command_line("printf next");
+        assert!(ticket.cancelled.load(Ordering::Acquire));
+        assert!(!observer.complete_probe(
+            &ticket, WslLocationProbe::Found(location(20, 30, "/stale")), true, now,
+        ));
+        assert!(!observer.active);
+        assert!(observer.observed().is_none());
+    }
+
+    #[test]
     fn owner_change_clears_old_location_and_unavailable_same_owner_expires() {
         let mut observer = WslCwdObserver::default();
         observer.prepare_submission(Some(boundary()));
         observer.accept_command_id("0123456789abcdef0123456789abcdef");
-        observer.accept_command_line("shell-token\nwsl.exe -d Ubuntu-22.04");
+        observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
         observer.start_command();
         let now = Instant::now();
         assert!(observer.apply_probe(WslLocationProbe::Found(location(20, 30, "/one")), now));
@@ -491,14 +512,14 @@ mod tests {
         let mut observer = WslCwdObserver::default();
         observer.prepare_submission(Some(boundary()));
         observer.accept_command_id("0123456789abcdef0123456789abcdef");
-        observer.accept_command_line("shell-token\nwsl.exe -d Ubuntu-22.04");
+        observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
         observer.start_command();
         let now = Instant::now();
         let old_ticket = observer.begin_probe(now).unwrap();
 
         observer.prepare_submission(Some(boundary()));
         observer.accept_command_id("abcdef0123456789abcdef0123456789");
-        observer.accept_command_line("shell-token\nwsl.exe -d Ubuntu-22.04");
+        observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
         observer.start_command();
         assert!(old_ticket.cancelled.load(Ordering::Acquire));
         assert!(!observer.complete_probe(
@@ -527,7 +548,7 @@ mod tests {
         let mut observer = WslCwdObserver::default();
         observer.prepare_submission(Some(boundary()));
         observer.accept_command_id("0123456789abcdef0123456789abcdef");
-        observer.accept_command_line("shell-token\nwsl.exe -d Ubuntu-22.04");
+        observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
         observer.start_command();
         let now = Instant::now();
         observer.apply_probe(WslLocationProbe::Found(location(20, 30, "/one")), now);
@@ -543,7 +564,7 @@ mod tests {
         let mut observer = WslCwdObserver::default();
         observer.prepare_submission(Some(boundary()));
         observer.accept_command_id("0123456789abcdef0123456789abcdef");
-        observer.accept_command_line("shell-token\nwsl.exe -d Ubuntu-22.04");
+        observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
         observer.start_command();
         let now = Instant::now();
         let ticket = observer.begin_probe(now).unwrap();
@@ -563,7 +584,7 @@ mod tests {
         let mut observer = WslCwdObserver::default();
         observer.prepare_submission(Some(boundary()));
         observer.accept_command_id("0123456789abcdef0123456789abcdef");
-        observer.accept_command_line("shell-token\nwsl.exe -d Ubuntu-22.04");
+        observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
         observer.start_command();
         let launcher = ProcessStamp { pid: 20, start_time: 200 };
 
@@ -587,7 +608,7 @@ mod tests {
             let mut observer = WslCwdObserver::default();
             observer.prepare_submission(Some(boundary()));
             observer.accept_command_id("0123456789abcdef0123456789abcdef");
-            observer.accept_command_line("shell-token\nwsl.exe -d Ubuntu-22.04");
+            observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
             observer.start_command();
 
             for _ in 0..MAX_UNCERTAIN_MISSES {
@@ -604,7 +625,7 @@ mod tests {
         let mut observer = WslCwdObserver::default();
         observer.prepare_submission(Some(boundary()));
         observer.accept_command_id("0123456789abcdef0123456789abcdef");
-        observer.accept_command_line("shell-token\nwsl.exe -d Ubuntu-22.04");
+        observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
         observer.start_command();
         let now = Instant::now();
         observer.apply_probe(WslLocationProbe::Found(location(20, 30, "/one")), now);

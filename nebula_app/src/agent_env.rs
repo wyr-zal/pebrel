@@ -53,7 +53,7 @@ const LEGACY_BIN_DIR_ENV: &str = "NEBULA_BIN_DIR";
 /// 当前 Pebrel 进程的 PID。和 pane id 一起构成进程归属，避免两个同时运行的
 /// Pebrel 实例各自的 pane 1 被身份探测混在一起；数字值可原样穿过 WSL。
 pub const PROCESS_ENV: &str = "PEBREL_PROCESS_ID";
-/// Random id for the currently submitted PowerShell command, forwarded only to WSL.
+/// Random id for the current command, forwarded across both WSL boundaries.
 pub const COMMAND_ID_ENV: &str = "PEBREL_COMMAND_ID";
 
 const TERM_PROGRAM_ENV: &str = "TERM_PROGRAM";
@@ -181,7 +181,10 @@ const WSLENV_ENTRIES: &[&str] = &[
     "PEBREL_BIN_DIR/p",
     "PEBREL_HOOK_EXE/p",
     PROCESS_ENV,
-    "PEBREL_COMMAND_ID/u",
+    // 裸条目（无 `/u`、`/w`）是唯一能双向保值的写法：实测 WSL 会整条丢弃
+    // `u`+`w` 组合标志的变量，而 `/u` 单程在“来宾 → wsl.exe → 来宾”这一圈里
+    // 拿不到值。命令 ID 必须走完整一圈：pane 里的 Agent 要能带它进嵌套来宾。
+    COMMAND_ID_ENV,
     crate::runtime_api::ENDPOINT_ENV,
     "NEBULA_CLI/p",
     "NEBULA_BIN_DIR/p",
@@ -206,7 +209,14 @@ fn merge_wslenv(env: &mut HashMap<String, String>) {
         // 只按变量名判重：宿主若已用别的标志位传同一个变量，尊重它的选择，
         // 不去覆盖成我们的标志。
         let name = variable_name(entry);
-        if !entries.iter().any(|existing| variable_name(existing) == name) {
+        if name == COMMAND_ID_ENV {
+            // A command in a WSL pane can launch another `wsl.exe`; the token
+            // must travel WSL -> Windows -> WSL for that process to retain its
+            // command ownership. Only the bare entry survives that round trip,
+            // so rewrite anything already there (`/u` one-way, `/uw` dropped).
+            entries.retain(|existing| variable_name(existing) != name);
+            entries.push((*entry).to_owned());
+        } else if !entries.iter().any(|existing| variable_name(existing) == name) {
             entries.push((*entry).to_owned());
         }
     }
@@ -383,6 +393,25 @@ mod tests {
             let once = env.get("WSLENV").cloned().expect("WSLENV");
             apply(&mut env, 4);
             assert_eq!(env.get("WSLENV"), Some(&once));
+        }
+
+        #[test]
+        fn command_id_forwarding_is_bidirectional_for_nested_wsl() {
+            for legacy in ["PEBREL_COMMAND_ID/u", "PEBREL_COMMAND_ID/uw", "PEBREL_COMMAND_ID"] {
+                let mut env = HashMap::from([(
+                    "WSLENV".to_owned(),
+                    format!("KEEP/p:{legacy}"),
+                )]);
+                apply(&mut env, 5);
+
+                let entries: Vec<_> = env["WSLENV"]
+                    .split(':')
+                    .filter(|entry| variable_name(entry) == COMMAND_ID_ENV)
+                    .collect();
+                // 只有裸条目能穿过 来宾 → wsl.exe → 来宾；带标志位会被丢弃。
+                assert_eq!(entries, ["PEBREL_COMMAND_ID"], "legacy: {legacy}");
+                assert!(env["WSLENV"].split(':').any(|entry| entry == "KEEP/p"));
+            }
         }
 
         #[test]

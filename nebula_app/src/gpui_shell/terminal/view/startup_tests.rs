@@ -744,7 +744,7 @@ fn accepted_wsl_probe_updates_the_tab_label_and_emits_a_title_change(
         };
         view.wsl_cwd_observer.prepare_submission(Some(boundary));
         view.wsl_cwd_observer.accept_command_id("0123456789abcdef0123456789abcdef");
-        view.wsl_cwd_observer.accept_command_line("shell-token\nwsl.exe -d Ubuntu-22.04");
+        view.wsl_cwd_observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
         view.wsl_cwd_observer.start_command();
         let ticket = view.wsl_cwd_observer.begin_probe(Instant::now()).unwrap();
         let location = ObservedWslLocation {

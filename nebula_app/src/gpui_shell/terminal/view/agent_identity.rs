@@ -45,7 +45,9 @@ fn shell_reports_command_identity(program: Option<&str>) -> bool {
             .file_stem()
             .and_then(|stem| stem.to_str())
             .is_some_and(|stem| {
-                stem.eq_ignore_ascii_case("powershell") || stem.eq_ignore_ascii_case("pwsh")
+                stem.eq_ignore_ascii_case("powershell")
+                    || stem.eq_ignore_ascii_case("pwsh")
+                    || stem.eq_ignore_ascii_case("wsl")
             })
     })
 }
@@ -65,15 +67,11 @@ impl TerminalView {
     /// Called only for a shell submission, before any bytes reach the PTY.
     #[cfg(windows)]
     pub(super) fn capture_native_command_boundary(&mut self) {
-        let wsl_boundary = if self.suggest.suggest_env.is_this_machine()
-            && self.ssh_destination.is_none()
+        let wsl_boundary = if self.ssh_destination.is_none()
             && self
                 .exec_context
                 .as_ref()
-                .is_some_and(|context| {
-                    context.wsl_distribution().is_none()
-                        && shell_reports_command_identity(context.shell_program())
-                })
+                .is_some_and(|context| shell_reports_command_identity(context.shell_program()))
         {
             self.session.as_ref().and_then(|session| {
                 (session.shell_pid != 0)
@@ -572,11 +570,12 @@ mod proof_contract_tests {
 
     #[cfg(windows)]
     #[test]
-    fn command_boundary_capture_is_limited_to_integrated_powershell_shells() {
+    fn command_boundary_capture_requires_a_supported_local_shell() {
         assert!(super::shell_reports_command_identity(None), "the Windows default is PowerShell");
         assert!(super::shell_reports_command_identity(Some(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")));
         assert!(super::shell_reports_command_identity(Some(r"C:\Program Files\PowerShell\7\pwsh.exe")));
-        for unsupported in ["bash.exe", "wsl.exe", "cmd.exe", "nu.exe"] {
+        assert!(super::shell_reports_command_identity(Some(r"C:\Windows\System32\wsl.exe")));
+        for unsupported in ["bash.exe", "cmd.exe", "nu.exe"] {
             assert!(!super::shell_reports_command_identity(Some(unsupported)), "{unsupported}");
         }
     }

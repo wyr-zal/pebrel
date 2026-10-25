@@ -848,8 +848,8 @@ pub fn wsl_unc_cwd(located: &WslCwd) -> Option<std::path::PathBuf> {
 /// `PROMPT_COMMAND` 为空）。
 ///
 /// 尽力而为、失败无害：来宾默认 shell 是 zsh/fish（不认 `PROMPT_COMMAND`），
-/// 或用户自己在 rc 里直接赋值把它覆盖掉，都只是回到"不上报"的现状，不会影响
-/// shell 正常启动。
+/// 用户自己覆盖 `PROMPT_COMMAND`，或 Bash 已有 DEBUG trap（不会覆盖用户 trap），
+/// 都只会让命令身份不上报，不影响 shell 正常启动。
 pub fn wsl_cwd_report_env(
     program: &str,
     _args: &[String],
@@ -858,12 +858,42 @@ pub fn wsl_cwd_report_env(
     if !is_wsl_launcher(program) {
         return Vec::new();
     }
-    // 用 `$PWD` 而不是 `$(pwd)`，整个 PROMPT_COMMAND 只有变量赋值与一个
-    // builtin printf；身份只在首个提示符编码一次。初始提示符多发的 D 无害，
-    // Runtime submit barrier 会拒绝把它错配给尚未真正提交的新命令。
-    const REPORT: &str = r#"__nebula_status=$?; if [ -z "${__pebrel_shell_token:-}" ]; then __pebrel_shell_token=$(printf '%s' "wsl|${WSL_DISTRO_NAME:-}|bash:${HOSTNAME:-wsl}:${BASHPID:-$$}:$RANDOM" | base64 | tr -d '\r\n');
-__PEBREL_CONNECTION_HOOK__
-fi; printf '\033]1337;SetUserVar=pebrel_shell=%s\007' "$__pebrel_shell_token"; if typeset -f __pebrel_editor_ready_report >/dev/null; then __pebrel_editor_ready_report; fi; printf '\033]133;D;%s\007\033]7;file://%s%s\007\033]133;A\007' "$__nebula_status" "${HOSTNAME:-wsl}" "$PWD""#;
+    // `$PROMPT_COMMAND` runs before each prompt. Give commands started from a WSL
+    // pane a fresh identity, then report each simple command before execution.
+    const REPORT: &str = r#"__nebula_status=$?
+if [ -z "${__pebrel_shell_token:-}" ]; then
+    __pebrel_shell_token=$(printf '%s' "wsl|${WSL_DISTRO_NAME:-}|bash:${HOSTNAME:-wsl}:${BASHPID:-$$}:$RANDOM" | base64 | tr -d '\r\n')
+    __PEBREL_CONNECTION_HOOK__
+fi
+IFS= read -r __pebrel_command_id < /proc/sys/kernel/random/uuid || __pebrel_command_id=
+__pebrel_command_id=${__pebrel_command_id//-/}
+if [[ ! $__pebrel_command_id =~ ^[[:xdigit:]]{32}$ ]]; then
+    printf -v __pebrel_command_id '%08x%08x%08x%08x' "${BASHPID:-$$}" "$SECONDS" "$RANDOM" "$RANDOM"
+fi
+export PEBREL_COMMAND_ID="$__pebrel_command_id"
+if [ "${__pebrel_preexec_installed:-}" != 1 ] && [ -z "$(trap -p DEBUG)" ]; then
+    __pebrel_preexec_installed=1
+    __pebrel_at_prompt=0
+    __pebrel_preexec() {
+        local __pebrel_command=${1-} __pebrel_id64 __pebrel_command64
+        if [[ $__pebrel_command == '__nebula_status=$?' ]]; then
+            __pebrel_at_prompt=0
+            return 0
+        fi
+        [[ ${__pebrel_at_prompt:-0} == 1 ]] || return 0
+        [[ -t 1 && ${PEBREL_COMMAND_ID:-} =~ ^[[:xdigit:]]{32}$ ]] || return 0
+        __pebrel_id64=$(printf '%s' "$PEBREL_COMMAND_ID" | command base64 | command tr -d '\r\n') || return 0
+        __pebrel_command64=$(printf '%s' "$__pebrel_command" | command base64 | command tr -d '\r\n') || return 0
+        # The terminal parser caps one OSC payload at 4096 bytes.
+        if [[ ${#__pebrel_command64} -gt 3000 ]]; then __pebrel_command64=; fi
+        printf '\033]1337;SetUserVar=pebrel_command_id=%s\007\033]1337;SetUserVar=pebrel_command=%s\007\033]133;C\007' "$__pebrel_id64" "$__pebrel_command64"
+    }
+    trap '__pebrel_preexec "$BASH_COMMAND"' DEBUG
+fi
+printf '\033]1337;SetUserVar=pebrel_shell=%s\007' "$__pebrel_shell_token"
+if typeset -f __pebrel_editor_ready_report >/dev/null; then __pebrel_editor_ready_report; fi
+printf '\033]133;D;%s\007\033]7;file://%s%s\007\033]133;A\007' "$__nebula_status" "${HOSTNAME:-wsl}" "$PWD"
+__pebrel_at_prompt=1"#;
     // 宿主侧可能已经有 WSLENV（别的工具设的），必须追加而不是覆盖。
     let mut wslenv = current_wslenv
         .map(str::to_owned)
@@ -1366,6 +1396,10 @@ mod tests {
         assert!(prompt_command.contains("]133;D;%s"));
         assert!(prompt_command.contains("]7;file://%s%s"));
         assert!(prompt_command.contains("]133;A"));
+        assert!(prompt_command.contains("PEBREL_COMMAND_ID"));
+        assert!(prompt_command.contains("pebrel_command_id=%s"));
+        assert!(prompt_command.contains("pebrel_command=%s"));
+        assert!(prompt_command.contains("trap '__pebrel_preexec \"$BASH_COMMAND\"' DEBUG"));
         assert!(!prompt_command.contains('\r'));
     }
 
@@ -1404,8 +1438,12 @@ typeset -f __pebrel_connection >/dev/null || exit 92
 typeset -f ssh >/dev/null || exit 93
 token=$__pebrel_shell_token
 test -n "$token" || exit 94
+first_command_id=$PEBREL_COMMAND_ID
+[[ $first_command_id =~ ^[[:xdigit:]]{{32}}$ ]] || exit 98
 (exit 23); eval "$PROMPT_COMMAND" || exit 95
 test "$token" = "$__pebrel_shell_token" || exit 96
+[[ $PEBREL_COMMAND_ID =~ ^[[:xdigit:]]{{32}}$ ]] || exit 99
+test "$first_command_id" != "$PEBREL_COMMAND_ID" || exit 100
 {user_check}
 "#
             );
@@ -1427,7 +1465,13 @@ test "$token" = "$__pebrel_shell_token" || exit 96
 
         for user_function in ["", "ssh() { return 42; }"] {
             let output = run(prompt, user_function);
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "exit={:?}, stdout={}, stderr={}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             assert!(output.stderr.is_empty(), "{}", String::from_utf8_lossy(&output.stderr));
             let stdout = String::from_utf8(output.stdout).unwrap();
             for marker in

@@ -372,7 +372,7 @@ fn location_probe_returns_only_the_selected_agent_cwd() {
     let snapshot = format!(
         "S\t100\t1\nP\t200\t100\tclaude\tclaude\t--resume\nD\t200\t2000\t{cwd}\nM\t100\t1\t1000\t34823\t100\t200\nM\t200\t100\t2000\t34823\t200\t200\nE\n"
     );
-    let parsed = parse_probe_snapshot(&snapshot).expect("valid location snapshot");
+    let parsed = parse_probe_snapshot(&snapshot, false).expect("valid location snapshot");
     assert_eq!(
         parsed,
         (
@@ -388,10 +388,10 @@ fn location_probe_returns_only_the_selected_agent_cwd() {
     );
 
     let wrong_owner = snapshot.replace("D\t200\t2000\t", "D\t201\t2000\t");
-    assert_eq!(parse_probe_snapshot(&wrong_owner).unwrap().1, None);
+    assert_eq!(parse_probe_snapshot(&wrong_owner, false).unwrap().1, None);
 
     let reused_pid = snapshot.replace("M\t200\t100\t2000\t", "M\t200\t100\t2001\t");
-    let (probe, cwd) = parse_probe_snapshot(&reused_pid).expect("reused process snapshot parses");
+    let (probe, cwd) = parse_probe_snapshot(&reused_pid, false).expect("reused process snapshot parses");
     let AgentProbe::Found(agent) = probe else { panic!("foreground Agent identity remains observable") };
     assert_eq!(agent.process, ProcessStamp { pid: 200, start_time: 2001 });
     assert!(cwd.is_none(), "cwd from the old PID instance must not be reused");
@@ -416,8 +416,8 @@ fn expired_location_probe_deadline_returns_unavailable_without_starting_a_child(
 
 #[test]
 fn command_token_without_a_matching_guest_process_is_a_complete_no_agent_result() {
-    assert_eq!(parse_probe_snapshot("N\nE\n"), Some((AgentProbe::NoAgent, None)));
-    assert_eq!(parse_probe_snapshot("N\nS\t100\t1\nE\n"), None);
+    assert_eq!(parse_probe_snapshot("N\nE\n", false), Some((AgentProbe::NoAgent, None)));
+    assert_eq!(parse_probe_snapshot("N\nS\t100\t1\nE\n", false), None);
 }
 
 #[test]
@@ -484,4 +484,67 @@ fn execed_root_does_not_relax_owner_uniqueness() {
     assert_eq!(parse_probe(two_roots), AgentProbe::Unavailable);
     let fake_root = "S\t100\t1\nM\t100\t1\t1000\t34823\t100\t200\nR\t200\t100\nP\t200\t100\tcodex\tcodex\t\nM\t200\t100\t2000\t34823\t200\t200\nE\n";
     assert_eq!(parse_probe(fake_root), AgentProbe::Unavailable);
+}
+
+/// WSL pane 里的嵌套 `wsl.exe`：同一个命令 ID 同时覆盖客侧的 interop 启动器
+/// 和它新开的来宾会话，所以合法观测天然带两个 root。宿主 pane 的严格规则不变。
+#[test]
+fn wsl_pane_observation_accepts_the_interop_launcher_and_the_new_session() {
+    use base64::Engine as _;
+    let launcher_cwd = base64::engine::general_purpose::STANDARD.encode("/mnt/e/ProjectOrder/VoiceRecite");
+    let agent_cwd = base64::engine::general_purpose::STANDARD.encode("/mnt/f/ProjectLearn");
+    let snapshot = format!(
+        "U\t58624\t0\nR\t224513\t224075\nP\t224513\t224075\twsl.exe\t/init\t/mnt/c/Windows/System32/wsl.exe\nD\t224513\t489144\t{launcher_cwd}\nM\t224513\t224075\t489144\t34820\t224513\t224513\nR\t224516\t224515\nP\t224516\t224515\tpython3\tcodex\t/tmp/codex.js\nD\t224516\t489163\t{agent_cwd}\nM\t224516\t224515\t489163\t34821\t224516\t224516\nU\t58624\t0\nE\n"
+    );
+
+    assert_eq!(
+        parse_probe_snapshot(&snapshot, true),
+        Some((
+            AgentProbe::Found(ForegroundAgent {
+                kind: AgentKind::Codex,
+                process: ProcessStamp { pid: 224516, start_time: 489163 },
+                shell: ProcessStamp { pid: 224516, start_time: 489163 },
+                tty_nr: 34821,
+                process_group: 224516,
+            }),
+            Some("/mnt/f/ProjectLearn".into()),
+        ))
+    );
+    assert_eq!(
+        parse_probe_snapshot(&snapshot, false),
+        None,
+        "宿主 pane 的单会话规则不能被放宽"
+    );
+    let unrelated_root = snapshot.replace("wsl.exe\t/init\t", "python3\t/init\t");
+    assert_eq!(parse_probe_snapshot(&unrelated_root, true), None);
+}
+
+/// 放宽 root 数量不等于接受歧义：两个会话各有一个 Agent 仍然必须拒绝。
+#[test]
+fn wsl_pane_observation_still_rejects_two_foreground_agents() {
+    let two_agents = "R\t200\t1\nP\t200\t1\tcodex\tcodex\t\nM\t200\t1\t2000\t34823\t200\t200\nR\t300\t1\nP\t300\t1\tclaude\tclaude\t\nM\t300\t1\t3000\t34824\t300\t300\nE\n";
+    assert_eq!(parse_probe_snapshot(two_agents, true), None);
+
+    let shared_tty = "R\t200\t100\nP\t200\t100\tcodex\tcodex\t\nM\t200\t100\t2000\t34823\t200\t200\nR\t300\t100\nP\t300\t100\tclaude\tclaude\t\nM\t300\t100\t3000\t34823\t300\t300\nE\n";
+    assert_eq!(parse_probe_snapshot(shared_tty, true), None, "一个 tty 只能有一个 root");
+
+    let different_depths = "R\t200\t1\nP\t200\t1\tcodex\tcodex\t\nM\t200\t1\t2000\t34823\t200\t200\nS\t300\t1\nM\t300\t1\t3000\t34824\t300\t310\nP\t310\t300\tclaude\tclaude\t\nM\t310\t300\t3100\t34824\t310\t310\nE\n";
+    assert_eq!(parse_probe_snapshot(different_depths, true), None);
+    assert_eq!(parse_probe(different_depths), AgentProbe::Unavailable);
+}
+
+#[test]
+fn nested_wsl_location_keeps_the_guest_shell_anchor() {
+    let snapshot = "R\t100\t1\nP\t100\t1\twsl.exe\t/init\t/mnt/c/Windows/System32/wsl.exe\nM\t100\t1\t1000\t34820\t100\t100\nS\t200\t1\nM\t200\t1\t2000\t34821\t200\t300\nP\t300\t200\tcodex\tcodex\t\nM\t300\t200\t3000\t34821\t300\t300\nE\n";
+    assert_eq!(
+        parse_probe_snapshot(snapshot, true),
+        Some((AgentProbe::Found(ForegroundAgent {
+            kind: AgentKind::Codex,
+            process: ProcessStamp { pid: 300, start_time: 3000 },
+            shell: ProcessStamp { pid: 200, start_time: 2000 },
+            tty_nr: 34821,
+            process_group: 300,
+        }), None))
+    );
+    assert_eq!(parse_probe_snapshot(snapshot, false), None);
 }

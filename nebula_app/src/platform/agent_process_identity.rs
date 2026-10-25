@@ -482,7 +482,8 @@ fn probe_foreground_agent_snapshot(
     else {
         return (AgentProbe::Unavailable, None);
     };
-    let Some((result, cwd)) = parse_probe_snapshot(&output) else {
+    let nested_wsl_command = context.is_wsl_pane() && context.command_id().is_some();
+    let Some((result, cwd)) = parse_probe_snapshot(&output, nested_wsl_command) else {
         return (AgentProbe::Unavailable, None);
     };
     let AgentProbe::Found(ref agent) = result else { return (result, None) };
@@ -722,12 +723,13 @@ fn resolve_process_records(output: &str) -> Option<AgentKind> {
 }
 
 fn parse_probe(output: &str) -> AgentProbe {
-    parse_probe_snapshot(output)
+    parse_probe_snapshot(output, false)
         .map(|(probe, _)| probe)
         .unwrap_or(AgentProbe::Unavailable)
 }
 
-fn parse_probe_snapshot(output: &str) -> Option<(AgentProbe, Option<String>)> {
+/// Only a command-scoped WSL scan may contain the interop launcher's extra TTY.
+fn parse_probe_snapshot(output: &str, nested_wsl_command: bool) -> Option<(AgentProbe, Option<String>)> {
     if output.len() > MAX_PROBE_OUTPUT || !output.ends_with("E\n") {
         return None;
     }
@@ -806,7 +808,7 @@ fn parse_probe_snapshot(output: &str) -> Option<(AgentProbe, Option<String>)> {
         }
         return None;
     }
-    let (shells, processes, roots) = parse_records(&records).ok()?;
+    let (mut shells, mut processes, mut roots) = parse_records(&records).ok()?;
     if shells.is_empty()
         || shells
             .iter()
@@ -825,18 +827,38 @@ fn parse_probe_snapshot(output: &str) -> Option<(AgentProbe, Option<String>)> {
     }) {
         return None;
     }
+    if nested_wsl_command {
+        let interop_roots: Vec<_> = roots.iter().copied().filter(|pid| {
+            processes.get(pid).is_some_and(|process| {
+                process.executable == "wsl.exe"
+                    && process.argv0 == "/init"
+                    && crate::shell_detect::is_wsl_launcher(&process.argv1)
+            })
+        }).collect();
+        if interop_roots.len() > 1 { return None; }
+        // Exclude only the command-owned WSL bridge, then keep the original
+        // single-session checks for the guest. Other roots remain ambiguous.
+        for pid in interop_roots {
+            let launcher = kernel.get(&pid)?;
+            if launcher.tty_nr == 0 || i64::from(launcher.group) != launcher.foreground
+                || kernel.get(&launcher.ppid).is_some_and(|parent| parent.tty_nr == launcher.tty_nr)
+            { return None; }
+            roots.remove(&pid);
+            shells.remove(&pid);
+            processes.remove(&pid);
+        }
+        let guest_ttys: HashSet<_> = shells.keys().filter_map(|pid| kernel.get(pid))
+            .filter(|record| record.tty_nr != 0).map(|record| record.tty_nr).collect();
+        if guest_ttys.len() > 1 { return None; }
+    }
     if let Some(root) = roots.iter().next() {
         let anchor = kernel.get(root)?;
         if roots.len() != 1
             || anchor.tty_nr == 0
             || kernel.get(&anchor.ppid).is_some_and(|parent| parent.tty_nr == anchor.tty_nr)
-            || shells
-                .keys()
-                .filter_map(|pid| kernel.get(pid))
+            || shells.keys().filter_map(|pid| kernel.get(pid))
                 .any(|other| other.tty_nr != 0 && other.tty_nr != anchor.tty_nr)
-        {
-            return None;
-        }
+        { return None; }
     }
     let Some((kind, pid, shell)) = resolve_owner(&shells, &processes, &roots).ok()? else {
         // Missing the foreground group is an incomplete observation, not absence.

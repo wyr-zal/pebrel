@@ -78,6 +78,18 @@ pub(crate) fn probe(
     if cancelled() {
         return WslLocationProbe::Unavailable { launcher: None };
     }
+    if let Some(distribution) = host_context.wsl_distribution() {
+        return probe_from_wsl_pane(
+            shell_pid,
+            pane_id,
+            boundary,
+            host_context,
+            distribution,
+            command_id,
+            deadline,
+            cancelled,
+        );
+    }
     let launcher = match select_launcher(shell_pid, boundary) {
         LauncherSelection::One(launcher) => {
             crate::logging::debug_log("wsl_location stage=launcher outcome=selected");
@@ -167,6 +179,53 @@ pub(crate) fn probe(
             WslLocationProbe::Unavailable { launcher: Some(launcher.stamp) }
         },
     }
+}
+
+fn probe_from_wsl_pane(
+    shell_pid: u32,
+    pane_id: u64,
+    boundary: &NativeLaunchBoundary,
+    context: &crate::runtime_exec::PaneExecContext,
+    distribution: Option<&str>,
+    command_id: &str,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> WslLocationProbe {
+    // Probe only the pane's captured distribution. A nested command targeting
+    // another distro fails closed instead of reusing a same-token process here.
+    let owner = boundary.shell;
+    if shell_pid != owner.pid || !native_shell_is_current(owner) {
+        return WslLocationProbe::Unavailable { launcher: Some(owner) };
+    }
+    let command_context = context.with_command_id(command_id);
+    let result = crate::platform::agent_process_identity::probe_foreground_agent_location(
+        pane_id,
+        &command_context,
+        deadline,
+        cancelled,
+    );
+    if cancelled() || Instant::now() >= deadline || !native_shell_is_current(owner) {
+        return WslLocationProbe::Unavailable { launcher: Some(owner) };
+    }
+    match result {
+        ForegroundAgentLocationProbe::Found(agent, cwd) => {
+            WslLocationProbe::Found(ObservedWslLocation {
+                distro: distribution.unwrap_or("WSL").to_owned(),
+                user: context.wsl_user().map(str::to_owned),
+                cwd,
+                launcher: owner,
+                agent,
+            })
+        },
+        ForegroundAgentLocationProbe::NoAgent => WslLocationProbe::NoAgent { launcher: owner },
+        ForegroundAgentLocationProbe::Unavailable => {
+            WslLocationProbe::Unavailable { launcher: Some(owner) }
+        },
+    }
+}
+
+fn native_shell_is_current(expected: ProcessStamp) -> bool {
+    NativeProcessIdentity::open(expected.pid).is_some_and(|process| process.stamp() == expected)
 }
 
 fn select_launcher(shell_pid: u32, boundary: &NativeLaunchBoundary) -> LauncherSelection {

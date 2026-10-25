@@ -76,6 +76,14 @@ impl PaneExecContext {
         }
     }
 
+    /// pane 自身就是 WSL 程序，而不是宿主 shell 里的一次 WSL 分支。
+    ///
+    /// 两者在来宾进程树里长得不一样：WSL pane 的命令会在客侧同时留下
+    /// interop 启动器和它新开的会话，所以身份解析必须按这个区别放宽。
+    pub(crate) fn is_wsl_pane(&self) -> bool {
+        self.shell_program.as_deref().is_some_and(is_wsl_program)
+    }
+
     pub(crate) fn for_wsl_distribution(&self, name: &str) -> Option<Self> {
         let mut context = self.clone();
         let ExecLocation::Wsl { distro, .. } = &mut context.location else { return None };
@@ -97,6 +105,11 @@ impl PaneExecContext {
             distro: Some(distro.to_owned()),
             user: user.map(str::to_owned),
         };
+        context.with_command_id(command_id)
+    }
+
+    pub(crate) fn with_command_id(&self, command_id: &str) -> Self {
+        let mut context = self.clone();
         context.env.insert(crate::agent_env::COMMAND_ID_ENV.into(), command_id.to_owned());
         context
     }
@@ -470,6 +483,22 @@ mod tests {
         assert_eq!(observed.wsl_distribution(), Some(Some("Ubuntu-22.04")));
         assert_eq!(observed.command_id(), Some(command_id.as_str()));
         assert_eq!(host.command_id(), None);
+    }
+
+    #[test]
+    fn command_id_can_be_added_without_changing_the_wsl_pane_scope() {
+        let mut options = nebula_terminal::tty::Options::default();
+        options.shell = Some(nebula_terminal::tty::Shell::new(
+            "wsl.exe".into(),
+            vec!["--distribution".into(), "Ubuntu-22.04".into()],
+        ));
+        let pane = PaneExecContext::from_pty_options(&options);
+        let command_id = "0123456789abcdef0123456789abcdef";
+        let command = pane.with_command_id(command_id);
+
+        assert_eq!(command.wsl_distribution(), Some(Some("Ubuntu-22.04")));
+        assert_eq!(command.command_id(), Some(command_id));
+        assert_eq!(pane.command_id(), None);
     }
 
     /// 启动目录和直接执行参数是不同的解析边界。
