@@ -158,6 +158,13 @@ impl TerminalView {
                 cx.emit(TerminalViewEvent::SessionIdentityChanged);
             }
         }
+        if self.retire_probe_session_for_identity(Some(&event.source), true) {
+            cx.emit(TerminalViewEvent::SessionIdentityChanged);
+        }
+        #[cfg(windows)]
+        self.wsl_cwd_observer.suppress_identity_until_next_command();
+        #[cfg(windows)]
+        self.revoke_wsl_agent_identity(false);
 
         // Only the owner may publish answers or replace the resumable identity.
         if self.ssh_destination.is_none()

@@ -3,6 +3,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 #[cfg(windows)]
+use std::sync::Weak;
+#[cfg(windows)]
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -10,6 +12,13 @@ use gpui::{Context, EventEmitter as _};
 
 use super::{TerminalView, TerminalViewEvent};
 use crate::platform::agent_process_identity::{self, AgentProbe, AgentRecheck, ForegroundAgent};
+#[cfg(windows)]
+use super::wsl_cwd_observer::WslIdentityScope;
+
+#[cfg(windows)]
+type WslPty = nebula_terminal::sync::FairMutex<
+    nebula_terminal::Term<super::session::EventProxy>,
+>;
 
 const PROBE_INTERVAL: Duration = Duration::from_secs(2);
 const RECHECK_INTERVAL: Duration = Duration::from_secs(5);
@@ -18,6 +27,16 @@ const MAX_IDLE_INTERVAL: Duration = Duration::from_secs(30);
 enum ProbeOutcome {
     Discovery(AgentProbe),
     Recheck(AgentRecheck),
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub(super) struct WslIdentityOverride {
+    pub(super) scope: WslIdentityScope,
+    pub(super) receipt: ForegroundAgent,
+    pub(super) pty: Weak<WslPty>,
+    pub(super) shell_pid: u32,
+    pub(super) base_program: Option<String>,
 }
 
 fn probe_interval(receipt: bool, misses: u8, wake: bool) -> Duration {
@@ -66,7 +85,8 @@ fn additional_binding_is_current(
 impl TerminalView {
     /// Called only for a shell submission, before any bytes reach the PTY.
     #[cfg(windows)]
-    pub(super) fn capture_native_command_boundary(&mut self) {
+    pub(super) fn capture_native_command_boundary(&mut self) -> bool {
+        let identity_changed = self.revoke_wsl_agent_identity(true);
         let wsl_boundary = if self.ssh_destination.is_none()
             && self
                 .exec_context
@@ -83,6 +103,157 @@ impl TerminalView {
         };
         self.wsl_cwd_observer.prepare_submission(wsl_boundary);
         self.capture_native_recovery_boundary();
+        identity_changed
+    }
+
+    #[cfg(windows)]
+    fn current_wsl_identity_binding(&self) -> Option<(WslIdentityScope, Weak<WslPty>, u32)> {
+        let scope = self.wsl_cwd_observer.identity_scope()?;
+        let session = self.session.as_ref()?;
+        if session.shell_pid == 0 || session.shell_pid != scope.boundary.shell.pid {
+            return None;
+        }
+        Some((scope, Arc::downgrade(&session.term), session.shell_pid))
+    }
+
+    #[cfg(windows)]
+    pub(super) fn wsl_identity_override_is_current(&self) -> bool {
+        let Some(owner) = &self.wsl_identity_override else { return false };
+        self.current_wsl_identity_binding().is_some_and(|(scope, pty, shell_pid)| {
+            owner.scope == scope
+                && Weak::ptr_eq(&owner.pty, &pty)
+                && owner.shell_pid == shell_pid
+        })
+    }
+
+    #[cfg(windows)]
+    pub(super) fn sync_wsl_agent_identity(&mut self) -> bool {
+        if self.agent_activity.hook_seen() {
+            return self.revoke_wsl_agent_identity(false);
+        }
+        let Some(location) = self.wsl_cwd_observer.observed().cloned() else {
+            let had_owner = self.wsl_identity_override.is_some();
+            let changed = self.revoke_wsl_agent_identity(true);
+            if had_owner {
+                self.retire_probe_session_for_identity(None, false);
+            }
+            return changed;
+        };
+        let Some((scope, pty, shell_pid)) = self.current_wsl_identity_binding() else {
+            let had_owner = self.wsl_identity_override.is_some();
+            let changed = self.revoke_wsl_agent_identity(true);
+            if had_owner {
+                self.retire_probe_session_for_identity(None, false);
+            }
+            return changed;
+        };
+
+        if let Some(owner) = self.wsl_identity_override.clone() {
+            if owner.scope == scope
+                && Weak::ptr_eq(&owner.pty, &pty)
+                && owner.shell_pid == shell_pid
+            {
+                if !self.agent_identity_receipt.as_ref().is_some_and(|receipt| receipt == &owner.receipt)
+                    || self.running_program.as_deref() != Some(owner.receipt.kind.slug())
+                {
+                    self.wsl_identity_override = None;
+                    return false;
+                }
+                if owner.receipt == location.agent {
+                    self.retire_probe_session_for_identity(
+                        Some(owner.receipt.kind.slug()),
+                        false,
+                    );
+                    return false;
+                }
+                if let Some(current) = &mut self.wsl_identity_override {
+                    current.receipt = location.agent.clone();
+                }
+                return self.publish_agent_identity_receipt(location.agent, false);
+            }
+            self.revoke_wsl_agent_identity(true);
+        }
+
+        // Cancel and epoch out any native Windows probe before a Linux PID can
+        // become the shared foreground receipt for this pane.
+        let base_program = self.running_program.clone();
+        self.invalidate_agent_identity_probe();
+        self.invalidate_ai_session_probe();
+        self.publish_agent_identity_receipt(location.agent.clone(), false);
+        self.wsl_identity_override = Some(WslIdentityOverride {
+            scope,
+            receipt: location.agent,
+            pty,
+            shell_pid,
+            base_program,
+        });
+        true
+    }
+
+    #[cfg(windows)]
+    pub(super) fn sync_wsl_agent_identity_with_context(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let previous_session = self.ai_session.clone();
+        let changed = self.sync_wsl_agent_identity();
+        let session_changed = previous_session != self.ai_session;
+        if session_changed {
+            cx.emit(TerminalViewEvent::SessionIdentityChanged);
+        }
+        changed || session_changed
+    }
+
+    #[cfg(windows)]
+    pub(super) fn revoke_wsl_agent_identity(&mut self, restore_base: bool) -> bool {
+        let Some(owner) = self.wsl_identity_override.take() else { return false };
+        let receipt_owned = self.agent_identity_receipt.as_ref() == Some(&owner.receipt);
+        let program_owned = self.running_program.as_deref() == Some(owner.receipt.kind.slug());
+        if receipt_owned {
+            self.agent_identity_receipt = None;
+        }
+        if !self.agent_activity.hook_seen() && receipt_owned {
+            self.agent_activity.forget_unhooked_identity();
+        }
+        if restore_base && !self.agent_activity.hook_seen() && receipt_owned && program_owned {
+            self.running_program = owner.base_program;
+            return true;
+        }
+        receipt_owned
+    }
+
+    fn publish_agent_identity_receipt(
+        &mut self,
+        receipt: ForegroundAgent,
+        preserve_matching_probe_session: bool,
+    ) -> bool {
+        let program = receipt.kind.slug().to_owned();
+        let changed = self.running_program.as_deref() != Some(program.as_str())
+            || self.agent_identity_receipt.as_ref() != Some(&receipt);
+        self.retire_probe_session_for_identity(Some(&program), preserve_matching_probe_session);
+        self.running_program = Some(program);
+        self.agent_identity_receipt = Some(receipt);
+        self.agent_identity_probe_misses = 0;
+        self.agent_activity.identify_foreground_process();
+        changed
+    }
+
+    pub(super) fn retire_probe_session_for_identity(
+        &mut self,
+        source: Option<&str>,
+        preserve_matching: bool,
+    ) -> bool {
+        if !self.ai_session_from_probe
+            || (preserve_matching && source.is_some_and(|source| {
+                self.ai_session.as_ref().is_some_and(|identity| identity.source == source)
+            }))
+        {
+            return false;
+        }
+        let changed = self.ai_session.take().is_some();
+        self.ai_session_from_probe = false;
+        self.invalidate_ai_session_probe();
+        changed
     }
 
     #[cfg(windows)]
@@ -107,7 +278,17 @@ impl TerminalView {
         self.last_agent_identity_probe = None;
         self.agent_identity_probe_misses = 0;
         self.agent_identity_probe_wake = true;
-        self.agent_identity_receipt = None;
+        #[cfg(windows)]
+        let wsl_receipt_still_owns_program = self.wsl_identity_override.as_ref().is_some_and(|owner| {
+            self.wsl_identity_override_is_current()
+                && self.agent_identity_receipt.as_ref() == Some(&owner.receipt)
+                && self.running_program.as_deref() == Some(owner.receipt.kind.slug())
+        });
+        #[cfg(not(windows))]
+        let wsl_receipt_still_owns_program = false;
+        if !wsl_receipt_still_owns_program {
+            self.agent_identity_receipt = None;
+        }
         if let Some(cancelled) = &self.agent_identity_probe_cancel {
             cancelled.store(true, Ordering::Release);
         }
@@ -188,10 +369,11 @@ impl TerminalView {
             {
                 match result {
                     AgentProbe::Found(receipt) => {
-                        self.running_program = Some(receipt.kind.slug().to_owned());
-                        self.agent_identity_receipt = Some(receipt);
-                        self.agent_identity_probe_misses = 0;
-                        self.agent_activity.identify_foreground_process();
+                        let previous_session = self.ai_session.clone();
+                        self.publish_agent_identity_receipt(receipt, true);
+                        if previous_session != self.ai_session {
+                            cx.emit(TerminalViewEvent::SessionIdentityChanged);
+                        }
                         self.replay_pending_recovery_hooks(cx);
                         // Identity is not activity; the shared lifecycle owns all task-state changes.
                         cx.emit(TerminalViewEvent::TitleChanged);
@@ -280,6 +462,19 @@ fn process_probe_result_is_current(
 
 impl TerminalView {
     pub(super) fn probe_agent_identity(&mut self, cx: &mut Context<'_, Self>) {
+        #[cfg(windows)]
+        if self.wsl_identity_override.is_some() {
+            if self.wsl_identity_override_is_current()
+                && self.wsl_identity_override.as_ref().is_some_and(|owner| {
+                    self.agent_identity_receipt.as_ref() == Some(&owner.receipt)
+                        && self.running_program.as_deref() == Some(owner.receipt.kind.slug())
+                        && !self.agent_activity.hook_seen()
+                })
+            {
+                return;
+            }
+            self.revoke_wsl_agent_identity(true);
+        }
         if self.exited.is_some()
             || self.error.is_some()
             || self.agent_activity.hook_seen()

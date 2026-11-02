@@ -746,6 +746,7 @@ fn accepted_wsl_probe_updates_the_tab_label_and_emits_a_title_change(
         view.wsl_cwd_observer.accept_command_id("0123456789abcdef0123456789abcdef");
         view.wsl_cwd_observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
         view.wsl_cwd_observer.start_command();
+        view.wsl_cwd_observer.mark_command_start();
         let ticket = view.wsl_cwd_observer.begin_probe(Instant::now()).unwrap();
         let location = ObservedWslLocation {
             distro: "Ubuntu-22.04".into(),

@@ -307,6 +307,8 @@ impl TerminalView {
             agent_identity_probe_misses: 0,
             agent_identity_receipt: None,
             #[cfg(windows)]
+            wsl_identity_override: None,
+            #[cfg(windows)]
             native_command_boundary: None,
             #[cfg(windows)]
             wsl_cwd_observer: Default::default(),

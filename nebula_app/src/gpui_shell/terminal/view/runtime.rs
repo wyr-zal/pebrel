@@ -62,12 +62,10 @@ impl TerminalView {
         {
             // Late shell events retain the earlier pre-input boundary. Without
             // one, fail closed for processes already running when C is read.
+            self.revoke_wsl_agent_identity(true);
             self.native_command_boundary = launch_boundary;
             if let Some(early_hooks) = early_hooks { self.pending_recovery_hooks = early_hooks; }
             if self.native_command_boundary.is_none() { self.capture_native_recovery_boundary(); }
-            if self.wsl_cwd_observer.start_command() {
-                cx.emit(TerminalViewEvent::TitleChanged);
-            }
         }
         self.invalidate_shell_boundary_probe();
         self.invalidate_agent_identity_probe();
@@ -79,6 +77,13 @@ impl TerminalView {
                 .map(|agent| agent.slug().to_owned())
                 .or_else(|| crate::display::extract_program(&self.suggest.last_committed));
             self.invalidate_ai_session_probe();
+            let identity_source = identity
+                .as_deref()
+                .and_then(crate::ai_agents::AgentKind::parse)
+                .map(|agent| agent.slug());
+            if self.retire_probe_session_for_identity(identity_source, true) {
+                cx.emit(TerminalViewEvent::SessionIdentityChanged);
+            }
             if identity != self.running_program {
                 self.running_program = identity;
                 self.ai_session = None;
@@ -91,6 +96,10 @@ impl TerminalView {
                 .and_then(crate::ai_agents::AgentKind::parse)
                 .is_some();
             self.agent_activity.begin_command(agent);
+        }
+        #[cfg(windows)]
+        if !self.agent_activity.hook_seen() && self.wsl_cwd_observer.mark_command_start() {
+            cx.emit(TerminalViewEvent::TitleChanged);
         }
         self.mark_command_running();
         self.probe_missing_codex_session(cx);
@@ -181,7 +190,10 @@ impl TerminalView {
     pub(super) fn clear_foreground_agent_state(&mut self, cx: &mut Context<Self>) -> bool {
         self.pending_recovery_hooks.clear();
         #[cfg(windows)]
-        { self.native_command_boundary = None; }
+        {
+            self.native_command_boundary = None;
+            self.revoke_wsl_agent_identity(false);
+        }
         self.invalidate_shell_boundary_probe();
         self.invalidate_agent_identity_probe();
         self.cancel_auto_continue();
@@ -930,6 +942,10 @@ impl TerminalView {
     /// File and process operations run on the background executor. Only results
     /// for the same foreground command and unchanged identity are applied.
     pub(super) fn probe_missing_codex_session(&mut self, cx: &mut Context<Self>) {
+        #[cfg(windows)]
+        if self.wsl_identity_override_is_current() {
+            return;
+        }
         if self.exited.is_some()
             || self.ai_session_probe_pending
             || self.ssh_destination.is_some()

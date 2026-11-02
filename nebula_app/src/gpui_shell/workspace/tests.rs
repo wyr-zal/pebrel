@@ -2,6 +2,84 @@
 
 use super::*;
 
+#[cfg(all(windows, feature = "gpui-test-support"))]
+mod wsl_process_identity_presentation_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn wsl_process_identity_selects_the_claude_tab_logo_without_a_hook(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::gpui_shell::math_view::register(cx);
+            crate::gpui_shell::file_editor::init(cx);
+            super::super::init(cx);
+            cx.set_reduce_motion(true);
+            windowing::initialize(cx, crate::runtime_api::RuntimeHub::new());
+        });
+        let mut entity = None;
+        let (_, window) = cx.add_window_view(|window, cx| {
+            let workspace = cx.new(|cx| {
+                NebulaWorkspace::new(
+                    window,
+                    None,
+                    None,
+                    1,
+                    crate::runtime_api::RuntimeHub::new(),
+                    windowing::WorkspaceStartup::Empty,
+                    windowing::WindowRole::Regular,
+                    cx,
+                )
+            });
+            entity = Some(workspace.clone());
+            Root::new(workspace, window, cx)
+        });
+        let entity = entity.unwrap();
+        window.update(|window, cx| {
+            entity.update(cx, |workspace, cx| {
+                let saved = crate::session::Session::new(
+                    0,
+                    vec![crate::session::TabSession {
+                        cwd: r"C:\Users\12704".into(),
+                        custom_name: None,
+                        color: None,
+                        launch: Some(crate::session::LaunchSession::Shell {
+                            name: "fixture".into(),
+                            program: "pebrel-test-missing-shell-executable".into(),
+                            args: vec![],
+                        }),
+                        layout: None,
+                        active_pane: 0,
+                    }],
+                );
+                assert!(workspace.restore_update_session(&saved, true, window, cx));
+                let ix = workspace.tabs.len() - 1;
+                let pane = workspace.tabs[ix].focused_view().unwrap().clone();
+                pane.update(cx, |pane, cx| pane.install_wsl_process_identity_test_fixture(cx));
+                let claude_logo = Arc::new(gpui::RenderImage::new(vec![image::Frame::new(
+                    image::RgbaImage::new(1, 1),
+                )]));
+                workspace.sidebar_logo_images.clear();
+                workspace
+                    .sidebar_logo_images
+                    .insert((crate::display::AiLogo::Claude, true), claude_logo.clone());
+                let presentation = workspace.tab_presentation(ix, cx, true);
+                assert_eq!(presentation.title.as_ref(), "VoiceRecite");
+                assert!(Arc::ptr_eq(presentation.logo_image.as_ref().unwrap(), &claude_logo));
+                assert!(!presentation.logo_pending);
+                assert!(
+                    presentation.program_glyph.is_none(),
+                    "use the Agent logo, not a shell glyph"
+                );
+                let agent = pane.read(cx).runtime_agent().unwrap();
+                assert_eq!(agent.kind, "claude");
+                assert!(!agent.hook_seen);
+                assert!(agent.session_id.is_none());
+            });
+        });
+    }
+}
+
 #[test]
 fn ssh_host_icons_are_confined_to_the_selected_configuration_directory() {
     let temporary = tempfile::tempdir().unwrap();

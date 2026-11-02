@@ -18,6 +18,8 @@ mod image_paste;
 mod layout;
 #[cfg(all(test, windows, feature = "gpui-test-support"))]
 mod native_cmd_tests;
+#[cfg(all(test, windows, feature = "gpui-test-support"))]
+mod wsl_agent_identity_tests;
 mod notifications;
 #[cfg(all(test, feature = "gpui-test-support"))]
 mod output_tests;
@@ -334,6 +336,8 @@ pub struct TerminalView {
     agent_identity_probe_misses: u8,
     agent_identity_receipt: Option<crate::platform::agent_process_identity::ForegroundAgent>,
     #[cfg(windows)]
+    wsl_identity_override: Option<agent_identity::WslIdentityOverride>,
+    #[cfg(windows)]
     native_command_boundary: Option<crate::platform::agent_process_identity::NativeLaunchBoundary>,
     #[cfg(windows)]
     wsl_cwd_observer: wsl_cwd_observer::WslCwdObserver,
@@ -640,8 +644,19 @@ impl TerminalView {
                     let mut parts = rest.splitn(3, '|');
                     parts.next();
                     self.branch = parts.next().unwrap_or("").trim().to_owned();
+                    #[cfg(windows)]
+                    if self.wsl_identity_override.is_some()
+                        && !self.wsl_identity_override_is_current()
+                    {
+                        self.revoke_wsl_agent_identity(true);
+                    }
+                    #[cfg(windows)]
+                    let wsl_identity_owns_program = self.wsl_identity_override_is_current();
+                    #[cfg(not(windows))]
+                    let wsl_identity_owns_program = false;
                     if let Some(program) = parts.next()
                         && !self.agent_activity.hook_seen()
+                        && !wsl_identity_owns_program
                     {
                         self.running_program =
                             (!program.trim().is_empty()).then(|| program.trim().to_owned());
@@ -781,14 +796,19 @@ impl TerminalView {
                 {
                     let title_changed = if name == "pebrel_command_id" {
                         self.wsl_cwd_observer.accept_command_id(&value);
-                        self.wsl_cwd_observer.start_command()
+                        self.wsl_cwd_observer.refresh_command_metadata()
                     } else if name == "pebrel_command" {
                         self.wsl_cwd_observer.accept_command_line(&value);
-                        self.wsl_cwd_observer.start_command()
+                        self.wsl_cwd_observer.refresh_command_metadata()
                     } else {
                         false
                     };
-                    if title_changed || self.wsl_cwd_observer.take_title_change() {
+                    let identity_changed = matches!(name.as_str(), "pebrel_command_id" | "pebrel_command")
+                        && self.sync_wsl_agent_identity_with_context(cx);
+                    if title_changed
+                        || self.wsl_cwd_observer.take_title_change()
+                        || identity_changed
+                    {
                         cx.emit(TerminalViewEvent::TitleChanged);
                     }
                 }
@@ -820,7 +840,11 @@ impl TerminalView {
     fn mark_exited(&mut self, message: String, cx: &mut Context<Self>) {
         self.stop_agent_identity_probe();
         #[cfg(windows)]
-        if self.wsl_cwd_observer.finish_command() {
+        let wsl_title_changed = self.wsl_cwd_observer.finish_command();
+        #[cfg(windows)]
+        let wsl_identity_changed = self.revoke_wsl_agent_identity(true);
+        #[cfg(windows)]
+        if wsl_title_changed || wsl_identity_changed {
             cx.emit(TerminalViewEvent::TitleChanged);
         }
         if let Some(session) = &self.session {

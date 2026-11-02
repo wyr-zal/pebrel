@@ -18,6 +18,8 @@ pub(super) struct WslCwdObserver {
     boundary: Option<NativeLaunchBoundary>,
     command_id: Option<String>,
     command_candidate: bool,
+    command_started: bool,
+    identity_suppressed: bool,
     active: bool,
     epoch: u64,
     pending: Option<Arc<AtomicBool>>,
@@ -28,6 +30,20 @@ pub(super) struct WslCwdObserver {
     launcher: Option<ProcessStamp>,
     observed: Option<ObservedWslLocation>,
     closed: AtomicBool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct WslIdentityScope {
+    pub(super) epoch: u64,
+    pub(super) command_id: String,
+    pub(super) boundary: NativeLaunchBoundary,
+    pub(super) launcher: ProcessStamp,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ProbeCompletion {
+    pub(super) accepted: bool,
+    pub(super) path_changed: bool,
 }
 
 pub(super) struct ProbeTicket {
@@ -43,6 +59,8 @@ impl Default for WslCwdObserver {
             boundary: None,
             command_id: None,
             command_candidate: false,
+            command_started: false,
+            identity_suppressed: false,
             active: false,
             epoch: 0,
             pending: None,
@@ -63,12 +81,19 @@ impl WslCwdObserver {
         self.boundary = boundary;
         self.command_id = None;
         self.command_candidate = false;
+        self.command_started = false;
+        self.identity_suppressed = false;
         self.active = false;
         self.reset_probe_state();
         self.pending_title_changed |= self.clear_observed();
     }
 
     pub(super) fn accept_command_id(&mut self, command_id: &str) {
+        if valid_command_id(command_id)
+            && self.command_id.as_deref() == Some(command_id)
+        {
+            return;
+        }
         self.invalidate();
         self.command_id = valid_command_id(command_id).then(|| command_id.to_owned());
         self.active = false;
@@ -86,7 +111,21 @@ impl WslCwdObserver {
     }
 
     pub(super) fn start_command(&mut self) -> bool {
-        self.active = self.boundary.is_some()
+        self.mark_command_start()
+    }
+
+    pub(super) fn refresh_command_metadata(&mut self) -> bool {
+        self.refresh_active_state()
+    }
+
+    pub(super) fn mark_command_start(&mut self) -> bool {
+        self.command_started = true;
+        self.refresh_active_state()
+    }
+
+    fn refresh_active_state(&mut self) -> bool {
+        self.active = self.command_started
+            && self.boundary.is_some()
             && self.command_id.is_some()
             && self.command_candidate
             && !self.closed.load(Ordering::Acquire);
@@ -99,6 +138,8 @@ impl WslCwdObserver {
         self.boundary = None;
         self.command_id = None;
         self.command_candidate = false;
+        self.command_started = false;
+        self.identity_suppressed = false;
         self.reset_probe_state();
         let cleared = self.clear_observed();
         self.take_title_change() || cleared
@@ -113,6 +154,22 @@ impl WslCwdObserver {
 
     pub(super) fn observed(&self) -> Option<&ObservedWslLocation> {
         self.observed.as_ref()
+    }
+
+    pub(super) fn identity_scope(&self) -> Option<WslIdentityScope> {
+        if !self.command_started || self.identity_suppressed {
+            return None;
+        }
+        Some(WslIdentityScope {
+            epoch: self.epoch,
+            command_id: self.command_id.clone()?,
+            boundary: self.boundary.clone()?,
+            launcher: self.observed.as_ref()?.launcher,
+        })
+    }
+
+    pub(super) fn suppress_identity_until_next_command(&mut self) {
+        self.identity_suppressed = true;
     }
 
     #[cfg(test)]
@@ -193,12 +250,12 @@ impl WslCwdObserver {
         result: WslLocationProbe,
         binding_is_current: bool,
         now: Instant,
-    ) -> bool {
+    ) -> ProbeCompletion {
         if !self.finish_probe(ticket) {
             crate::logging::debug_log(
                 "wsl_cwd_observer event=probe_complete accepted=false reason=stale_or_cancelled",
             );
-            return false;
+            return ProbeCompletion::default();
         }
         let outcome = match &result {
             WslLocationProbe::Found(_) => "found",
@@ -212,9 +269,12 @@ impl WslCwdObserver {
             "wsl_cwd_observer event=probe_complete outcome={outcome} binding_current={binding_is_current}"
         ));
         if !binding_is_current {
-            return self.finish_command();
+            return ProbeCompletion {
+                accepted: false,
+                path_changed: self.finish_command(),
+            };
         }
-        self.apply_probe(result, now)
+        ProbeCompletion { accepted: true, path_changed: self.apply_probe(result, now) }
     }
 
     fn apply_probe(&mut self, result: WslLocationProbe, now: Instant) -> bool {
@@ -315,7 +375,9 @@ fn command_line_contains_wsl(value: &str) -> bool {
 impl TerminalView {
     pub(crate) fn refresh_wsl_cwd_observation(&mut self, cx: &mut Context<Self>) {
         let now = Instant::now();
-        if self.wsl_cwd_observer.expire_stale(now) {
+        let path_changed = self.wsl_cwd_observer.expire_stale(now);
+        let identity_changed = self.sync_wsl_agent_identity_with_context(cx);
+        if path_changed || identity_changed {
             cx.emit(TerminalViewEvent::TitleChanged);
             cx.notify();
         }
@@ -366,15 +428,7 @@ impl TerminalView {
                     && same_shell
                     && view.exited.is_none()
                     && view.error.is_none();
-                if view.wsl_cwd_observer.complete_probe(
-                    &ticket,
-                    result,
-                    current_binding,
-                    Instant::now(),
-                ) {
-                    cx.emit(TerminalViewEvent::TitleChanged);
-                    cx.notify();
-                }
+                view.apply_wsl_cwd_probe_result(&ticket, result, current_binding, cx);
             });
         })
         .detach();
@@ -387,12 +441,15 @@ impl TerminalView {
         same_pty_and_shell: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.wsl_cwd_observer.complete_probe(
+        let completion = self.wsl_cwd_observer.complete_probe(
             ticket,
             result,
             same_pty_and_shell && self.exited.is_none() && self.error.is_none(),
             Instant::now(),
-        ) {
+        );
+        let identity_changed = (completion.accepted || completion.path_changed)
+            && self.sync_wsl_agent_identity_with_context(cx);
+        if completion.path_changed || identity_changed {
             cx.emit(TerminalViewEvent::TitleChanged);
             cx.notify();
         }
@@ -435,17 +492,19 @@ mod tests {
         observer.prepare_submission(Some(boundary()));
         observer.accept_command_id("0123456789abcdef0123456789abcdef");
         observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
-        observer.start_command();
+        observer.refresh_command_metadata();
+        assert!(!observer.active, "metadata alone cannot start the WSL probe");
+        observer.mark_command_start();
         assert!(observer.active);
 
         observer.prepare_submission(Some(boundary()));
         observer.accept_command_id("not-a-guid");
         observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
-        observer.start_command();
+        observer.mark_command_start();
         assert!(!observer.active);
         observer.accept_command_id("0123456789abcdef0123456789abcdef");
         observer.accept_command_line("pwsh:fixture\nGet-ChildItem");
-        observer.start_command();
+        observer.mark_command_start();
         assert!(!observer.active);
     }
 
@@ -454,11 +513,26 @@ mod tests {
         let mut observer = WslCwdObserver::default();
         observer.prepare_submission(Some(boundary()));
         observer.accept_command_line("wsl.exe -d Ubuntu-22.04 --cd /mnt/e/ProjectOrder/VoiceRecite");
-        observer.start_command();
+        observer.mark_command_start();
         assert!(!observer.active);
 
         observer.accept_command_id("abcdef0123456789abcdef0123456789");
-        observer.start_command();
+        observer.refresh_command_metadata();
+        assert!(observer.active);
+    }
+
+    #[test]
+    fn command_metadata_arriving_after_command_start_activates_the_probe() {
+        let mut observer = WslCwdObserver::default();
+        observer.prepare_submission(Some(boundary()));
+        observer.mark_command_start();
+        assert!(!observer.active);
+
+        observer.accept_command_id("abcdef0123456789abcdef0123456789");
+        observer.refresh_command_metadata();
+        assert!(!observer.active);
+        observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
+        observer.refresh_command_metadata();
         assert!(observer.active);
     }
 
@@ -475,7 +549,7 @@ mod tests {
         observer.prepare_submission(Some(boundary()));
         observer.accept_command_line("wsl.exe -d Ubuntu-22.04");
         observer.accept_command_id("0123456789abcdef0123456789abcdef");
-        observer.start_command();
+        observer.mark_command_start();
         let now = Instant::now();
         let ticket = observer.begin_probe(now).unwrap();
 
@@ -483,7 +557,7 @@ mod tests {
         assert!(ticket.cancelled.load(Ordering::Acquire));
         assert!(!observer.complete_probe(
             &ticket, WslLocationProbe::Found(location(20, 30, "/stale")), true, now,
-        ));
+        ).accepted);
         assert!(!observer.active);
         assert!(observer.observed().is_none());
     }
@@ -494,7 +568,7 @@ mod tests {
         observer.prepare_submission(Some(boundary()));
         observer.accept_command_id("0123456789abcdef0123456789abcdef");
         observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
-        observer.start_command();
+        observer.mark_command_start();
         let now = Instant::now();
         assert!(observer.apply_probe(WslLocationProbe::Found(location(20, 30, "/one")), now));
         assert!(observer.apply_probe(WslLocationProbe::Found(location(21, 31, "/two")), now));
@@ -508,26 +582,165 @@ mod tests {
     }
 
     #[test]
+    fn accepted_identity_updates_do_not_depend_on_visible_path_changes() {
+        let mut observer = WslCwdObserver::default();
+        observer.prepare_submission(Some(boundary()));
+        observer.accept_command_id("0123456789abcdef0123456789abcdef");
+        observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
+        observer.mark_command_start();
+        let now = Instant::now();
+
+        let first = observer.begin_probe(now).unwrap();
+        let first_completion = observer.complete_probe(
+            &first,
+            WslLocationProbe::Found(location(20, 30, "/same")),
+            true,
+            now,
+        );
+        assert_eq!(first_completion, ProbeCompletion { accepted: true, path_changed: true });
+
+        let mut replacement = location(20, 30, "/same");
+        replacement.agent.process.start_time += 1;
+        let next = observer.begin_probe(now + LOCATION_REFRESH_INTERVAL).unwrap();
+        let next_completion = observer.complete_probe(
+            &next,
+            WslLocationProbe::Found(replacement.clone()),
+            true,
+            now + LOCATION_REFRESH_INTERVAL,
+        );
+        assert_eq!(next_completion, ProbeCompletion { accepted: true, path_changed: false });
+        assert_eq!(observer.observed().unwrap().agent.process, replacement.agent.process);
+
+        let duplicate = observer
+            .begin_probe(now + LOCATION_REFRESH_INTERVAL * 2)
+            .unwrap();
+        let duplicate_completion = observer.complete_probe(
+            &duplicate,
+            WslLocationProbe::Found(replacement),
+            true,
+            now + LOCATION_REFRESH_INTERVAL * 2,
+        );
+        assert_eq!(duplicate_completion, ProbeCompletion { accepted: true, path_changed: false });
+
+        let no_agent = observer
+            .begin_probe(now + LOCATION_REFRESH_INTERVAL * 3)
+            .unwrap();
+        let no_agent_completion = observer.complete_probe(
+            &no_agent,
+            WslLocationProbe::NoAgent { launcher: ProcessStamp { pid: 20, start_time: 200 } },
+            true,
+            now + LOCATION_REFRESH_INTERVAL * 3,
+        );
+        assert_eq!(no_agent_completion, ProbeCompletion { accepted: true, path_changed: true });
+        assert!(observer.identity_scope().is_none());
+    }
+
+    #[test]
+    fn unavailable_retains_a_fresh_receipt_until_expiry_then_drops_scope() {
+        let mut observer = WslCwdObserver::default();
+        observer.prepare_submission(Some(boundary()));
+        observer.accept_command_id("0123456789abcdef0123456789abcdef");
+        observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
+        observer.mark_command_start();
+        let now = Instant::now();
+        let found = observer.begin_probe(now).unwrap();
+        observer.complete_probe(
+            &found,
+            WslLocationProbe::Found(location(20, 30, "/same")),
+            true,
+            now,
+        );
+
+        let unavailable = observer.begin_probe(now + LOCATION_REFRESH_INTERVAL).unwrap();
+        let completion = observer.complete_probe(
+            &unavailable,
+            WslLocationProbe::Unavailable {
+                launcher: Some(ProcessStamp { pid: 20, start_time: 200 }),
+            },
+            true,
+            now + LOCATION_REFRESH_INTERVAL,
+        );
+        assert_eq!(completion, ProbeCompletion { accepted: true, path_changed: false });
+        assert!(observer.identity_scope().is_some());
+        assert!(observer.expire_stale(now + MAX_STALE_LOCATION + Duration::from_millis(1)));
+        assert!(observer.identity_scope().is_none());
+    }
+
+    #[test]
+    fn a_ticket_from_a_replaced_pty_is_rejected_and_clears_its_scope() {
+        let mut observer = WslCwdObserver::default();
+        observer.prepare_submission(Some(boundary()));
+        observer.accept_command_id("0123456789abcdef0123456789abcdef");
+        observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
+        observer.mark_command_start();
+        let now = Instant::now();
+        let found = observer.begin_probe(now).unwrap();
+        observer.complete_probe(
+            &found,
+            WslLocationProbe::Found(location(20, 30, "/same")),
+            true,
+            now,
+        );
+        assert!(observer.identity_scope().is_some());
+
+        let stale = observer.begin_probe(now + LOCATION_REFRESH_INTERVAL).unwrap();
+        let completion = observer.complete_probe(
+            &stale,
+            WslLocationProbe::Found(location(20, 31, "/other")),
+            false,
+            now + LOCATION_REFRESH_INTERVAL,
+        );
+        assert_eq!(completion, ProbeCompletion { accepted: false, path_changed: true });
+        assert!(observer.observed().is_none());
+        assert!(observer.identity_scope().is_none());
+    }
+
+    #[test]
+    fn hook_takeover_suppresses_process_identity_until_the_next_command() {
+        let mut observer = WslCwdObserver::default();
+        observer.prepare_submission(Some(boundary()));
+        observer.accept_command_id("0123456789abcdef0123456789abcdef");
+        observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
+        observer.mark_command_start();
+        let now = Instant::now();
+        observer.apply_probe(WslLocationProbe::Found(location(20, 30, "/one")), now);
+        assert!(observer.identity_scope().is_some());
+
+        observer.suppress_identity_until_next_command();
+        assert!(observer.identity_scope().is_none());
+        observer.apply_probe(WslLocationProbe::Found(location(20, 30, "/two")), now);
+        assert!(observer.identity_scope().is_none());
+
+        observer.prepare_submission(Some(boundary()));
+        observer.accept_command_id("abcdef0123456789abcdef0123456789");
+        observer.accept_command_line("wsl.exe -d Ubuntu-22.04");
+        observer.mark_command_start();
+        assert!(observer.identity_scope().is_none(), "a fresh scope still needs an accepted location");
+        observer.apply_probe(WslLocationProbe::Found(location(20, 30, "/next")), now);
+        assert!(observer.identity_scope().is_some());
+    }
+
+    #[test]
     fn canceled_old_epoch_and_closed_probe_results_are_discarded() {
         let mut observer = WslCwdObserver::default();
         observer.prepare_submission(Some(boundary()));
         observer.accept_command_id("0123456789abcdef0123456789abcdef");
         observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
-        observer.start_command();
+        observer.mark_command_start();
         let now = Instant::now();
         let old_ticket = observer.begin_probe(now).unwrap();
 
         observer.prepare_submission(Some(boundary()));
         observer.accept_command_id("abcdef0123456789abcdef0123456789");
         observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
-        observer.start_command();
+        observer.mark_command_start();
         assert!(old_ticket.cancelled.load(Ordering::Acquire));
         assert!(!observer.complete_probe(
             &old_ticket,
             WslLocationProbe::Found(location(20, 30, "/stale")),
             true,
             now,
-        ));
+        ).accepted);
         assert!(observer.active);
         assert!(observer.observed().is_none());
 
@@ -539,7 +752,7 @@ mod tests {
             WslLocationProbe::Found(location(20, 30, "/closed")),
             true,
             now,
-        ));
+        ).accepted);
         assert!(observer.observed().is_none());
     }
 
@@ -549,7 +762,7 @@ mod tests {
         observer.prepare_submission(Some(boundary()));
         observer.accept_command_id("0123456789abcdef0123456789abcdef");
         observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
-        observer.start_command();
+        observer.mark_command_start();
         let now = Instant::now();
         observer.apply_probe(WslLocationProbe::Found(location(20, 30, "/one")), now);
         let mut reused = location(20, 30, "/two");
@@ -565,7 +778,7 @@ mod tests {
         observer.prepare_submission(Some(boundary()));
         observer.accept_command_id("0123456789abcdef0123456789abcdef");
         observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
-        observer.start_command();
+        observer.mark_command_start();
         let now = Instant::now();
         let ticket = observer.begin_probe(now).unwrap();
         observer.complete_probe(
@@ -585,7 +798,7 @@ mod tests {
         observer.prepare_submission(Some(boundary()));
         observer.accept_command_id("0123456789abcdef0123456789abcdef");
         observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
-        observer.start_command();
+        observer.mark_command_start();
         let launcher = ProcessStamp { pid: 20, start_time: 200 };
 
         for _ in 0..MAX_NO_AGENT_MISSES {
@@ -609,7 +822,7 @@ mod tests {
             observer.prepare_submission(Some(boundary()));
             observer.accept_command_id("0123456789abcdef0123456789abcdef");
             observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
-            observer.start_command();
+            observer.mark_command_start();
 
             for _ in 0..MAX_UNCERTAIN_MISSES {
                 observer.apply_probe(result.clone(), Instant::now());
@@ -626,7 +839,7 @@ mod tests {
         observer.prepare_submission(Some(boundary()));
         observer.accept_command_id("0123456789abcdef0123456789abcdef");
         observer.accept_command_line("pwsh:fixture\nwsl.exe -d Ubuntu-22.04");
-        observer.start_command();
+        observer.mark_command_start();
         let now = Instant::now();
         observer.apply_probe(WslLocationProbe::Found(location(20, 30, "/one")), now);
         assert!(observer.apply_probe(
