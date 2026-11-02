@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::event::NativeTranscriptState;
 use super::payload::*;
 use super::{
     AiHookEvent, AiHookKind, AiPermissionMode, AiTurnOutcome, AttentionContext, CodexHookMode,
@@ -90,10 +91,24 @@ pub(super) fn parse_envelope(bytes: &[u8]) -> Option<AiHookEvent> {
     // including when a conversation was forked or loaded into another session.
     // An explicit null/invalid transcript is not a durable resume target. Older
     // hook payloads that omit the field retain their historical ID contract.
-    let session_id = if native_codex && native_transcript.is_some() {
-        session_file.as_deref().and_then(crate::session::codex_rollout_id).map(str::to_owned)
+    let codex_thread_id = (native_codex && native_transcript.is_some())
+        .then(|| {
+            session_file.as_deref().and_then(crate::session::codex_rollout_id).map(str::to_owned)
+        })
+        .flatten();
+    let native_transcript = if !native_codex {
+        NativeTranscriptState::NotCodex
+    } else if native_transcript.is_none() {
+        NativeTranscriptState::Omitted
+    } else if codex_thread_id.is_some() {
+        NativeTranscriptState::Verified
     } else {
-        reported_session_id
+        NativeTranscriptState::Unverifiable
+    };
+    let session_id = match native_transcript {
+        NativeTranscriptState::Verified => codex_thread_id,
+        NativeTranscriptState::Unverifiable => None,
+        NativeTranscriptState::NotCodex | NativeTranscriptState::Omitted => reported_session_id,
     };
     let mut event_id =
         context_string(&payload, &["event_id", "eventId"]).map(|id| truncate(&id, ID_MAX_CHARS));
@@ -329,6 +344,7 @@ pub(super) fn parse_envelope(bytes: &[u8]) -> Option<AiHookEvent> {
         message,
         session_id,
         session_file,
+        native_transcript,
         bridge_instance: payload
             .get("bridge_instance")
             .and_then(Value::as_str)

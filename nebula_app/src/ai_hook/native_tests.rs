@@ -193,6 +193,7 @@ fn codex_native_hooks_resume_the_transcript_thread_not_the_runtime_group() {
             );
             assert_eq!(event.session_id.as_deref(), Some(THREAD));
             assert_eq!(event.session_file.as_deref(), Some(transcript.as_str()));
+            assert!(!event.has_unverifiable_native_transcript());
             let target = crate::session::AgentSession {
                 source: event.source,
                 session_id: event.session_id,
@@ -212,9 +213,110 @@ fn codex_native_hooks_resume_the_transcript_thread_not_the_runtime_group() {
             }),
         );
         assert!(event.session_id.is_none(), "an ephemeral group must not become a resume ID");
+        assert!(
+            event.has_unverifiable_native_transcript(),
+            "an explicit invalid transcript cannot own the pane lifecycle"
+        );
     }
     let legacy = codex("SessionStart", "older-native-id", None);
     assert_eq!(legacy.session_id.as_deref(), Some("older-native-id"));
+    assert!(!legacy.has_unverifiable_native_transcript());
+}
+
+#[test]
+fn unverifiable_native_codex_transcript_cannot_replace_or_end_the_primary() {
+    const THREAD: &str = "0199a213-c2a4-7cf5-8f6b-d746fbb6e86c";
+    const PROCESS: &str = "100:55";
+    let transcript = format!("/home/user/.codex/sessions/rollout-date-{THREAD}.jsonl");
+    let primary = |name: &str, turn: Option<&str>, sequence: u64| {
+        native(
+            "full",
+            Some(PROCESS),
+            json!({
+                "hook_event_name": name,
+                "session_id": "primary-group",
+                "turn_id": turn,
+                "transcript_path": transcript,
+                "bridge_sequence": sequence,
+            }),
+        )
+    };
+    let unverified = |name: &str, transcript: Value, sequence: u64| {
+        native(
+            "full",
+            Some(PROCESS),
+            json!({
+                "hook_event_name": name,
+                "session_id": "internal-group",
+                "transcript_path": transcript,
+                "bridge_sequence": sequence,
+            }),
+        )
+    };
+
+    let mut activity = AgentActivity::default();
+    assert!(activity.apply_hook(&primary("SessionStart", None, 1)));
+    assert!(activity.apply_hook(&primary("UserPromptSubmit", Some("turn"), 2)));
+    assert_eq!(activity.status(), AgentStatus::Working);
+    assert!(activity.hook_seen());
+
+    for (sequence, transcript) in
+        [(3, Value::Null), (4, json!("relative/rollout-invalid.jsonl")), (5, json!(42))]
+    {
+        for name in ["SessionStart", "SessionEnd"] {
+            let hook = unverified(name, transcript.clone(), sequence);
+            assert!(hook.has_unverifiable_native_transcript());
+            assert!(!activity.apply_hook(&hook), "{name} must not cross the lifecycle guard");
+            assert_eq!(activity.status(), AgentStatus::Working);
+            assert!(activity.hook_seen());
+        }
+    }
+
+    assert!(activity.apply_hook(&primary("PostToolUse", Some("turn"), 6)));
+    assert_eq!(activity.status(), AgentStatus::Working);
+    assert!(activity.apply_hook(&primary("PermissionRequest", Some("turn"), 7)));
+    assert_eq!(activity.status(), AgentStatus::Blocked);
+    assert!(activity.apply_hook(&primary("PostToolUse", Some("turn"), 8)));
+    assert_eq!(activity.status(), AgentStatus::Working);
+
+    let mut gate = super::ordering::AiHookEventGate::default();
+    let rejected = unverified("SessionEnd", Value::Null, 9);
+    assert_eq!(gate.verdict(&rejected, 90), GateVerdict::UnverifiedNativeTranscript);
+
+    assert!(activity.apply_hook(&primary("SessionEnd", None, 10)));
+    assert!(!activity.hook_seen());
+    assert!(!activity.apply_hook(&primary("PostToolUse", Some("turn"), 11)));
+}
+
+#[test]
+fn unverifiable_native_codex_start_cannot_claim_an_empty_pane() {
+    const THREAD: &str = "0199a213-c2a4-7cf5-8f6b-d746fbb6e86c";
+    let transcript = format!("/home/user/.codex/sessions/rollout-date-{THREAD}.jsonl");
+    let start = |session: &str, transcript: Value| {
+        native(
+            "full",
+            Some("100:55"),
+            json!({
+                "hook_event_name": "SessionStart",
+                "session_id": session,
+                "transcript_path": transcript,
+                "bridge_sequence": 1,
+            }),
+        )
+    };
+
+    let mut activity = AgentActivity::default();
+    let internal = start("internal-group", Value::Null);
+    assert!(internal.has_unverifiable_native_transcript());
+    assert!(!activity.apply_hook(&internal));
+    assert!(!activity.hook_seen());
+    assert_eq!(activity.status(), AgentStatus::Unknown);
+
+    let primary = start("primary-group", json!(transcript));
+    assert!(!primary.has_unverifiable_native_transcript());
+    assert!(activity.apply_hook(&primary));
+    assert!(activity.hook_seen());
+    assert_eq!(activity.status(), AgentStatus::Idle);
 }
 
 #[test]

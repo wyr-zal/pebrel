@@ -94,6 +94,8 @@ pub enum GateVerdict {
     AfterSessionEnd,
     /// Done 之后抵达的 ToolComplete，且没有任何证据证明它更新。
     UnorderedAfterDone,
+    /// Native Codex supplied transcript data that cannot identify its thread.
+    UnverifiedNativeTranscript,
 }
 
 impl GateVerdict {
@@ -109,6 +111,9 @@ impl AiHookEventGate {
     }
 
     pub(super) fn verdict(&mut self, event: &AiHookEvent, pane_id: u64) -> GateVerdict {
+        if event.has_unverifiable_native_transcript() {
+            return GateVerdict::UnverifiedNativeTranscript;
+        }
         let key = event.stream_key(Some(pane_id));
         if !self.streams.contains_key(&key) && self.streams.len() >= MAX_TRACKED_STREAMS {
             if let Some(oldest) = self

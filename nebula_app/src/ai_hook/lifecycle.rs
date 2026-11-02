@@ -356,6 +356,13 @@ impl AgentActivity {
         if self.native_codex && event.source == "codex" && event.codex_hooks.is_none() {
             return false;
         }
+        // Codex reports a session/group ID for internal work, but its concrete
+        // thread is identified by the rollout transcript. An explicit null or
+        // malformed transcript cannot prove that a lifecycle edge belongs to
+        // this pane; the shared Codex process is not sufficient ownership.
+        if event.has_unverifiable_native_transcript() {
+            return false;
+        }
         // A submitted prompt has no authoritative new turn yet. Old tool/end
         // events, including a repeated SessionStart, cannot acknowledge it.
         if self.pending_hook_prompt {

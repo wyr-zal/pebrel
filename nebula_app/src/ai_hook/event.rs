@@ -63,6 +63,18 @@ pub(crate) enum CodexHookMode {
     Full,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum NativeTranscriptState {
+    #[default]
+    NotCodex,
+    /// Older native hooks omitted the field; retain their historical contract.
+    Omitted,
+    /// The transcript identifies the concrete Codex thread.
+    Verified,
+    /// The provider supplied a field value that cannot identify a durable thread.
+    Unverifiable,
+}
+
 pub fn capabilities_for(source: &str) -> AiHookCapabilities {
     match source {
         "claude" => AiHookCapabilities {
@@ -280,6 +292,10 @@ pub struct AiHookEvent {
     pub session_id: Option<String>,
     /// Exact native file and owner lifetime used by durable session recovery.
     pub session_file: Option<String>,
+    /// Whether a native Codex event carried enough transcript evidence to bind
+    /// the hook to a concrete thread. The reported session/group ID is not a
+    /// substitute for thread ownership.
+    pub(crate) native_transcript: NativeTranscriptState,
     pub bridge_instance: Option<String>,
     /// Provider 给出的幂等身份；只在同一 source/session/pane 内去重。
     pub event_id: Option<String>,
@@ -322,5 +338,9 @@ impl AiHookEvent {
 
     pub fn active_background_tasks(&self) -> u32 {
         self.background_tasks.map_or(0, |tasks| tasks.active)
+    }
+
+    pub(crate) fn has_unverifiable_native_transcript(&self) -> bool {
+        self.native_transcript == NativeTranscriptState::Unverifiable
     }
 }
