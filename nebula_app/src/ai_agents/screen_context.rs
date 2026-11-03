@@ -24,6 +24,16 @@ static CLAUDE_HISTORY: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
+static CODEX_HISTORY_BANNER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:↓\s*)?back\s+to\s+bottom\s*[·•]\s*esc(?:ape)?$").unwrap()
+});
+static CODEX_HISTORY_FOOTER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)^earlier\s+messages\s+available\.\s+enter\s*/\s*esc\s+latest(?:\s*[·•]\s*\?\s+(?:for\s+)?shortcuts)?(?:\s+⚠\s*\d+\s+warnings?\s*[·•]\s*f2\s+to\s+view)?$",
+    )
+    .unwrap()
+});
+
 pub(super) fn is_horizontal_rule(line: &str) -> bool {
     let row = line.trim();
     if row.chars().filter(|character| *character == '─').count() < 3 {
@@ -57,16 +67,12 @@ fn claude_composer_bounds(screen: &str) -> Option<(usize, usize)> {
     }
     let lower = lines.len().saturating_sub(MAX_COMPOSER_LINES);
 
-    let labeled_bottom = (lower..lines.len())
-        .rev()
-        .find(|index| is_horizontal_rule(lines[*index].0) && lines[*index].0.contains(char::is_alphanumeric));
+    let labeled_bottom = (lower..lines.len()).rev().find(|index| {
+        is_horizontal_rule(lines[*index].0) && lines[*index].0.contains(char::is_alphanumeric)
+    });
     if let Some(bottom) = labeled_bottom
-        && let Some(prompt) = (lower..bottom)
-            .rev()
-            .find(|index| is_prompt_row(lines[*index].0))
-        && let Some(top) = (lower..prompt)
-            .rev()
-            .find(|index| is_horizontal_rule(lines[*index].0))
+        && let Some(prompt) = (lower..bottom).rev().find(|index| is_prompt_row(lines[*index].0))
+        && let Some(top) = (lower..prompt).rev().find(|index| is_horizontal_rule(lines[*index].0))
     {
         return Some((lines[top].1, lines[bottom].2));
     }
@@ -100,6 +106,9 @@ pub(super) fn has_current_composer(agent: AgentKind, screen: &str) -> bool {
 }
 
 pub(super) fn is_history_viewport(agent: AgentKind, screen: &str) -> bool {
+    if agent == AgentKind::Codex {
+        return codex_history_viewport(screen);
+    }
     if agent != AgentKind::Claude {
         return false;
     }
@@ -116,9 +125,10 @@ pub(super) fn is_history_viewport(agent: AgentKind, screen: &str) -> bool {
         }
         let banner_end = if CLAUDE_HISTORY.is_match(row) {
             Some(index + 1)
-        } else if rows.get(index + 1).is_some_and(|next| {
-            CLAUDE_HISTORY.is_match(&format!("{row} {next}"))
-        }) {
+        } else if rows
+            .get(index + 1)
+            .is_some_and(|next| CLAUDE_HISTORY.is_match(&format!("{row} {next}")))
+        {
             Some(index + 2)
         } else {
             None
@@ -128,9 +138,7 @@ pub(super) fn is_history_viewport(agent: AgentKind, screen: &str) -> bool {
         let boxed_prompt = rows[end..]
             .windows(2)
             .any(|pair| is_horizontal_rule(pair[0]) && is_prompt_row(pair[1]));
-        if !boxed_prompt
-            || following.first().is_some_and(|line| is_horizontal_rule(line))
-        {
+        if !boxed_prompt || following.first().is_some_and(|line| is_horizontal_rule(line)) {
             return true;
         }
     }
@@ -163,7 +171,7 @@ pub(super) fn attention_region(agent: AgentKind, screen: &str) -> &str {
 
 static CODEX_FOOTER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?s)^[^\r\n]+(?:\r?\n[^\r\n]+)?[ \t]+(?:default|minimal|low|medium|high|xhigh|max|ultra)[ \t]*[·•][^\r\n]*(?:\r?\n[ \t]*Context [^\r\n]+)?(?:\r?\n[ \t]*\?[ \t]+for shortcuts[^\r\n]*)?\s*\z",
+        r"(?s)^[^\r\n]+(?:\r?\n[^\r\n]+)?[ \t]+(?:default|minimal|low|medium|high|xhigh|max|ultra)[ \t]*[·•][^\r\n]*(?:\r?\n[ \t]*Context [^\r\n]+)?(?:\r?\n[ \t]*\?[ \t]+(?:for\s+)?shortcuts[^\r\n]*)?(?:\r?\n[ \t]*⚠[ \t]*\d+[ \t]+warnings?[ \t]*[·•][ \t]*f2[ \t]+to[ \t]+view)?\s*\z",
     )
     .unwrap()
 });
@@ -171,18 +179,7 @@ static CODEX_FOOTER: LazyLock<Regex> = LazyLock::new(|| {
 /// A composer is a frame boundary, not evidence that an assistant has stopped.
 /// Only the adjacent activity block may supply busy/error observations.
 pub(super) fn codex_activity_region(screen: &str) -> Option<&str> {
-    let mut composer = None;
-    let mut offset = 0;
-    for line in screen.split_inclusive('\n') {
-        if let Some(rest) = line.trim().strip_prefix(['›', '»'])
-            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
-            && !rest.trim_start().starts_with(|c: char| c.is_ascii_digit() || c == '[')
-        {
-            composer = Some((offset, offset + line.len()));
-        }
-        offset += line.len();
-    }
-    let (start, end) = composer?;
+    let (start, end) = codex_composer_bounds(screen)?;
     let footer = screen[end..].trim();
     if footer.len() > 2048 || !CODEX_FOOTER.is_match(footer) {
         return None;
@@ -200,6 +197,57 @@ pub(super) fn codex_activity_region(screen: &str) -> Option<&str> {
         }
     }
     Some("")
+}
+
+fn codex_composer_bounds(screen: &str) -> Option<(usize, usize)> {
+    let mut composer = None;
+    let mut offset = 0;
+    for line in screen.split_inclusive('\n') {
+        let row = line.trim();
+        if let Some(rest) = row.strip_prefix(['›', '»'])
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+            && !rest.trim_start().starts_with(|c: char| c.is_ascii_digit() || c == '[')
+        {
+            composer = Some((offset, offset + line.len()));
+        }
+        offset += line.len();
+    }
+    composer
+}
+
+fn codex_history_viewport(screen: &str) -> bool {
+    let Some((start, end)) = codex_composer_bounds(screen) else { return false };
+    let footer = screen[end..].trim();
+    if footer.len() > 2048 {
+        return false;
+    }
+    let rows: Vec<_> = footer.lines().map(str::trim).filter(|row| !row.is_empty()).collect();
+    // History controls must terminate the actual model footer, not occur in prose.
+    for count in 1..=3.min(rows.len()) {
+        let split = rows.len() - count;
+        if CODEX_HISTORY_FOOTER.is_match(&rows[split..].join(" "))
+            && CODEX_FOOTER.is_match(&rows[..split].join("\n"))
+        {
+            return true;
+        }
+    }
+    if !CODEX_FOOTER.is_match(footer) {
+        return false;
+    }
+    let above: Vec<_> = screen[..start]
+        .lines()
+        .rev()
+        .map(str::trim)
+        .filter(|row| !row.is_empty())
+        .take(3)
+        .collect();
+    for count in 1..=above.len() {
+        let banner = above[..count].iter().rev().copied().collect::<Vec<_>>().join(" ");
+        if CODEX_HISTORY_BANNER.is_match(&banner) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Only the final activity block above the current boxed Claude composer.
@@ -266,8 +314,7 @@ mod tests {
             );
             assert!(detect("claude", &screen).is_none(), "{banner}");
             assert!(
-                crate::ai_agents::auto_continue_error_text("claude", &screen, &patterns)
-                    .is_none(),
+                crate::ai_agents::auto_continue_error_text("claude", &screen, &patterns).is_none(),
                 "historical errors: {banner}"
             );
             assert!(!crate::ai_agents::auto_continue_screen_is_safe("claude", &screen));
@@ -285,6 +332,85 @@ mod tests {
             let screen = format!("{text}\n{composer}");
             assert_eq!(detect("claude", &screen).unwrap().status, AgentStatus::Idle);
         }
+    }
+
+    #[test]
+    fn codex_scroll_history_chrome_never_supplies_live_evidence() {
+        let patterns = crate::ai_agents::parse_auto_continue_error_patterns(
+            "stream disconnected before completion:",
+        );
+        let error = "■ stream disconnected before completion: upstream returned HTML (502)";
+        let composer = "› Ask Codex to do anything\nGPT-6.1 Sol · Agent1 max · Context 21% used";
+        for (banner, footer) in [
+            ("↓ Back to bottom · esc", "? for shortcuts"),
+            ("↓ Back to bottom\n· esc", "? for shortcuts"),
+            ("", "Earlier messages available. enter/esc latest · ? for shortcuts"),
+            ("", "Earlier messages available.\nenter/esc latest · ? for shortcuts"),
+            (
+                "↓ Back to bottom · esc",
+                "Earlier messages available. enter/esc latest · ? for shortcuts  ⚠ 2 warnings · f2 to view",
+            ),
+            (
+                "↓ Back to bottom · esc",
+                "Earlier messages available. enter/esc latest · ? shortcuts ⚠ 2 warnings · f2 to view",
+            ),
+            (
+                "↓ Back to bottom · esc",
+                "Earlier messages available. enter/esc latest · ? shortcuts",
+            ),
+        ] {
+            let screen = format!("{error}\n{banner}\n{composer}\n{footer}");
+            assert!(crate::ai_agents::screen_is_history_viewport("codex", &screen), "{screen}");
+            assert!(detect("codex", &screen).is_none(), "history is not a turn outcome");
+            assert!(
+                crate::ai_agents::auto_continue_error_text("codex", &screen, &patterns).is_none()
+            );
+            assert!(!crate::ai_agents::auto_continue_screen_is_safe("codex", &screen));
+        }
+
+        let screenshot_status = "GPT-6.1 Sol · Agent1 max · 825K out · Context 21% used · No changes · main · 370K window · status\n? for shortcuts\n⚠ 2 warnings · f2 to view";
+        let scrolled = format!(
+            "{error}\n↓ Back to bottom · esc\n› Ask Codex to do anything\n{screenshot_status}"
+        );
+        assert!(crate::ai_agents::screen_is_history_viewport("codex", &scrolled));
+        assert!(
+            crate::ai_agents::auto_continue_error_text("codex", &scrolled, &patterns).is_none()
+        );
+        assert!(!crate::ai_agents::auto_continue_screen_is_safe("codex", &scrolled));
+
+        let footer_history = format!(
+            "{error}\n› Ask Codex to do anything\nGPT-6.1 Sol · Agent1 max · 825K out · Context 21% used · No changes · main · 370K window · status\nEarlier messages available.  enter/esc latest · ? shortcuts\n⚠ 2 warnings · f2 to view"
+        );
+        assert!(crate::ai_agents::screen_is_history_viewport("codex", &footer_history));
+        assert!(
+            crate::ai_agents::auto_continue_error_text("codex", &footer_history, &patterns)
+                .is_none()
+        );
+        assert!(!crate::ai_agents::auto_continue_screen_is_safe("codex", &footer_history));
+    }
+
+    #[test]
+    fn codex_scroll_history_lookalikes_do_not_hide_the_live_composer() {
+        let composer =
+            "› Ask Codex to do anything\ngpt-6 medium · Context 2% used\n? for shortcuts";
+        for prose in [
+            "The guide says ↓ Back to bottom · esc",
+            "`↓ Back to bottom · esc`",
+            "\"Earlier messages available. enter/esc latest · ? for shortcuts\"",
+            "↓ Back to bottom · esc\nThe explanation continues here.",
+            "```text\n↓ Back to bottom · esc\n```",
+            "~~~text\nEarlier messages available. enter/esc latest · ? for shortcuts\n~~~",
+            "Earlier messages available. enter/esc latest · ? for shortcuts",
+        ] {
+            let screen = format!("{prose}\n{composer}");
+            assert!(!crate::ai_agents::screen_is_history_viewport("codex", &screen), "{prose}");
+            assert!(crate::ai_agents::screen_has_current_composer("codex", &screen));
+        }
+        let draft = "› ↓ Back to bottom · esc\ngpt-6 medium · Context 2% used\n? for shortcuts";
+        assert!(!crate::ai_agents::screen_is_history_viewport("codex", draft));
+        let truncated_code = format!("tail of a long code block\n```\n{composer}");
+        assert!(crate::ai_agents::screen_has_current_composer("codex", &truncated_code));
+        assert!(!crate::ai_agents::screen_is_history_viewport("codex", &truncated_code));
     }
 
     #[test]
@@ -349,17 +475,9 @@ Enter to select · ↑/↓ to navigate · Esc to cancel
             super::claude_composer_bounds(&working).is_some(),
             "composer fixture was not parsed: {working:?}"
         );
-        assert_eq!(
-            super::claude_activity_region(&working),
-            "✢ Compacting conversation… (2s)"
-        );
+        assert_eq!(super::claude_activity_region(&working), "✢ Compacting conversation… (2s)");
         let detected = detect("claude", &working).unwrap();
-        assert_eq!(
-            detected.status,
-            AgentStatus::Working,
-            "rule={}",
-            detected.rule_id
-        );
+        assert_eq!(detected.status, AgentStatus::Working, "rule={}", detected.rule_id);
 
         let idle =
             format!("✻ Baked for 15m 24s\n────────────────\n❯ \n──────────────── magpie ─{tasks}");

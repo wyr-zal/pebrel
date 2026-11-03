@@ -589,23 +589,26 @@ impl TerminalView {
             return;
         }
         if display_offset > 0 {
-            self.ignore_historical_screen_observation(cx);
+            // Viewing history provides no new evidence about the current turn.
             return;
         }
         let Some(screen) = screen else {
-            self.set_screen_error_indicator(false, cx);
             return;
         };
         if self.running_program.as_deref().is_some_and(|program| {
             crate::ai_agents::screen_is_history_viewport(program, &screen)
         }) {
-            self.ignore_historical_screen_observation(cx);
             return;
         }
         if retry_source.as_deref().is_some_and(|program| {
             !crate::ai_agents::screen_has_current_composer(program, &screen)
         }) {
-            self.ignore_historical_screen_observation(cx);
+            if retry_source.as_deref().is_some_and(|program| {
+                crate::ai_agents::detect(program, &screen)
+                    .is_some_and(|detected| detected.status == AgentStatus::Blocked)
+            }) {
+                self.cancel_auto_continue(cx, "waiting_for_input");
+            }
             return;
         }
         let settings = cx.try_global::<crate::gpui_shell::config::Settings>();
@@ -688,19 +691,6 @@ impl TerminalView {
         );
         cx.emit(TerminalViewEvent::TitleChanged);
         cx.notify();
-    }
-
-    fn ignore_historical_screen_observation(&mut self, cx: &mut Context<Self>) {
-        // A historical viewport is not a fresh observation. Keep the last
-        // current-turn state, but discard evidence that would make an old
-        // screen error actionable.
-        self.set_screen_error_indicator(false, cx);
-        if self.auto_continue.pending()
-            == Some(crate::ai_hook::auto_continue::RetryEvidence::ScreenFailure)
-        {
-            self.auto_continue.take_pending(u8::MAX);
-            self.auto_continue_task = None;
-        }
     }
 }
 

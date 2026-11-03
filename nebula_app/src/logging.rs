@@ -128,6 +128,21 @@ pub(crate) fn startup_diagnostic(message: impl AsRef<str>) {
     append_bounded_log(&path, record.as_bytes());
 }
 
+/// Persist reason-only retry transitions from the background executor, including
+/// when the regular logger's default Warn filter excludes Debug messages.
+pub(crate) fn auto_continue_diagnostic(pane: u64, stage: &'static str, reason: &'static str) {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let pid = process::id();
+    let path = env::temp_dir().join(format!("Pebrel-retry-{pid}.log"));
+    let record = format!(
+        "[{timestamp} pid={pid} pane={pane}] auto_continue: stage={stage} reason={reason}\n"
+    );
+    append_bounded_log(&path, record.as_bytes());
+}
+
 /// User configurable extra log targets to include.
 fn extra_log_targets() -> &'static [String] {
     static EXTRA_LOG_TARGETS: OnceLock<Vec<String>> = OnceLock::new();
@@ -444,6 +459,17 @@ mod tests {
             startup_diagnostic_record(42, "event=launch_begin"),
             "[STARTUP pid=42] event=launch_begin\n",
         );
+    }
+
+    #[test]
+    fn auto_continue_diagnostic_persists_without_the_filtered_logger() {
+        auto_continue_diagnostic(42, "send_paused", "agent_history");
+        let path = env::temp_dir().join(format!("Pebrel-retry-{}.log", process::id()));
+        let records = fs::read_to_string(&path).expect("retry diagnostics must remain available");
+        assert!(
+            records.contains("pane=42] auto_continue: stage=send_paused reason=agent_history\n")
+        );
+        assert!(fs::metadata(path).unwrap().len() <= MAX_LOG_FILE_BYTES);
     }
 
     #[test]

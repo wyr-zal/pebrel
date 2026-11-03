@@ -1,7 +1,16 @@
-use super::super::startup_tests::open;
+use super::super::startup_tests::open as open_terminal;
 use super::*;
 use gpui::{BorrowAppContext as _, TestAppContext};
 use std::time::Duration;
+
+fn open(
+    cx: &mut TestAppContext,
+) -> (gpui::Entity<TerminalView>, &mut gpui::VisualTestContext, std::sync::mpsc::Receiver<Msg>) {
+    let (view, window, receiver) = open_terminal(cx);
+    // An accepted failure still needs a current composer before automatic input.
+    view.update(window, |view, _| screen(view, "────────\n❯ \n────────\n? for shortcuts"));
+    (view, window, receiver)
+}
 
 fn hook(owner: &str, name: &str, sequence: u64) -> AiHookEvent {
     crate::ai_hook::parse_remote_envelope(
@@ -364,58 +373,371 @@ fn working_frames_do_not_forget_an_unchanged_historical_error(cx: &mut TestAppCo
 }
 
 #[gpui::test]
-fn agent_scroll_history_revokes_screen_retry_without_forgetting_old_error(cx: &mut TestAppContext) {
-    let (view, window, receiver) = open(cx);
-    window.update(|_, cx| {
-        cx.update_global::<Settings, _>(|settings, _| {
-            settings.ai_auto_continue = true;
-            settings.ai_auto_continue_interval = Duration::from_secs(1);
-            settings.ai_auto_continue_error_patterns =
-                crate::ai_agents::parse_auto_continue_error_patterns(
-                    nebula_settings::DEFAULT_AUTO_CONTINUE_ERROR_PATTERNS,
+fn agent_scroll_history_preserves_screen_retry_deadline_and_badge(cx: &mut TestAppContext) {
+    for program in ["claude", "codex"] {
+        for viewport in ["internal", "terminal", "composerless"] {
+            for overdue in [false, true] {
+                let (view, window, receiver) = open(cx);
+                window.update(|_, cx| {
+                    cx.update_global::<Settings, _>(|settings, _| {
+                        settings.ai_auto_continue = true;
+                        settings.ai_auto_continue_interval = Duration::from_secs(5);
+                        settings.ai_auto_continue_error_patterns =
+                            crate::ai_agents::parse_auto_continue_error_patterns(
+                                nebula_settings::DEFAULT_AUTO_CONTINUE_ERROR_PATTERNS,
+                            );
+                    })
+                });
+                let composer = if program == "claude" {
+                    "────────\n❯ \n────────\n? for shortcuts"
+                } else {
+                    "› Ask Codex to do anything\ngpt-6 medium · Context 2% used\n? for shortcuts"
+                };
+                let error = if program == "claude" {
+                    "API Error: stream error: stream disconnected before completion"
+                } else {
+                    "■ 503 Service Unavailable"
+                };
+                let live = format!("{error}\n{composer}");
+                let expected_input = view.update(window, |view, cx| {
+                    let owner = format!("history-retry-{program}-{viewport}-{overdue}");
+                    let prompt = if program == "claude" {
+                        hook(&owner, "UserPromptSubmit", 1)
+                    } else {
+                        codex_hook(&owner, "UserPromptSubmit", "turn")
+                    };
+                    assert!(view.handle_ai_hook(&prompt, cx), "{program}/{viewport}/{overdue}");
+                    for row in 0..48 {
+                        super::super::startup_tests::feed(
+                            view,
+                            format!("\r\nhistory row {row}").as_bytes(),
+                        );
+                    }
+                    screen(view, &live);
+                    view.refresh_agent_screen_state(cx);
+                    assert_eq!(view.auto_continue.pending(), Some(RetryEvidence::ScreenFailure));
+                    assert!(view.screen_error_indicator());
+                    if program == "codex" {
+                        crate::input::terminal_input::build_runtime_codex_submission(
+                            "continue",
+                            view.term_mode(),
+                        )
+                    } else {
+                        b"continue\r".to_vec()
+                    }
+                });
+                window.run_until_parked();
+                window.executor().advance_clock(Duration::from_secs(2));
+                let epoch = view.read_with(window, |view, _| view.prompt_input_epoch);
+                view.update(window, |view, cx| {
+                    match viewport {
+                        "internal" => {
+                            let history = if program == "claude" {
+                                format!("old answer\n1 new message (ctrl+End) ↓\n{composer}")
+                            } else {
+                                "old answer\n↓ Back to bottom · esc\n› Ask Codex to do anything\ngpt-6 medium · Context 2% used\nEarlier messages available. enter/esc latest · ? for shortcuts".into()
+                            };
+                            screen(view, &history);
+                        },
+                        "terminal" => view.session.as_ref().unwrap().term.lock().scroll_display(nebula_terminal::grid::Scroll::Top),
+                        _ => screen(view, "Historical output or a partial redraw without current composer."),
+                    }
+                    for _ in 0..4 { view.refresh_agent_screen_state(cx); }
+                    assert!(view.screen_error_indicator(), "{program}/{viewport}: history must preserve the badge");
+                    assert_eq!(view.auto_continue.pending(), Some(RetryEvidence::ScreenFailure));
+                    assert!(view.auto_continue_task.is_some());
+                    assert_eq!(view.prompt_input_epoch, epoch);
+                });
+                window.run_until_parked();
+                window.executor().advance_clock(Duration::from_secs(if overdue { 5 } else { 2 }));
+                window.run_until_parked();
+                assert!(!receiver.try_iter().any(|message| matches!(message, Msg::Input(_))));
+                view.update(window, |view, cx| {
+                    assert_eq!(view.auto_continue.pending(), Some(RetryEvidence::ScreenFailure));
+                    view.session
+                        .as_ref()
+                        .unwrap()
+                        .term
+                        .lock()
+                        .scroll_display(nebula_terminal::grid::Scroll::Bottom);
+                    screen(view, &live);
+                    view.refresh_agent_screen_state(cx);
+                    assert!(view.screen_error_indicator());
+                });
+                window.executor().advance_clock(Duration::from_millis(999));
+                window.run_until_parked();
+                assert!(!receiver.try_iter().any(|message| matches!(message, Msg::Input(_))));
+                window.executor().advance_clock(Duration::from_millis(1));
+                window.run_until_parked();
+                let inputs: Vec<_> = receiver
+                    .try_iter()
+                    .filter_map(|message| match message {
+                        Msg::Input(bytes) => Some(bytes.into_owned()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    inputs,
+                    vec![expected_input],
+                    "{program}/{viewport}/{overdue}: keep the original deadline"
                 );
-        })
-    });
-    view.update(window, |view, cx| {
-        let error = "API Error: stream error: stream disconnected before completion";
-        let composer = "────────\n❯ \n────────\n? for shortcuts";
-        assert!(view.handle_ai_hook(&hook("history-retry", "UserPromptSubmit", 1), cx));
-        screen(view, &format!("{error}\n{composer}"));
-        view.refresh_agent_screen_state(cx);
-        assert!(view.auto_continue_task.is_some());
-        screen(view, &format!("{error}\n1 new message (ctrl+End) ↓\n{composer}"));
-        view.refresh_agent_screen_state(cx);
-        assert!(view.auto_continue_task.is_none());
-        assert!(!view.screen_error_indicator());
-        screen(view, &format!("{error}\n{composer}"));
-        view.refresh_agent_screen_state(cx);
-        assert!(view.auto_continue_task.is_none(), "same error remains consumed");
-        assert!(view.handle_ai_hook(&hook("history-retry", "UserPromptSubmit", 2), cx));
-        screen(view, &format!("{error}\nJump to bottom (ctrl+End) ↓\n{composer}"));
-        view.refresh_agent_screen_state(cx);
-        screen(view, &format!("{error}\n{composer}"));
-        view.refresh_agent_screen_state(cx);
-        assert!(view.auto_continue_task.is_none(), "prompt baseline survives history");
-        screen(view, &format!("{error}\nJump to bottom (ctrl+End) ↓\n{composer}"));
-        assert!(view.handle_ai_hook(&hook("history-retry", "UserPromptSubmit", 3), cx));
-        view.refresh_agent_screen_state(cx);
-        screen(view, &format!("{error}\n{composer}"));
-        view.refresh_agent_screen_state(cx);
-        assert!(!view.screen_error_indicator(), "prompt in history retains error baseline");
-        assert!(view.auto_continue_task.is_none(), "prompt in history cannot reuse old error");
-        screen(view, composer);
-        view.refresh_agent_screen_state(cx);
-        screen(view, &format!("{error}\n{composer}"));
-        view.refresh_agent_screen_state(cx);
-        assert!(view.screen_error_indicator(), "error appearing after a clean frame is new");
-        assert!(view.auto_continue_task.is_some());
-        screen(view, &format!("{error}\nJump to bottom (ctrl+End) ↓\n{composer}"));
-        view.refresh_agent_screen_state(cx);
-    });
-    window.run_until_parked();
-    window.executor().advance_clock(Duration::from_secs(2));
-    window.run_until_parked();
-    assert!(!receiver.try_iter().any(|message| matches!(message, Msg::Input(_))));
+                window.executor().advance_clock(Duration::from_secs(10));
+                window.run_until_parked();
+                assert!(!receiver.try_iter().any(|message| matches!(message, Msg::Input(_))));
+            }
+        }
+    }
+}
+
+#[gpui::test]
+fn agent_scroll_history_at_dispatch_without_refresh_defers_retry(cx: &mut TestAppContext) {
+    for program in ["claude", "codex"] {
+        let (view, window, receiver) = open(cx);
+        window.update(|_, cx| {
+            cx.update_global::<Settings, _>(|settings, _| {
+                settings.ai_auto_continue = true;
+                settings.ai_auto_continue_interval = Duration::from_secs(1);
+                settings.ai_auto_continue_error_patterns =
+                    crate::ai_agents::parse_auto_continue_error_patterns(
+                        nebula_settings::DEFAULT_AUTO_CONTINUE_ERROR_PATTERNS,
+                    );
+            })
+        });
+        let error = if program == "claude" {
+            "API Error: stream error: stream disconnected before completion"
+        } else {
+            "■ 503 Service Unavailable"
+        };
+        let composer = if program == "claude" {
+            "────────\n❯ \n────────\n? for shortcuts"
+        } else {
+            "› Ask Codex to do anything\ngpt-6 medium · Context 2% used\n? for shortcuts"
+        };
+        let live = format!("{error}\n{composer}");
+        let expected_input = view.update(window, |view, cx| {
+            let prompt = if program == "claude" {
+                hook("dispatch-history", "UserPromptSubmit", 1)
+            } else {
+                codex_hook("dispatch-history", "UserPromptSubmit", "turn")
+            };
+            assert!(view.handle_ai_hook(&prompt, cx));
+            screen(view, &live);
+            view.refresh_agent_screen_state(cx);
+            assert!(view.auto_continue_task.is_some());
+            if program == "codex" {
+                crate::input::terminal_input::build_runtime_codex_submission(
+                    "continue",
+                    view.term_mode(),
+                )
+            } else {
+                b"continue\r".to_vec()
+            }
+        });
+        window.run_until_parked();
+        view.update(window, |view, _| {
+            let banner = if program == "claude" {
+                "Jump to bottom (ctrl+End) ↓"
+            } else {
+                "↓ Back to bottom · esc"
+            };
+            screen(view, &format!("{error}\n{banner}\n{composer}"));
+        });
+        window.executor().advance_clock(Duration::from_secs(2));
+        window.run_until_parked();
+        assert!(
+            !receiver.try_iter().any(|message| matches!(message, Msg::Input(_))),
+            "{program}: dispatch must reject historical input even without refresh"
+        );
+        view.update(window, |view, _| {
+            assert_eq!(view.auto_continue.pending(), Some(RetryEvidence::ScreenFailure));
+            screen(view, &live);
+        });
+        window.executor().advance_clock(Duration::from_secs(1));
+        window.run_until_parked();
+        let inputs: Vec<_> = receiver
+            .try_iter()
+            .filter_map(|message| match message {
+                Msg::Input(bytes) => Some(bytes.into_owned()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(inputs, vec![expected_input]);
+    }
+}
+
+#[gpui::test]
+fn agent_scroll_history_new_prompt_retains_the_known_error_baseline(cx: &mut TestAppContext) {
+    for program in ["claude", "codex"] {
+        let (view, window, receiver) = open(cx);
+        window.update(|_, cx| {
+            cx.update_global::<Settings, _>(|settings, _| {
+                settings.ai_auto_continue = true;
+                settings.ai_auto_continue_interval = Duration::from_secs(1);
+                settings.ai_auto_continue_error_patterns =
+                    crate::ai_agents::parse_auto_continue_error_patterns(
+                        nebula_settings::DEFAULT_AUTO_CONTINUE_ERROR_PATTERNS,
+                    );
+            })
+        });
+        let composer = if program == "claude" {
+            "────────\n❯ \n────────\n? for shortcuts"
+        } else {
+            "› Ask Codex to do anything\ngpt-6 medium · Context 2% used\n? for shortcuts"
+        };
+        let error = if program == "claude" {
+            "API Error: stream error: stream disconnected before completion"
+        } else {
+            "■ 503 Service Unavailable"
+        };
+        let prompt = |number| {
+            if program == "claude" {
+                hook("history-baseline", "UserPromptSubmit", number)
+            } else {
+                codex_hook("history-baseline", "UserPromptSubmit", &number.to_string())
+            }
+        };
+        view.update(window, |view, cx| {
+            assert!(view.handle_ai_hook(&prompt(1), cx));
+            screen(view, &format!("{error}\n{composer}"));
+            view.refresh_agent_screen_state(cx);
+            assert!(view.auto_continue.pending().is_some());
+            let banner = if program == "claude" {
+                "Jump to bottom (ctrl+End) ↓"
+            } else {
+                "↓ Back to bottom · esc"
+            };
+            screen(view, &format!("old answer\n{banner}\n{composer}"));
+            assert!(view.handle_ai_hook(&prompt(2), cx));
+            view.refresh_agent_screen_state(cx);
+            screen(view, &format!("{error}\n{composer}"));
+            view.refresh_agent_screen_state(cx);
+            assert!(
+                view.auto_continue.pending().is_none(),
+                "{program}: a new prompt cannot reuse the known old failure"
+            );
+            assert!(!view.screen_error_indicator());
+        });
+        window.run_until_parked();
+        window.executor().advance_clock(Duration::from_secs(2));
+        window.run_until_parked();
+        assert!(!receiver.try_iter().any(|message| matches!(message, Msg::Input(_))));
+    }
+}
+
+#[gpui::test]
+fn agent_scroll_history_paused_retry_still_honors_cancellation(cx: &mut TestAppContext) {
+    for action in [
+        "input",
+        "epoch",
+        "permission_hook",
+        "permission_screen",
+        "success",
+        "cancel",
+        "session",
+        "exit",
+        "limit",
+        "disabled",
+        "prompt",
+        "end",
+        "command",
+        "program",
+    ] {
+        let (view, window, receiver) = open(cx);
+        window.update(|_, cx| {
+            cx.update_global::<Settings, _>(|settings, _| {
+                settings.ai_auto_continue = true;
+                settings.ai_auto_continue_interval = Duration::from_secs(1);
+                settings.ai_auto_continue_error_patterns =
+                    crate::ai_agents::parse_auto_continue_error_patterns(
+                        nebula_settings::DEFAULT_AUTO_CONTINUE_ERROR_PATTERNS,
+                    );
+            })
+        });
+        let live = "■ 503 Service Unavailable\n› Ask Codex to do anything\ngpt-6 medium · Context 2% used\n? for shortcuts";
+        view.update(window, |view, cx| {
+            assert!(view.handle_ai_hook(&codex_hook(action, "UserPromptSubmit", "turn"), cx));
+            screen(view, live);
+            view.refresh_agent_screen_state(cx);
+            screen(view, "old output\n↓ Back to bottom · esc\n› Ask Codex to do anything\ngpt-6 medium · Context 2% used\nEarlier messages available. enter/esc latest · ? for shortcuts");
+            view.refresh_agent_screen_state(cx);
+        });
+        window.run_until_parked();
+        window.executor().advance_clock(Duration::from_secs(2));
+        window.run_until_parked();
+        assert!(!receiver.try_iter().any(|message| matches!(message, Msg::Input(_))));
+        view.read_with(window, |view, _| assert!(view.auto_continue.pending().is_some()));
+        if action == "limit" {
+            window.update(|_, cx| {
+                cx.update_global::<Settings, _>(|settings, _| {
+                    settings.ai_auto_continue_attempts = 0
+                })
+            });
+        }
+        if action == "disabled" {
+            window.update(|_, cx| {
+                cx.update_global::<Settings, _>(|settings, _| settings.ai_auto_continue = false)
+            });
+            window.run_until_parked();
+            window.update(|_, cx| {
+                cx.update_global::<Settings, _>(|settings, _| settings.ai_auto_continue = true)
+            });
+        }
+        view.update(window, |view, cx| {
+            match action {
+                "input" => view.write_input(b"manual".to_vec(), cx),
+                "epoch" => view.prompt_input_epoch = view.prompt_input_epoch.wrapping_add(1),
+                "permission_hook" => {
+                    let event = codex_hook(action, "PermissionRequest", "turn");
+                    assert_eq!(event.kind, AiHookKind::NeedsAttention);
+                    assert!(view.handle_ai_hook(&event, cx));
+                    assert_eq!(view.agent_activity.status(), AgentStatus::Blocked);
+                    assert!(view.auto_continue.pending().is_none());
+                    assert!(view.auto_continue_task.is_none());
+                },
+                "permission_screen" => {
+                    screen(
+                        view,
+                        "Allow command?\n› 1. Yes\n2. No\nPress enter to confirm or esc to cancel",
+                    );
+                    view.refresh_agent_screen_state(cx);
+                    assert!(view.auto_continue.pending().is_none());
+                    assert!(view.auto_continue_task.is_none());
+                },
+                "success" | "cancel" => {
+                    let mut event = codex_hook(action, "Stop", "turn");
+                    event.turn_outcome = if action == "success" {
+                        crate::ai_hook::AiTurnOutcome::Succeeded
+                    } else {
+                        crate::ai_hook::AiTurnOutcome::Cancelled
+                    };
+                    assert!(view.handle_ai_hook(&event, cx));
+                },
+                "session" => view.ai_session.as_mut().unwrap().session_id = "replacement".into(),
+                "exit" => view.exited = Some("exited".into()),
+                "prompt" => {
+                    assert!(
+                        view.handle_ai_hook(&codex_hook(action, "UserPromptSubmit", "next"), cx)
+                    );
+                },
+                "end" => {
+                    assert!(view.handle_ai_hook(&codex_hook(action, "SessionEnd", "turn"), cx));
+                },
+                "command" => {
+                    view.clear_foreground_agent_state(cx);
+                },
+                "program" => view.running_program = Some("claude".into()),
+                _ => {},
+            }
+            screen(view, live);
+        });
+        receiver.try_iter().for_each(drop);
+        window.executor().advance_clock(Duration::from_secs(2));
+        window.run_until_parked();
+        assert!(
+            !receiver.try_iter().any(|message| matches!(message, Msg::Input(_))),
+            "{action}: old paused input must stay cancelled"
+        );
+    }
 }
 
 #[gpui::test]
@@ -447,10 +769,13 @@ fn agent_scroll_history_defers_hook_retry_until_live_screen(cx: &mut TestAppCont
     });
     window.executor().advance_clock(Duration::from_secs(1));
     window.run_until_parked();
-    let inputs: Vec<_> = receiver.try_iter().filter_map(|message| match message {
-        Msg::Input(bytes) => Some(bytes.into_owned()),
-        _ => None,
-    }).collect();
+    let inputs: Vec<_> = receiver
+        .try_iter()
+        .filter_map(|message| match message {
+            Msg::Input(bytes) => Some(bytes.into_owned()),
+            _ => None,
+        })
+        .collect();
     assert_eq!(inputs, vec![b"continue\r".to_vec()]);
 }
 
@@ -515,7 +840,9 @@ fn next_turn_new_error_retries_without_an_intermediate_clear_frame(cx: &mut Test
         view.handle_ai_hook(&codex_hook("next-error", "Stop", "first"), cx);
         screen(view, first);
         let snapshot = view.auto_continue_screen_snapshot().unwrap();
-        assert!(view.auto_continue_screen_error("codex", &snapshot, cx.global::<Settings>()).is_some());
+        assert!(
+            view.auto_continue_screen_error("codex", &snapshot, cx.global::<Settings>()).is_some()
+        );
         assert!(view.auto_continue_screen_can_retry("codex", &snapshot));
         view.refresh_agent_screen_state(cx);
     });

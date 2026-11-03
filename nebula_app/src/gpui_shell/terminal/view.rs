@@ -897,7 +897,7 @@ impl TerminalView {
                 self.agent_activity.request_cancel();
             }
         }
-        self.cancel_auto_continue();
+        self.cancel_auto_continue(cx, "input_changed");
         self.completion_editor.invalidate();
         self.editor_query_task = None;
         self.cursor_animation.note_input(&bytes);
@@ -1481,7 +1481,7 @@ impl gpui::EntityInputHandler for TerminalView {
             return;
         }
         if !new_text.is_empty() {
-            self.cancel_auto_continue();
+            self.cancel_auto_continue(cx, "marked_text");
         }
         let marked_text = if new_text.is_empty() { None } else { Some(new_text.to_string()) };
         if self.marked_text != marked_text {

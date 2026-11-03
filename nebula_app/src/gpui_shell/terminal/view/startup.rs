@@ -332,7 +332,7 @@ impl TerminalView {
             screen_error_at_prompt: None,
             _auto_continue_subscription: cx.observe_global::<Settings>(|view, cx| {
                 if !cx.global::<Settings>().ai_auto_continue {
-                    view.cancel_auto_continue();
+                    view.cancel_auto_continue(cx, "disabled");
                 }
             }),
             progress: crate::taskbar::TaskProgress::None,

@@ -196,7 +196,7 @@ impl TerminalView {
         }
         self.invalidate_shell_boundary_probe();
         self.invalidate_agent_identity_probe();
-        self.cancel_auto_continue();
+        self.cancel_auto_continue(cx, "command_ended");
         self.auto_continue.reset();
         self.screen_error_at_prompt = None;
         if let Some(session) = &self.session {

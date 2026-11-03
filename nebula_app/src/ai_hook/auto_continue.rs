@@ -84,6 +84,10 @@ impl AutoContinue {
             .flatten()
     }
 
+    pub fn screen_failure_baseline(&self) -> Option<&str> {
+        self.screen_failure_latched.as_deref()
+    }
+
     pub fn take_pending(&mut self, max_attempts: u8) -> Option<RetryEvidence> {
         self.pending.take().filter(|_| self.attempts < max_attempts)
     }
@@ -302,21 +306,22 @@ mod tests {
         assert_eq!(rejected.reason, ScreenRetryReason::PromptNotArmed);
         assert_eq!(rejected.reason.code(), "prompt_not_armed");
         assert!(rejected.should_log);
-        assert!(!state
-            .observe_screen_failure_diagnostic(
-                "codex",
-                Some("session"),
-                Some("high-demand error identity"),
-                true,
-                true,
-                now,
-                3,
-                interval,
-            )
-            .should_log);
+        assert!(
+            !state
+                .observe_screen_failure_diagnostic(
+                    "codex",
+                    Some("session"),
+                    Some("high-demand error identity"),
+                    true,
+                    true,
+                    now,
+                    3,
+                    interval,
+                )
+                .should_log
+        );
 
-        let scheduled = state
-            .observe(&event("SessionStart", ""), now, 3, interval);
+        let scheduled = state.observe(&event("SessionStart", ""), now, 3, interval);
         assert_eq!(scheduled, None);
         state.observe(&event("UserPromptSubmit", ""), now, 3, interval);
         let scheduled = state.observe_screen_failure_diagnostic(
@@ -345,21 +350,30 @@ mod tests {
         );
         assert_eq!(pending.reason, ScreenRetryReason::RetryPending);
         assert!(pending.should_log);
-        assert!(!state
-            .observe_screen_failure_diagnostic(
-                "codex",
-                Some("session"),
-                Some("high-demand error identity"),
-                true,
-                true,
-                now,
-                3,
-                interval,
-            )
-            .should_log);
+        assert!(
+            !state
+                .observe_screen_failure_diagnostic(
+                    "codex",
+                    Some("session"),
+                    Some("high-demand error identity"),
+                    true,
+                    true,
+                    now,
+                    3,
+                    interval,
+                )
+                .should_log
+        );
 
         let cleared = state.observe_screen_failure_diagnostic(
-            "codex", Some("session"), None, true, true, now, 3, interval,
+            "codex",
+            Some("session"),
+            None,
+            true,
+            true,
+            now,
+            3,
+            interval,
         );
         assert_eq!(cleared.reason, ScreenRetryReason::NoError);
         assert!(!cleared.should_log);

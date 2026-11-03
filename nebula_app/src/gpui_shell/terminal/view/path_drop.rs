@@ -101,7 +101,7 @@ impl TerminalView {
             );
             return;
         };
-        self.cancel_auto_continue();
+        self.cancel_auto_continue(cx, "path_input");
         let distro = self
             .exec_context
             .as_ref()
