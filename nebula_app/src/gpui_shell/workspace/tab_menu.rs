@@ -94,6 +94,12 @@ fn file_manager_directory(
     if view.ssh_destination.is_some() {
         return None;
     }
+    // Nested WSL uses the observed guest location without replacing the execution cwd.
+    if let Some((distro, guest)) = view.observed_wsl_cwd() {
+        let located =
+            crate::shell_detect::WslCwd { distro: distro.to_owned(), guest: guest.to_owned() };
+        return crate::shell_detect::wsl_host_cwd(&located);
+    }
     let cwd = view.working_directory()?;
     // A WSL path must never fall through to the host's current drive or default distro.
     if let Some(distro) = view.exec_context.as_ref().and_then(|context| context.wsl_distribution())
@@ -474,7 +480,7 @@ mod cwd_copy_tests {
     use gpui::{AppContext as _, ClipboardItem, IntoElement, TestAppContext};
     use gpui_component::Root;
 
-    fn open_source(
+    pub(super) fn open_source(
         cx: &mut TestAppContext,
     ) -> (Entity<TerminalView>, &mut gpui::VisualTestContext) {
         cx.update(|cx| {
@@ -702,6 +708,9 @@ mod cwd_copy_tests {
         }
     }
 }
+
+#[cfg(all(test, windows, feature = "gpui-test-support"))]
+mod wsl_cwd_tests;
 
 #[cfg(test)]
 mod tests {

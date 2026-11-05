@@ -10,7 +10,6 @@ fn ssh_label(destination: Option<&str>, directory: &std::path::Path) -> Option<S
     profiles.labels().remove(destination)
 }
 
-#[cfg(windows)]
 fn observed_wsl_tab_label(distro: &str, cwd: &str) -> String {
     last_path_component(cwd).unwrap_or_else(|| distro.to_owned())
 }
@@ -34,6 +33,22 @@ impl TerminalView {
         ((path.starts_with('/') || std::path::Path::new(path).is_absolute())
             && !path.chars().any(char::is_control))
         .then_some(path)
+    }
+
+    pub(crate) fn observed_wsl_cwd(&self) -> Option<(&str, &str)> {
+        #[cfg(windows)]
+        if let Some(location) = self.wsl_cwd_observer.observed() {
+            return Some((&location.distro, &location.cwd));
+        }
+        None
+    }
+
+    #[cfg(all(test, windows, feature = "gpui-test-support"))]
+    pub(crate) fn set_observed_wsl_location_for_test(
+        &mut self,
+        location: Option<crate::platform::wsl_location::ObservedWslLocation>,
+    ) {
+        self.wsl_cwd_observer.set_observed_for_test(location);
     }
 
     pub fn copy_working_directory(
@@ -65,9 +80,8 @@ impl TerminalView {
         if let Some(destination) = &self.ssh_destination {
             return self.ssh_label.as_ref().unwrap_or(destination).clone();
         }
-        #[cfg(windows)]
-        if let Some(location) = self.wsl_cwd_observer.observed() {
-            return observed_wsl_tab_label(&location.distro, &location.cwd);
+        if let Some((distro, cwd)) = self.observed_wsl_cwd() {
+            return observed_wsl_tab_label(distro, cwd);
         }
         last_path_component(&self.cwd)
             .or_else(|| {
@@ -92,17 +106,12 @@ impl TerminalView {
                 lines.push(destination.clone());
             }
         }
-        #[cfg(windows)]
-        if let Some(location) = self.wsl_cwd_observer.observed() {
-            let guest_location = format!("{} · {}", location.distro, location.cwd);
+        if let Some((distro, cwd)) = self.observed_wsl_cwd() {
+            let guest_location = format!("{distro} · {cwd}");
             if !lines.contains(&guest_location) {
                 lines.push(guest_location);
             }
         } else if !self.cwd.trim().is_empty() && !lines.contains(&self.cwd) {
-            lines.push(self.cwd.clone());
-        }
-        #[cfg(not(windows))]
-        if !self.cwd.trim().is_empty() && !lines.contains(&self.cwd) {
             lines.push(self.cwd.clone());
         }
         if self.exited.is_none()
@@ -141,7 +150,6 @@ impl TerminalView {
 mod tests {
     use super::*;
 
-    #[cfg(windows)]
     #[test]
     fn observed_wsl_root_uses_distribution_as_tab_label() {
         assert_eq!(observed_wsl_tab_label("Ubuntu-22.04", "/"), "Ubuntu-22.04");
