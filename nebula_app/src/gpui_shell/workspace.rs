@@ -1143,10 +1143,8 @@ impl NebulaWorkspace {
         // 设置页的「启动目录」（存在且是目录才算数），否则继承聚焦 pane
         // 的 cwd——`startup_directory=` 因此在两壳有同一效果。WSL 来宾目录
         // 见 `tab_duplication::CopyKind::NewTab`。
-        let (launch, cwd) = match Self::startup_directory() {
-            Some(dir) => (shell_launch::configured_local_launch(cx), Some(dir)),
-            None => self.new_tab_from_focused(cx),
-        };
+        let (launch, cwd) =
+            self.new_tab_from_focused(shell_launch::configured_local_launch(cx), cx);
         self.add_terminal_with(launch, cwd, None, window, cx);
     }
 
@@ -2096,12 +2094,7 @@ impl NebulaWorkspace {
             program: shell.program().to_owned(),
             args: shell.args().to_vec(),
         };
-        let cwd = Self::startup_directory().or_else(|| {
-            self.tabs
-                .get(self.active)
-                .and_then(WorkspaceTab::focused_view)
-                .and_then(|view| view.read(cx).local_cwd())
-        });
+        let (launch, cwd) = self.new_tab_from_focused(launch, cx);
         self.add_terminal_with(launch, cwd, None, window, cx);
     }
 
@@ -2113,12 +2106,7 @@ impl NebulaWorkspace {
     ) {
         self.dismiss_palette_state();
         let launch = shell_launch::profile_launch_session(profile);
-        let cwd = Self::startup_directory().or_else(|| {
-            self.tabs
-                .get(self.active)
-                .and_then(WorkspaceTab::focused_view)
-                .and_then(|view| view.read(cx).local_cwd())
-        });
+        let (launch, cwd) = self.new_tab_from_focused(launch, cx);
         self.add_terminal_with(launch, cwd, None, window, cx);
     }
 

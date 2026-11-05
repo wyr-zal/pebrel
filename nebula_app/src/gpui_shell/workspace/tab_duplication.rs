@@ -138,9 +138,15 @@ pub(super) fn copy_launch(
 }
 
 impl NebulaWorkspace {
-    /// New-tab identity from the focused pane; see [`PaneOrigin::of`].
-    pub(super) fn new_tab_from_focused(&self, cx: &gpui::App) -> (LaunchSession, Option<PathBuf>) {
-        let launch = super::shell_launch::configured_local_launch(cx);
+    /// New-tab location for the chosen shell, shared by the default and picker entries.
+    pub(super) fn new_tab_from_focused(
+        &self,
+        launch: LaunchSession,
+        cx: &gpui::App,
+    ) -> (LaunchSession, Option<PathBuf>) {
+        if let Some(directory) = Self::startup_directory() {
+            return (launch, Some(directory));
+        }
         let Some(view) = self.tabs.get(self.active).and_then(super::WorkspaceTab::focused_view)
         else {
             return (launch, None);
@@ -350,3 +356,6 @@ mod tests {
 
 #[cfg(all(test, feature = "gpui-test-support"))]
 mod layout_tests;
+
+#[cfg(all(windows, test, feature = "gpui-test-support"))]
+mod picker_tests;
