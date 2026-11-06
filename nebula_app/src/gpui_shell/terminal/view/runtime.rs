@@ -193,6 +193,9 @@ impl TerminalView {
         {
             self.native_command_boundary = None;
             self.revoke_wsl_agent_identity(false);
+            if self.wsl_cwd_observer.finish_command() {
+                cx.emit(TerminalViewEvent::TitleChanged);
+            }
         }
         self.invalidate_shell_boundary_probe();
         self.invalidate_agent_identity_probe();
@@ -942,10 +945,6 @@ impl TerminalView {
     /// File and process operations run on the background executor. Only results
     /// for the same foreground command and unchanged identity are applied.
     pub(super) fn probe_missing_codex_session(&mut self, cx: &mut Context<Self>) {
-        #[cfg(windows)]
-        if self.wsl_identity_override_is_current() {
-            return;
-        }
         if self.exited.is_some()
             || self.ai_session_probe_pending
             || self.ssh_destination.is_some()
@@ -964,13 +963,31 @@ impl TerminalView {
             return;
         }
         let Some(exec_context) = self.exec_context.clone() else { return };
+        let wsl_binding = self.wsl_session_probe_binding();
+        if (wsl_binding.is_none() && self.saved_wsl_agent().is_some())
+            || wsl_binding.as_ref().is_some_and(|(_, location)| {
+                location.agent.kind != crate::ai_agents::AgentKind::Codex
+                    || exec_context.process_instance().is_none()
+            })
+        {
+            // During a temporary loss of the guest receipt, a remembered WSL
+            // target cannot authorize a lookup in the outer Windows Shell.
+            return;
+        }
         let epoch = self.ai_session_probe_epoch;
         let pane_id = self.pane_id;
         let shell_pid = self.session.as_ref().map(|session| session.shell_pid);
+        let pty = self.session.as_ref().map(|session| std::sync::Arc::downgrade(&session.term));
         let previous_target = self.session_agent();
         self.ai_session_probe_pending = true;
         self.last_ai_session_probe = Some(std::time::Instant::now());
+        let work_binding = wsl_binding.clone();
         let work = cx.background_executor().spawn(async move {
+            if let Some((scope, location)) = work_binding {
+                return crate::platform::ai_session_identity::probe_observed_wsl_codex_session_in_scope(
+                    pane_id, &exec_context, &scope, &location,
+                );
+            }
             crate::platform::ai_session_identity::probe_codex_session(
                 pane_id,
                 Some(&exec_context),
@@ -983,43 +1000,78 @@ impl TerminalView {
                 if view.ai_session_probe_epoch == epoch {
                     view.ai_session_probe_pending = false;
                 }
+                let same_pty = pty.as_ref().is_some_and(|pty| {
+                    view.session.as_ref().is_some_and(|session| {
+                        pty.ptr_eq(&std::sync::Arc::downgrade(&session.term))
+                            && Some(session.shell_pid) == shell_pid
+                    })
+                });
+                let same_wsl_owner = match &wsl_binding {
+                    Some((scope, location)) => {
+                        view.wsl_session_probe_owner_is_current(scope, location)
+                    },
+                    None => {
+                        view.wsl_session_probe_binding().is_none()
+                            && view.saved_wsl_agent().is_none()
+                    },
+                };
                 if !probe_result_is_current(
                     view.ai_session_probe_epoch,
                     epoch,
-                    view.session_agent() != previous_target,
+                    !same_session_identity(view.session_agent().as_ref(), previous_target.as_ref()),
                     view.running_program.as_deref(),
-                ) {
+                ) || !same_pty
+                    || !same_wsl_owner
+                    || view.exited.is_some()
+                    || view.error.is_some()
+                {
                     return;
                 }
                 if let Some(session) = session_id {
                     log::debug!("agent session identity from active rollout: pane={pane_id}");
-                    let target = crate::session::AgentSession {
-                        source: "codex".to_owned(),
-                        session_id: Some(session.session_id.clone()),
-                        session_file: Some(session.session_file),
-                    };
-                    let previous = view.recovery.target.clone();
-                    if !view.recovery.confirm(target) {
-                        return;
-                    }
-                    if previous != view.recovery.target {
-                        view.set_screen_error_indicator(false, cx);
-                        cx.emit(TerminalViewEvent::SessionIdentityChanged);
-                    }
-                    view.ai_session = Some(crate::display::AiSessionIdentity {
-                        source: "codex".to_owned(),
-                        session_id: session.session_id,
-                    });
-                    if let Some(cwd) = session.cwd {
-                        view.process_event(nebula_terminal::event::Event::CwdReport(cwd), cx);
-                    }
-                    view.ai_session_from_probe = true;
-                    cx.emit(TerminalViewEvent::TitleChanged);
-                    cx.notify();
+                    let guest = wsl_binding.is_some();
+                    view.apply_codex_session_identity(session, guest, cx);
                 }
             });
         })
         .detach();
+    }
+
+    pub(super) fn apply_codex_session_identity(
+        &mut self,
+        session: crate::platform::ai_session_identity::CodexSession,
+        observed_guest: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.with_wsl_launch(crate::session::AgentSession {
+            source: "codex".to_owned(),
+            session_id: Some(session.session_id.clone()),
+            session_file: Some(session.session_file),
+            wsl_launch: None,
+        });
+        let previous = self.recovery.target.clone();
+        if !self.recovery.confirm_live(target.clone(), observed_guest) {
+            return;
+        }
+        if observed_guest {
+            self.confirm_saved_wsl_identity(&target);
+        }
+        if !same_session_identity(previous.as_ref(), self.recovery.target.as_ref()) {
+            self.set_screen_error_indicator(false, cx);
+            cx.emit(TerminalViewEvent::SessionIdentityChanged);
+        }
+        self.ai_session = Some(crate::display::AiSessionIdentity {
+            source: "codex".to_owned(),
+            session_id: session.session_id,
+        });
+        // Metadata cwd belongs to the rollout's creation. Observed WSL cwd
+        // remains guest recovery metadata and must not overwrite Host cwd.
+        if !observed_guest && let Some(cwd) = session.cwd {
+            self.process_event(nebula_terminal::event::Event::CwdReport(cwd), cx);
+        }
+        self.ai_session_from_probe = true;
+        cx.emit(TerminalViewEvent::TitleChanged);
+        cx.notify();
     }
 
     pub(super) fn sync_native_prompt(&mut self) {
@@ -1309,6 +1361,21 @@ fn probe_result_is_current(
         && running_program
             .and_then(crate::ai_agents::AgentKind::parse)
             .is_some_and(|agent| agent == crate::ai_agents::AgentKind::Codex)
+}
+
+fn same_session_identity(
+    first: Option<&crate::session::AgentSession>,
+    second: Option<&crate::session::AgentSession>,
+) -> bool {
+    match (first, second) {
+        (Some(first), Some(second)) => {
+            first.source == second.source
+                && first.session_id == second.session_id
+                && first.session_file == second.session_file
+        },
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 /// 一次写入是谁发起的。安全判定不看写了什么，看谁让写的。

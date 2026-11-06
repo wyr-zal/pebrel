@@ -2,23 +2,22 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-#[cfg(windows)]
-use std::sync::Weak;
-#[cfg(windows)]
-use std::path::Path;
 use std::time::{Duration, Instant};
+#[cfg(windows)]
+use std::{path::Path, sync::Weak};
 
 use gpui::{Context, EventEmitter as _};
 
 use super::{TerminalView, TerminalViewEvent};
 use crate::platform::agent_process_identity::{self, AgentProbe, AgentRecheck, ForegroundAgent};
-#[cfg(windows)]
-use super::wsl_cwd_observer::WslIdentityScope;
+use crate::platform::ai_session_identity::{
+    ObservedWslLocation, ObservedWslSessionScope as WslIdentityScope,
+};
 
 #[cfg(windows)]
-type WslPty = nebula_terminal::sync::FairMutex<
-    nebula_terminal::Term<super::session::EventProxy>,
->;
+type WslPty = nebula_terminal::sync::FairMutex<nebula_terminal::Term<super::session::EventProxy>>;
+
+pub(super) type WslSessionProbeBinding = (WslIdentityScope, ObservedWslLocation);
 
 const PROBE_INTERVAL: Duration = Duration::from_secs(2);
 const RECHECK_INTERVAL: Duration = Duration::from_secs(5);
@@ -82,9 +81,9 @@ fn additional_binding_is_current(
     current_input == request_input && same_pty && same_scope && !closed && !cancelled
 }
 
+#[cfg(windows)]
 impl TerminalView {
     /// Called only for a shell submission, before any bytes reach the PTY.
-    #[cfg(windows)]
     pub(super) fn capture_native_command_boundary(&mut self) -> bool {
         let identity_changed = self.revoke_wsl_agent_identity(true);
         let wsl_boundary = if self.ssh_destination.is_none()
@@ -106,7 +105,6 @@ impl TerminalView {
         identity_changed
     }
 
-    #[cfg(windows)]
     fn current_wsl_identity_binding(&self) -> Option<(WslIdentityScope, Weak<WslPty>, u32)> {
         let scope = self.wsl_cwd_observer.identity_scope()?;
         let session = self.session.as_ref()?;
@@ -116,7 +114,16 @@ impl TerminalView {
         Some((scope, Arc::downgrade(&session.term), session.shell_pid))
     }
 
-    #[cfg(windows)]
+    pub(super) fn wsl_session_probe_binding(&self) -> Option<WslSessionProbeBinding> {
+        let scope = self.wsl_cwd_observer.recovery_scope()?;
+        let session = self.session.as_ref()?;
+        let location = self.wsl_cwd_observer.observed()?.clone();
+        if session.shell_pid == 0 || session.shell_pid != scope.boundary.shell.pid {
+            return None;
+        }
+        Some((scope, location))
+    }
+
     pub(super) fn wsl_identity_override_is_current(&self) -> bool {
         let Some(owner) = &self.wsl_identity_override else { return false };
         self.current_wsl_identity_binding().is_some_and(|(scope, pty, shell_pid)| {
@@ -126,7 +133,6 @@ impl TerminalView {
         })
     }
 
-    #[cfg(windows)]
     pub(super) fn sync_wsl_agent_identity(&mut self) -> bool {
         if self.agent_activity.hook_seen() {
             return self.revoke_wsl_agent_identity(false);
@@ -160,10 +166,7 @@ impl TerminalView {
                     return false;
                 }
                 if owner.receipt == location.agent {
-                    self.retire_probe_session_for_identity(
-                        Some(owner.receipt.kind.slug()),
-                        false,
-                    );
+                    self.retire_probe_session_for_identity(Some(owner.receipt.kind.slug()), true);
                     return false;
                 }
                 if let Some(current) = &mut self.wsl_identity_override {
@@ -190,11 +193,7 @@ impl TerminalView {
         true
     }
 
-    #[cfg(windows)]
-    pub(super) fn sync_wsl_agent_identity_with_context(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    pub(super) fn sync_wsl_agent_identity_with_context(&mut self, cx: &mut Context<Self>) -> bool {
         let previous_session = self.ai_session.clone();
         let changed = self.sync_wsl_agent_identity();
         let session_changed = previous_session != self.ai_session;
@@ -204,7 +203,6 @@ impl TerminalView {
         changed || session_changed
     }
 
-    #[cfg(windows)]
     pub(super) fn revoke_wsl_agent_identity(&mut self, restore_base: bool) -> bool {
         let Some(owner) = self.wsl_identity_override.take() else { return false };
         let receipt_owned = self.agent_identity_receipt.as_ref() == Some(&owner.receipt);
@@ -220,6 +218,57 @@ impl TerminalView {
             return true;
         }
         receipt_owned
+    }
+
+    pub(super) fn capture_native_recovery_boundary(&mut self) {
+        if !self.recovery.requires_foreground_receipt()
+            || !self.suggest.suggest_env.is_this_machine()
+            || self.ssh_destination.is_some()
+        {
+            self.native_command_boundary = None;
+            return;
+        }
+        self.invalidate_agent_identity_probe();
+        self.pending_recovery_hooks.clear();
+        self.native_command_boundary = self.session.as_ref().and_then(|session| {
+            agent_process_identity::NativeLaunchBoundary::capture(session.shell_pid)
+        });
+    }
+
+    pub(super) fn saved_wsl_agent(&self) -> Option<&crate::session::AgentSession> {
+        self.wsl_cwd_observer.saved_agent()
+    }
+
+    pub(super) fn confirm_saved_wsl_identity(&mut self, target: &crate::session::AgentSession) {
+        self.wsl_cwd_observer.confirm_saved_identity(target);
+    }
+}
+
+#[cfg(not(windows))]
+impl TerminalView {
+    pub(super) fn saved_wsl_agent(&self) -> Option<&crate::session::AgentSession> {
+        None
+    }
+
+    pub(super) fn wsl_session_probe_binding(&self) -> Option<WslSessionProbeBinding> {
+        None
+    }
+
+    pub(super) fn confirm_saved_wsl_identity(&mut self, _: &crate::session::AgentSession) {}
+}
+
+impl TerminalView {
+    pub(super) fn wsl_session_probe_owner_is_current(
+        &self,
+        expected_scope: &WslIdentityScope,
+        expected_location: &ObservedWslLocation,
+    ) -> bool {
+        self.wsl_session_probe_binding().is_some_and(|(scope, location)| {
+            scope == *expected_scope
+                && location.agent == expected_location.agent
+                && location.distro == expected_location.distro
+                && location.user == expected_location.user
+        })
     }
 
     fn publish_agent_identity_receipt(
@@ -250,26 +299,23 @@ impl TerminalView {
         {
             return false;
         }
-        let changed = self.ai_session.take().is_some();
+        let previous_identity = self.ai_session.take();
+        let changed = previous_identity.is_some();
+        if self.recovery.live.as_ref().is_some_and(|live| {
+            live.wsl_launch.is_some()
+                && previous_identity.as_ref().is_some_and(|identity| {
+                    live.source == identity.source
+                        && live.session_id.as_deref() == Some(identity.session_id.as_str())
+                })
+        }) {
+            // The observer retains the last coherent guest recovery candidate
+            // during a temporary probe failure. A new receipt cannot reuse this
+            // process-owned live identity from the previous WSL Agent.
+            self.recovery.live = None;
+        }
         self.ai_session_from_probe = false;
         self.invalidate_ai_session_probe();
         changed
-    }
-
-    #[cfg(windows)]
-    pub(super) fn capture_native_recovery_boundary(&mut self) {
-        if !self.recovery.requires_foreground_receipt()
-            || !self.suggest.suggest_env.is_this_machine()
-            || self.ssh_destination.is_some()
-        {
-            self.native_command_boundary = None;
-            return;
-        }
-        self.invalidate_agent_identity_probe();
-        self.pending_recovery_hooks.clear();
-        self.native_command_boundary = self.session.as_ref().and_then(|session| {
-            agent_process_identity::NativeLaunchBoundary::capture(session.shell_pid)
-        });
     }
 
     /// Invalidation requests cancellation; only the completed worker releases its slot.
@@ -850,6 +896,7 @@ mod proof_contract_tests {
             });
             view.ai_session_from_probe = true;
             view.recovery.target = Some(crate::session::AgentSession {
+                wsl_launch: None,
                 source: "codex".into(),
                 session_id: Some("derived-old".into()),
                 session_file: None,
@@ -954,6 +1001,7 @@ mod proof_contract_tests {
 
     fn failed_codex_recovery(view: &mut TerminalView) -> crate::session::AgentSession {
         let target = crate::session::AgentSession {
+            wsl_launch: None,
             source: "codex".into(),
             session_id: Some("missing-codex".into()),
             session_file: None,

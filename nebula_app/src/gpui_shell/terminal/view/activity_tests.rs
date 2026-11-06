@@ -260,6 +260,7 @@ fn claude_resume_relocated_transcript_accepts_authenticated_hook_chain(cx: &mut 
         let id = "832ce477-f0e1-42d7-a438-32693bb51d6b";
         let current_file = format!("/home/test/.claude/projects/-project/{id}.jsonl");
         view.recovery.target = Some(crate::session::AgentSession {
+            wsl_launch: None,
             source: "claude".into(),
             session_id: Some(id.into()),
             session_file: Some(format!("/home/test/.claude/projects/-old-worktree/{id}.jsonl")),

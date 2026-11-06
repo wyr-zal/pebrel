@@ -126,6 +126,13 @@ impl SessionRecovery {
         {
             target.session_file = previous.session_file.clone();
         }
+        if target.wsl_launch.is_none()
+            && self.awaiting_confirmation
+            && let Some(previous) = &self.target
+            && previous.source == target.source
+        {
+            target.wsl_launch = previous.wsl_launch.clone();
+        }
         let recovered_pending_target = self.awaiting_confirmation;
         self.target = Some(target.clone());
         if recovered_pending_target {
@@ -199,11 +206,26 @@ impl TerminalView {
     pub(super) fn choose_codex_recovery_session(&mut self, cx: &mut Context<Self>) {
         // Keep the old target until the user's choice receives a native
         // acknowledgement. Directory similarity cannot recover a missing ID.
+        let command = self
+            .recovery
+            .retry_candidate
+            .as_ref()
+            .or(self.recovery.target.as_ref())
+            .and_then(|target| target.codex_selector_command(self.path_quote()));
+        let Some(command) = command else {
+            self.recovery.mark_failed();
+            cx.emit(TerminalViewEvent::Notification(crate::notify::Notification::Text {
+                body: ui_language().text(crate::i18n::Message::SessionRestoreFailed).to_owned(),
+                program: Some("codex".into()),
+            }));
+            cx.notify();
+            return;
+        };
         self.recovery.choosing_session = true;
         self.recovery.submitted = false;
         self.recovery.failed = false;
         self.last_command_failed = false;
-        self.run_command("codex resume".into(), cx);
+        self.run_command(command, cx);
         cx.emit(TerminalViewEvent::Notification(crate::notify::Notification::Text {
             body: ui_language().text(crate::i18n::Message::SessionRestoreChooseCodex).to_owned(),
             program: Some("codex".into()),
@@ -229,29 +251,59 @@ impl TerminalView {
         self.process_event(TermEvent::CwdReport(cwd), cx);
     }
 
+    pub(super) fn with_wsl_launch(
+        &self,
+        mut agent: crate::session::AgentSession,
+    ) -> crate::session::AgentSession {
+        if let Some(saved) = self.saved_wsl_agent().filter(|saved| saved.source == agent.source) {
+            agent.wsl_launch = saved.wsl_launch.clone();
+            if agent.session_file.is_none() && agent.session_id == saved.session_id {
+                agent.session_file = saved.session_file.clone();
+            }
+        }
+        agent
+    }
+
     /// Keep a queued cold resume in the next snapshot without presenting it as
     /// a live foreground agent before the shell accepts the command.
     pub(crate) fn session_agent(&self) -> Option<crate::session::AgentSession> {
         if let Some(live) = &self.recovery.live {
-            return Some(live.clone());
+            if live.session_id.is_none()
+                && live.session_file.is_none()
+                && let Some(candidate) =
+                    self.saved_wsl_agent().filter(|saved| saved.source == live.source)
+            {
+                return Some(candidate.clone());
+            }
+            return Some(self.with_wsl_launch(live.clone()));
         }
         if let Some(identity) = &self.ai_session {
-            return Some(crate::session::AgentSession {
+            return Some(self.with_wsl_launch(crate::session::AgentSession {
                 source: identity.source.clone(),
                 session_id: Some(identity.session_id.clone()),
                 session_file: None,
-            });
+                wsl_launch: None,
+            }));
         }
         if self.recovery.awaiting_confirmation
+            && !self.recovery.failed
             && let Some(target) = &self.recovery.target
         {
-            return Some(target.clone());
+            return Some(self.with_wsl_launch(target.clone()));
         }
         if self.running_program.is_none()
             && self.pending_shell_command.is_none()
             && let Some(candidate) = &self.recovery.retry_candidate
         {
             return Some(candidate.clone());
+        }
+        if let Some(candidate) = self.saved_wsl_agent() {
+            return Some(candidate.clone());
+        }
+        if self.recovery.awaiting_confirmation
+            && let Some(target) = &self.recovery.target
+        {
+            return Some(target.clone());
         }
         let pending = self.pending_shell_command.as_ref();
         let kind = pending
@@ -263,6 +315,7 @@ impl TerminalView {
             session_file: None,
             source: kind.slug().to_owned(),
             session_id: None,
+            wsl_launch: None,
         })
     }
 
@@ -286,6 +339,7 @@ impl TerminalView {
                     source,
                     session_id: Some(session_id),
                     session_file: None,
+                    wsl_launch: None,
                 }),
                 live: None,
                 awaiting_confirmation: true,
@@ -308,8 +362,8 @@ impl TerminalView {
             awaiting_confirmation: true,
             ..SessionRecovery::default()
         };
-        if agent.source != "pi" || self.ssh_destination.is_some() {
-            if let Some(command) = agent.resume_command() {
+        if agent.source != "pi" || self.ssh_destination.is_some() || agent.wsl_launch.is_some() {
+            if let Some(command) = agent.resume_command_for_quote(self.path_quote()) {
                 self.run_command(command, cx);
             } else {
                 self.recovery.mark_failed();

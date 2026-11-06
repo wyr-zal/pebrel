@@ -685,30 +685,33 @@ fn observed_wsl_directory_drives_only_the_automatic_tab_label(cx: &mut TestAppCo
     use crate::platform::{agent_process_identity::{ForegroundAgent, ProcessStamp}, wsl_location::ObservedWslLocation};
 
     let (view, window, _) = open(cx);
-    window.update(|_, cx| view.update(cx, |view, _| {
-        view.cwd = r"C:\mnt\c\Users\12704".into();
-        view.wsl_cwd_observer.set_observed_for_test(Some(ObservedWslLocation {
-            distro: "Ubuntu-22.04".into(),
-            user: None,
-            cwd: "/mnt/f/Project Learn".into(),
-            launcher: ProcessStamp { pid: 10, start_time: 100 },
-            agent: ForegroundAgent {
-                kind: AgentKind::Claude,
-                process: ProcessStamp { pid: 20, start_time: 200 },
-                shell: ProcessStamp { pid: 30, start_time: 300 },
-                tty_nr: 4,
-                process_group: 20,
-            },
-        }));
-        assert_eq!(view.tab_label(), "Project Learn");
-        assert!(view.tab_tooltip("手动命名").starts_with("手动命名\n"));
-        let tooltip = view.tab_tooltip("Project Learn");
-        assert!(tooltip.contains("Ubuntu-22.04 · /mnt/f/Project Learn"));
-        assert!(!tooltip.contains(r"C:\mnt\c\Users\12704"));
-        assert_eq!(view.cwd, r"C:\mnt\c\Users\12704");
-        assert!(view.wsl_cwd_observer.finish_command());
-        assert_eq!(view.tab_label(), "12704");
-    }));
+    window.update(|_, cx| {
+        view.update(cx, |view, _| {
+            view.cwd = r"C:\mnt\c\Users\12704".into();
+            view.wsl_cwd_observer.set_observed_for_test(Some(ObservedWslLocation {
+                agent_launch: None,
+                distro: "Ubuntu-22.04".into(),
+                user: None,
+                cwd: "/mnt/f/Project Learn".into(),
+                launcher: ProcessStamp { pid: 10, start_time: 100 },
+                agent: ForegroundAgent {
+                    kind: AgentKind::Claude,
+                    process: ProcessStamp { pid: 20, start_time: 200 },
+                    shell: ProcessStamp { pid: 30, start_time: 300 },
+                    tty_nr: 4,
+                    process_group: 20,
+                },
+            }));
+            assert_eq!(view.tab_label(), "Project Learn");
+            assert!(view.tab_tooltip("手动命名").starts_with("手动命名\n"));
+            let tooltip = view.tab_tooltip("Project Learn");
+            assert!(tooltip.contains("Ubuntu-22.04 · /mnt/f/Project Learn"));
+            assert!(!tooltip.contains(r"C:\mnt\c\Users\12704"));
+            assert_eq!(view.cwd, r"C:\mnt\c\Users\12704");
+            assert!(view.wsl_cwd_observer.finish_command());
+            assert_eq!(view.tab_label(), "12704");
+        })
+    });
 }
 
 #[cfg(windows)]
@@ -749,6 +752,7 @@ fn accepted_wsl_probe_updates_the_tab_label_and_emits_a_title_change(
         view.wsl_cwd_observer.mark_command_start();
         let ticket = view.wsl_cwd_observer.begin_probe(Instant::now()).unwrap();
         let location = ObservedWslLocation {
+            agent_launch: None,
             distro: "Ubuntu-22.04".into(),
             user: None,
             cwd: "/mnt/f/Project Learn".into(),
@@ -878,6 +882,7 @@ fn failed_cold_resume_keeps_target_for_retry(cx: &mut TestAppContext) {
     window.update(|_, cx| {
         view.update(cx, |view, cx| {
             let saved = crate::session::AgentSession {
+                wsl_launch: None,
                 source: "codex".into(),
                 session_id: Some("saved-42".into()),
                 session_file: None,
@@ -992,6 +997,7 @@ fn shutdown_waits_for_missing_native_identity_but_keeps_a_known_target(cx: &mut 
 fn different_native_session_cannot_confirm_or_erase_a_pending_resume() {
     use super::startup_command::SessionRecovery;
     let saved = crate::session::AgentSession {
+        wsl_launch: None,
         source: "pi".into(),
         session_id: Some("saved".into()),
         session_file: None,
@@ -1015,6 +1021,7 @@ fn native_acknowledgements_keep_known_files_when_a_bridge_omits_the_path() {
     use super::startup_command::SessionRecovery;
     for source in ["claude", "codex", "pi", "omp", "gemini", "opencode", "kimi"] {
         let saved = crate::session::AgentSession {
+            wsl_launch: None,
             source: source.into(),
             session_id: Some("saved-conversation".into()),
             session_file: Some("/sessions/conversation.jsonl".into()),
@@ -1041,6 +1048,7 @@ fn claude_relocated_transcript_requires_matching_native_id_and_filenames() {
     let id = "832ce477-f0e1-42d7-a438-32693bb51d6b";
     for root in ["/home/test/.claude/projects", r"C:\Users\test\.claude\projects"] {
         let saved = crate::session::AgentSession {
+            wsl_launch: None,
             source: "claude".into(),
             session_id: Some(id.into()),
             session_file: Some(format!("{root}/old/{id}.jsonl")),
@@ -1083,6 +1091,7 @@ fn cold_resume_normalizes_codex_identity_before_waiting_for_native_confirmation(
         let path = format!(r"C:\Users\user\.codex\sessions\rollout-date-{thread}.jsonl");
         view.restore_agent(
             crate::session::AgentSession {
+                wsl_launch: None,
                 source: "codex".into(),
                 session_id: Some("obsolete-hook-group".into()),
                 session_file: Some(path.clone()),
@@ -1129,6 +1138,7 @@ fn cold_resume_of_supported_clis_waits_for_the_shell_and_preserves_each_target(
         let (view, window, receiver) = open(cx);
         view.update(window, |view, cx| {
             let saved = crate::session::AgentSession {
+                wsl_launch: None,
                 source: source.into(),
                 session_id: Some("saved-conversation".into()),
                 session_file: None,
@@ -1155,6 +1165,7 @@ fn cold_resume_of_supported_clis_waits_for_the_shell_and_preserves_each_target(
 fn file_only_recovery_requires_the_provider_to_confirm_that_file() {
     use super::startup_command::SessionRecovery;
     let saved = crate::session::AgentSession {
+        wsl_launch: None,
         source: "pi".into(),
         session_id: None,
         session_file: Some("/sessions/selected.jsonl".into()),
@@ -1163,6 +1174,7 @@ fn file_only_recovery_requires_the_provider_to_confirm_that_file() {
     recovery.target = Some(saved.clone());
     recovery.awaiting_confirmation = true;
     assert!(!recovery.confirm(crate::session::AgentSession {
+        wsl_launch: None,
         source: "pi".into(),
         session_id: Some("unrelated".into()),
         session_file: None,
@@ -1184,6 +1196,7 @@ fn cold_resume_preserves_codex_id_with_a_legacy_native_file(cx: &mut TestAppCont
             Some(view.pane_id),
         ).unwrap();
         let reported = crate::session::AgentSession {
+            wsl_launch: None,
             source: event.source,
             session_id: event.session_id,
             session_file: event.session_file,
@@ -1212,6 +1225,7 @@ fn submit_codex_restore(
     cx: &mut Context<TerminalView>,
 ) -> crate::session::AgentSession {
     let saved = crate::session::AgentSession {
+        wsl_launch: None,
         source: "codex".into(),
         session_id: Some("saved-missing".into()),
         session_file: None,
@@ -1245,6 +1259,7 @@ fn missing_codex_target_opens_the_native_chooser_and_confirms_the_users_choice(
         }));
         assert!(view.recovery_pending(), "opening a chooser is not a recovered conversation");
         let selected = crate::session::AgentSession {
+            wsl_launch: None,
             source: "codex".into(),
             session_id: Some("0199a213-c2a4-7cf5-8f6b-d746fbb6e86c".into()),
             session_file: Some("/sessions/rollout-date-0199a213-c2a4-7cf5-8f6b-d746fbb6e86c.jsonl".into()),
@@ -1472,7 +1487,7 @@ fn lifecycle_only_hook_cannot_replace_a_verified_rollout_id(cx: &mut TestAppCont
     let (view, window, _) = open(cx);
     view.update(window, |view, cx| {
         let id = "0199a213-c2a4-7cf5-8f6b-d746fbb6e86c";
-        let target = crate::session::AgentSession { source: "codex".into(), session_id: Some(id.into()),
+        let target = crate::session::AgentSession { wsl_launch: None, source: "codex".into(), session_id: Some(id.into()),
             session_file: Some(format!("C:/sessions/rollout-date-{id}.jsonl")) };
         assert!(view.recovery.confirm(target.clone()));
         view.ai_session = Some(crate::display::AiSessionIdentity { source: "codex".into(), session_id: id.into() });

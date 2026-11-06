@@ -2,6 +2,8 @@
 
 use super::*;
 
+#[cfg(all(test, windows, feature = "gpui-test-support"))]
+mod restart_agent_context_tests;
 #[cfg(all(test, feature = "gpui-test-support"))]
 mod restart_cwd_tests;
 
@@ -186,7 +188,8 @@ impl NebulaWorkspace {
 
     /// 当前工作区 → 共享 v4 快照。设置/文档/图片 tab 不进会话（旧壳同
     /// 合同）；AI 会话身份优先取 hook 直报的精确 id，退而取可解析的前台
-    /// 程序名（claude 无 id 恢复成 `--continue`，安全判定在 schema 层）。
+    /// 程序名；恢复环境与确切目标由 `session_agent()` 一并保存，缺少 ID
+    /// 时不自动选择最近会话。
     ///
     /// 快照一律带 `boot_attempts = 0`：断路器只回答「这次启动活到了第一次
     /// 自动保存没有」（session.rs 模块合同）。agent 恢复目标尚未被 hook /

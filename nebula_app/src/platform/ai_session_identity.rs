@@ -33,8 +33,23 @@ const MAX_PROBE_RECORDS: usize = 128;
 const PROBE_SCRIPT: &str = r###"
 pane="$1"
 instance="$2"
+owner="${3:-}"
+owner_start="${4:-}"
+command_id="${5:-}"
+check_start() (
+    IFS= read -r stat_line < "$1/stat" 2>/dev/null || exit 1
+    stat_line=${stat_line##*) }
+    set -- $stat_line
+    [ "$#" -ge 20 ] || exit 1
+    case "$1" in Z|X) exit 1;; esac
+    [ "${20}" = "$owner_start" ]
+)
 for proc in /proc/[0-9]*; do
     pid=${proc##*/}
+    if [ -n "$owner" ]; then
+        [ "$pid" = "$owner" ] || continue
+        check_start "$proc" || exit 2
+    fi
     IFS= read -r comm < "$proc/comm" 2>/dev/null || continue
     case "$comm" in
         codex|codex.exe|codex-*) ;;
@@ -48,6 +63,10 @@ for proc in /proc/[0-9]*; do
     fi
     process_id=$(printf '%s\n' "$environment" | sed -n "s/^PEBREL_PROCESS_ID=//p" | head -n 1)
     [ "$pane_id" = "$pane" ] && [ "$process_id" = "$instance" ] || continue
+    if [ -n "$command_id" ]; then
+        observed_command=$(printf '%s\n' "$environment" | sed -n "s/^PEBREL_COMMAND_ID=//p" | head -n 1)
+        [ "$observed_command" = "$command_id" ] || exit 2
+    fi
     codex_root=$(printf '%s\n' "$environment" | sed -n "s/^CODEX_HOME=//p" | head -n 1)
     if [ -z "$codex_root" ]; then
         guest_home=$(printf '%s\n' "$environment" | sed -n "s/^HOME=//p" | head -n 1)
@@ -71,6 +90,7 @@ for proc in /proc/[0-9]*; do
         esac
     done
 done
+[ -z "$owner" ] || check_start "/proc/$owner" || exit 2
 "###;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +107,25 @@ pub(crate) struct CodexSession {
     pub session_id: String,
     pub session_file: String,
     pub cwd: Option<String>,
+}
+
+/// Immutable native/guest scope captured before an asynchronous session lookup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ObservedWslSessionScope {
+    pub epoch: u64,
+    pub command_id: String,
+    pub boundary: super::agent_process_identity::NativeLaunchBoundary,
+    pub launcher: super::agent_process_identity::ProcessStamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObservedWslLocation {
+    pub distro: String,
+    pub user: Option<String>,
+    pub cwd: String,
+    pub launcher: super::agent_process_identity::ProcessStamp,
+    pub agent: super::agent_process_identity::ForegroundAgent,
+    pub agent_launch: Option<crate::session::WslAgentLaunch>,
 }
 
 /// Probe the active Codex rollout for one pane.
@@ -121,6 +160,74 @@ pub(crate) fn probe_codex_session(
     {
         let _ = (pane_id, instance);
         windows::probe(shell_pid?)
+    }
+}
+
+/// A manually entered WSL branch is queried only through its verified guest
+/// receipt. The exact PID/start and command token exclude other panes and
+/// background Codex processes, even when they share the same project.
+pub(crate) fn probe_observed_wsl_codex_session(
+    pane_id: u64,
+    context: &crate::runtime_exec::PaneExecContext,
+    expected: &super::agent_process_identity::ForegroundAgent,
+) -> Option<CodexSession> {
+    let distro = context.wsl_distribution()?;
+    let command_id = context.command_id()?;
+    if expected.kind != crate::ai_agents::AgentKind::Codex
+        || expected.process.pid == 0
+        || expected.process.start_time == 0
+    {
+        return None;
+    }
+    let mut args = wsl_probe_args(
+        distro,
+        context.wsl_user(),
+        &pane_id.to_string(),
+        context.process_instance()?,
+    );
+    args.extend([
+        expected.process.pid.to_string(),
+        expected.process.start_time.to_string(),
+        command_id.to_owned(),
+    ]);
+    let mut command = Command::new("wsl.exe");
+    command.args(args);
+    crate::platform::process::hidden_command(&mut command);
+    let result = run_probe_command(command)?;
+    (super::agent_process_identity::recheck_foreground_agent(pane_id, context, expected, &|| false)
+        == super::agent_process_identity::AgentRecheck::Current)
+        .then_some(result)
+}
+
+pub(crate) fn probe_observed_wsl_codex_session_in_scope(
+    pane_id: u64,
+    host_context: &crate::runtime_exec::PaneExecContext,
+    scope: &ObservedWslSessionScope,
+    location: &ObservedWslLocation,
+) -> Option<CodexSession> {
+    #[cfg(windows)]
+    {
+        if scope.launcher != location.launcher {
+            return None;
+        }
+        let context = host_context.for_observed_wsl(
+            &location.distro,
+            location.user.as_deref(),
+            &scope.command_id,
+        );
+        let result = probe_observed_wsl_codex_session(pane_id, &context, &location.agent)?;
+        super::wsl_location::recheck_observed_launcher(
+            scope.boundary.shell.pid,
+            &scope.boundary,
+            host_context,
+            location,
+        )
+        .then_some(result)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (pane_id, host_context, scope, location);
+        None
     }
 }
 
@@ -209,10 +316,7 @@ fn matches_optional_string(
 }
 
 fn valid_uuid(id: &str) -> bool {
-    id.len() == 36
-        && id.as_bytes().iter().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) { *byte == b'-' } else { byte.is_ascii_hexdigit() }
-        })
+    crate::session::valid_session_uuid(id)
 }
 
 fn rollout_id(path: &Path) -> Option<String> {

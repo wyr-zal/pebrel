@@ -59,23 +59,27 @@ impl TerminalView {
         let keep_native_identity =
             event.source == "codex" && event.session_file.is_none() && self.ai_session_from_probe;
         let mut target = event.session_id.as_ref().filter(|_| !keep_native_identity).map(|id| {
-            crate::session::AgentSession {
+            self.with_wsl_launch(crate::session::AgentSession {
+                wsl_launch: None,
                 source: event.source.clone(),
                 session_id: Some(id.clone()),
                 session_file: event.session_file.clone(),
-            }
+            })
         });
-        let event_target = target.clone().unwrap_or_else(|| crate::session::AgentSession {
-            source: event.source.clone(),
-            session_id: if keep_native_identity {
-                self.ai_session
-                    .as_ref()
-                    .filter(|identity| identity.source == event.source)
-                    .map(|identity| identity.session_id.clone())
-            } else {
-                event.session_id.clone()
-            },
-            session_file: event.session_file.clone(),
+        let event_target = target.clone().unwrap_or_else(|| {
+            self.with_wsl_launch(crate::session::AgentSession {
+                wsl_launch: None,
+                source: event.source.clone(),
+                session_id: if keep_native_identity {
+                    self.ai_session
+                        .as_ref()
+                        .filter(|identity| identity.source == event.source)
+                        .map(|identity| identity.session_id.clone())
+                } else {
+                    event.session_id.clone()
+                },
+                session_file: event.session_file.clone(),
+            })
         });
         let process_confirmed = self.foreground_receipt_confirms(event, &event_target);
         let requires_receipt = self.recovery.requires_foreground_receipt();
@@ -152,6 +156,9 @@ impl TerminalView {
             let previous = self.recovery.live.clone();
             if !self.recovery.confirm_live(target, process_confirmed) {
                 return false;
+            }
+            if let Some(live) = self.recovery.live.clone() {
+                self.confirm_saved_wsl_identity(&live);
             }
             if previous != self.recovery.live {
                 self.set_screen_error_indicator(false, cx);

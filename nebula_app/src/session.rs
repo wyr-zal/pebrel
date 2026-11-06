@@ -20,9 +20,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::display::color::Rgb;
 
+mod agent_launch;
 mod identity;
 mod window_layout;
-pub(crate) use identity::codex_rollout_id;
+pub use agent_launch::WslAgentLaunch;
+pub(crate) use identity::{codex_rollout_id, valid_session_uuid};
 pub use window_layout::WindowLayout;
 pub(crate) use window_layout::combine_sessions;
 
@@ -72,10 +74,10 @@ pub enum SplitAxis {
 }
 
 /// 快照瞬间仍在一个 pane 前台运行的 AI CLI 对话。冷恢复用它接续会话：
-/// 身份来自 hook 直报或当前 Codex 会话元数据，缺 id 的
-/// claude 退化成 `--continue`（按 cwd 找最近对话，恰好匹配恢复语义）。
+/// 身份来自 hook 直报、当前 Codex 会话元数据或已核验启动的恢复候选。
+/// 缺 id 时不选择目录中最近的另一会话。
 ///
-/// 只存「安全启动描述」——来源名 + id，不存正文、不存启动参数原文。
+/// 保存结构化启动描述，不保存对话正文或可任意重放的 Shell 脚本。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentSession {
     /// CLI identity as the hook reports it (`claude` / `codex`).
@@ -85,6 +87,10 @@ pub struct AgentSession {
     /// Native session file, interpreted only inside the owning pane environment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_file: Option<String>,
+    /// An Agent entered through WSL keeps its own environment and location,
+    /// independently of the outer pane's Shell launch and working directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wsl_launch: Option<WslAgentLaunch>,
 }
 
 /// Validate both Windows and guest absolute paths without consulting the host
@@ -105,22 +111,39 @@ impl AgentSession {
     /// 缺 id）时返回 `None`，宁可只恢复布局也不上屏可疑字节。命令形状与
     /// `ai_sessions::AiSession::resume_command`（手动恢复面板）保持一致。
     pub fn resume_command(&self) -> Option<String> {
+        self.resume_command_for_quote(crate::display::side_panel::PathQuote::PowerShell)
+    }
+
+    pub(crate) fn resume_command_for_quote(
+        &self,
+        quote: crate::display::side_panel::PathQuote,
+    ) -> Option<String> {
         let agent = crate::ai_agents::AgentKind::parse(&self.source)?;
-        if agent == crate::ai_agents::AgentKind::Codex
-            && let Some(id) = self.session_file.as_deref().and_then(codex_rollout_id)
-        {
-            return agent.resume_command(id);
+        let id = if agent == crate::ai_agents::AgentKind::Codex {
+            self.session_file.as_deref().and_then(codex_rollout_id).or(self.session_id.as_deref())
+        } else {
+            self.session_id.as_deref()
+        }?;
+        if let Some(launch) = &self.wsl_launch {
+            return launch.resume_command(agent, id, quote);
         }
-        match self.session_id.as_deref() {
-            Some(id) if agent == crate::ai_agents::AgentKind::Pi && id.starts_with("pid-") => None,
-            Some(id) => agent.resume_command(id),
-            // claude 无 id（hook 未装、OSC 认出的启动）：`--continue` 恢复
-            // 当前目录最近一次对话——pane 的 cwd 已经先被恢复，语义正好。
-            None if agent == crate::ai_agents::AgentKind::Claude => {
-                Some("claude --continue".to_owned())
-            },
-            // codex 没有按目录 continue 的形式，缺 id 只能放弃接续。
-            _ => None,
+        if agent == crate::ai_agents::AgentKind::Pi && id.starts_with("pid-") {
+            None
+        } else {
+            agent.resume_command(id)
+        }
+    }
+
+    pub(crate) fn codex_selector_command(
+        &self,
+        quote: crate::display::side_panel::PathQuote,
+    ) -> Option<String> {
+        if self.source != "codex" {
+            return None;
+        }
+        match &self.wsl_launch {
+            Some(launch) => launch.codex_selector_command(quote),
+            None => Some("codex resume".into()),
         }
     }
 }
@@ -474,6 +497,7 @@ mod tests {
                 launch: None,
                 cwd: "D:/work".into(),
                 agent: Some(AgentSession {
+                    wsl_launch: None,
                     session_file: None,
                     source: "claude".into(),
                     session_id: Some("0199a213-c2a4-7cf5-8f6b-d746fbb6e86c".into()),
@@ -526,6 +550,7 @@ mod tests {
             launch: None,
             cwd: "D:/w".into(),
             agent: Some(AgentSession {
+                wsl_launch: None,
                 session_file: None,
                 source: "codex".into(),
                 session_id: Some("abc-1".into()),
@@ -540,6 +565,7 @@ mod tests {
     #[test]
     fn agent_resume_commands_are_exact_and_injection_safe() {
         let agent = |source: &str, id: Option<&str>| AgentSession {
+            wsl_launch: None,
             session_file: None,
             source: source.into(),
             session_id: id.map(str::to_owned),
@@ -548,7 +574,7 @@ mod tests {
             agent("claude", Some("abc-123")).resume_command().as_deref(),
             Some("claude --resume abc-123")
         );
-        assert_eq!(agent("claude", None).resume_command().as_deref(), Some("claude --continue"));
+        assert_eq!(agent("claude", None).resume_command(), None);
         assert_eq!(
             agent("codex", Some("b5f6c1c2-1111-2222-3333-444455556666"))
                 .resume_command()
@@ -622,6 +648,7 @@ mod tests {
                     launch: None,
                     cwd: "/home/user/project".into(),
                     agent: Some(AgentSession {
+                        wsl_launch: None,
                         session_file: None,
                         source: "codex".into(),
                         session_id: Some((*id).into()),

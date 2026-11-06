@@ -195,6 +195,7 @@ fn codex_native_hooks_resume_the_transcript_thread_not_the_runtime_group() {
             assert_eq!(event.session_file.as_deref(), Some(transcript.as_str()));
             assert!(!event.has_unverifiable_native_transcript());
             let target = crate::session::AgentSession {
+                wsl_launch: None,
                 source: event.source,
                 session_id: event.session_id,
                 session_file: event.session_file,

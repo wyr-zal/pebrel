@@ -133,6 +133,7 @@ mod tests {
             launch: None,
             cwd: tab.cwd.clone(),
             agent: Some(AgentSession {
+                wsl_launch: None,
                 session_file: None,
                 source: "claude".into(),
                 session_id: Some("saved-42".into()),

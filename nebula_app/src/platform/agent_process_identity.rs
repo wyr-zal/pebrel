@@ -8,7 +8,7 @@ use crate::runtime_exec::PaneExecContext;
 #[cfg(windows)]
 mod native;
 #[cfg(windows)]
-pub(crate) use native::{NativeLaunchBoundary, NativeProcessIdentity, hook_owner};
+pub(crate) use native::{NativeProcessIdentity, hook_owner};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PROBE_OUTPUT: usize = 64 * 1024;
@@ -273,6 +273,14 @@ echo_record E
 pub(crate) struct ProcessStamp {
     pub pid: u32,
     pub start_time: u64,
+}
+
+/// Frozen Windows launch boundary; creating one still uses the native backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeLaunchBoundary {
+    pub time: u64,
+    pub shell: ProcessStamp,
+    pub existing_branches: HashSet<ProcessStamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

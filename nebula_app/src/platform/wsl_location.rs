@@ -5,21 +5,13 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::platform::agent_process_identity::{
-    ForegroundAgent, ForegroundAgentLocationProbe, NativeLaunchBoundary, NativeProcessIdentity,
-    ProcessStamp,
+    ForegroundAgentLocationProbe, NativeLaunchBoundary, NativeProcessIdentity, ProcessStamp,
 };
 
 const LOCATION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_DISTRO_LIST: usize = 64 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ObservedWslLocation {
-    pub(crate) distro: String,
-    pub(crate) user: Option<String>,
-    pub(crate) cwd: String,
-    pub(crate) launcher: ProcessStamp,
-    pub(crate) agent: ForegroundAgent,
-}
+pub(crate) use super::ai_session_identity::ObservedWslLocation;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WslLocationProbe {
@@ -47,6 +39,8 @@ struct WslLauncher {
     stamp: ProcessStamp,
     distro: String,
     user: Option<String>,
+    program: String,
+    args: Vec<String>,
 }
 
 enum LauncherSelection {
@@ -164,12 +158,21 @@ pub(crate) fn probe(
     }
     match result {
         ForegroundAgentLocationProbe::Found(agent, cwd) => {
+            let agent_launch = crate::session::WslAgentLaunch::capture(
+                &launcher.program,
+                &launcher.args,
+                &launcher.distro,
+                launcher.user.as_deref(),
+                &cwd,
+                agent.kind,
+            );
             WslLocationProbe::Found(ObservedWslLocation {
                 distro: launcher.distro,
                 user: launcher.user,
                 cwd,
                 launcher: launcher.stamp,
                 agent,
+                agent_launch: Some(agent_launch),
             })
         },
         ForegroundAgentLocationProbe::NoAgent => {
@@ -215,6 +218,7 @@ fn probe_from_wsl_pane(
                 cwd,
                 launcher: owner,
                 agent,
+                agent_launch: None,
             })
         },
         ForegroundAgentLocationProbe::NoAgent => WslLocationProbe::NoAgent { launcher: owner },
@@ -226,6 +230,23 @@ fn probe_from_wsl_pane(
 
 fn native_shell_is_current(expected: ProcessStamp) -> bool {
     NativeProcessIdentity::open(expected.pid).is_some_and(|process| process.stamp() == expected)
+}
+
+/// Recheck the Windows side after an asynchronous guest session lookup.
+pub(crate) fn recheck_observed_launcher(
+    shell_pid: u32,
+    boundary: &NativeLaunchBoundary,
+    host_context: &crate::runtime_exec::PaneExecContext,
+    expected: &ObservedWslLocation,
+) -> bool {
+    if host_context.wsl_distribution().is_some() {
+        return shell_pid == boundary.shell.pid
+            && expected.launcher == boundary.shell
+            && native_shell_is_current(boundary.shell);
+    }
+    matches!(select_launcher(shell_pid, boundary), LauncherSelection::One(current)
+        if current.stamp == expected.launcher && current.distro == expected.distro
+            && current.user == expected.user)
 }
 
 fn select_launcher(shell_pid: u32, boundary: &NativeLaunchBoundary) -> LauncherSelection {
@@ -263,7 +284,14 @@ fn select_launcher(shell_pid: u32, boundary: &NativeLaunchBoundary) -> LauncherS
     if process.stamp() != stamp {
         return LauncherSelection::Unavailable;
     }
-    LauncherSelection::One(WslLauncher { stamp, distro, user })
+    let program = arguments.first().cloned().unwrap_or(executable);
+    LauncherSelection::One(WslLauncher {
+        stamp,
+        distro,
+        user,
+        program,
+        args: arguments[1..].to_vec(),
+    })
 }
 
 fn select_launcher_candidate(

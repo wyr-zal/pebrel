@@ -9,8 +9,29 @@ use gpui::TestAppContext;
 use nebula_terminal::event::Event;
 use std::time::Instant;
 
+mod recovery_tests;
+
+fn recovery_location(kind: AgentKind, id: &str, cwd: &str) -> ObservedWslLocation {
+    let mut result = location();
+    result.agent.kind = kind;
+    result.cwd = cwd.into();
+    let script = format!("exec ${{SHELL:-sh}} -lic '{}'", kind.resume_command(id).unwrap());
+    let args =
+        ["-d", "Ubuntu-22.04", "--cd", "/initial", "-e", "sh", "-lc", &script].map(str::to_owned);
+    result.agent_launch = Some(crate::session::WslAgentLaunch::capture(
+        "wsl.exe",
+        &args,
+        &result.distro,
+        None,
+        cwd,
+        kind,
+    ));
+    result
+}
+
 fn location() -> ObservedWslLocation {
     ObservedWslLocation {
+        agent_launch: None,
         distro: "Ubuntu-22.04".into(),
         user: None,
         cwd: "/mnt/e/ProjectOrder/VoiceRecite".into(),
@@ -73,6 +94,25 @@ impl TerminalView {
         let ticket = start_host_wsl(self, 'a', cx);
         self.apply_wsl_cwd_probe_result(&ticket, WslLocationProbe::Found(location()), true, cx);
         assert_process_identity(self);
+    }
+
+    pub(crate) fn install_wsl_restart_context_test_fixture(
+        &mut self,
+        kind: AgentKind,
+        id: &str,
+        cwd: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.install_completion_test_session();
+        let ticket = start_host_wsl(self, 'a', cx);
+        self.apply_wsl_cwd_probe_result(
+            &ticket,
+            WslLocationProbe::Found(recovery_location(kind, id, cwd)),
+            true,
+            cx,
+        );
+        self.suggest.last_committed = "a later chat message".into();
+        assert!(self.ai_session.is_none(), "the launch request is only a recovery candidate");
     }
 }
 
@@ -248,6 +288,7 @@ fn wsl_process_identity_owns_rechecks_until_its_command_ends(cx: &mut TestAppCon
     entity.update(window, |view, cx| {
         let ticket = start_host_wsl(view, 'a', cx);
         view.recovery.target = Some(crate::session::AgentSession {
+            wsl_launch: None,
             source: "codex".into(),
             session_id: Some("failed-restore".into()),
             session_file: None,
@@ -306,6 +347,7 @@ fn wsl_process_identity_survives_a_rejected_hook(cx: &mut TestAppContext) {
         let ticket = start_host_wsl(view, 'a', cx);
         view.apply_wsl_cwd_probe_result(&ticket, WslLocationProbe::Found(location()), true, cx);
         view.recovery.target = Some(crate::session::AgentSession {
+            wsl_launch: None,
             source: "claude".into(),
             session_id: Some("failed-restore".into()),
             session_file: None,

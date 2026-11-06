@@ -1,5 +1,5 @@
 //! Kernel-stamped native identities and bounded interpreter entrypoint reads.
-use super::{AgentKind, ProcessStamp};
+use super::{AgentKind, NativeLaunchBoundary, ProcessStamp};
 use std::{mem, ptr};
 use windows_sys::Wdk::System::Threading::{
     NtQueryInformationProcess, ProcessCommandLineInformation,
@@ -13,15 +13,10 @@ use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 /// Same kernel clock and units as process creation stamps (100 ns FILETIME).
 fn launch_boundary() -> u64 {
     let mut time = unsafe { mem::zeroed() };
-    unsafe { windows_sys::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime(&mut time) };
+    unsafe {
+        windows_sys::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime(&mut time)
+    };
     (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NativeLaunchBoundary {
-    pub time: u64,
-    pub shell: ProcessStamp,
-    pub existing_branches: std::collections::HashSet<ProcessStamp>,
 }
 
 impl NativeLaunchBoundary {

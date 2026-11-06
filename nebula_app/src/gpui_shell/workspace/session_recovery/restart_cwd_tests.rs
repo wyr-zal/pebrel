@@ -37,6 +37,7 @@ fn reported_cwd_is_saved_and_restored_with_the_same_agent(cx: &mut TestAppContex
         .collect();
     let initial = Session::new(0, tabs);
     let agent = AgentSession {
+        wsl_launch: None,
         source: "claude".into(),
         session_id: Some("fixture-session".into()),
         session_file: None,

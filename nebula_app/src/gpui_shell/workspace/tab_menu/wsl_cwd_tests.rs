@@ -11,6 +11,7 @@ fn observe(view: &mut TerminalView, host_path: &Path) {
     let host = host_path.to_string_lossy().replace('\\', "/");
     let guest = format!("/mnt/{}{}", host[..1].to_ascii_lowercase(), &host[2..]);
     view.set_observed_wsl_location_for_test(Some(ObservedWslLocation {
+        agent_launch: None,
         distro: "pebrel-test-nested-distro".into(),
         user: None,
         cwd: guest,

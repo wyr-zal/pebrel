@@ -3,6 +3,13 @@
 //! Hook lifecycle IDs are not necessarily conversation IDs. In particular,
 //! Codex resumes a rollout's thread UUID, not its hook session/group UUID.
 
+pub(crate) fn valid_session_uuid(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) { byte == b'-' } else { byte.is_ascii_hexdigit() }
+        })
+}
+
 /// Read a Codex thread UUID from its native rollout path without consulting
 /// the host filesystem: Windows, WSL and SSH paths belong to their own shell.
 pub(crate) fn codex_rollout_id(path: &str) -> Option<&str> {
@@ -16,12 +23,7 @@ pub(crate) fn codex_rollout_id(path: &str) -> Option<&str> {
     if start == 0 || stem.as_bytes().get(start - 1) != Some(&b'-') {
         return None;
     }
-    id.bytes()
-        .enumerate()
-        .all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) { byte == b'-' } else { byte.is_ascii_hexdigit() }
-        })
-        .then_some(id)
+    valid_session_uuid(id).then_some(id)
 }
 
 impl super::AgentSession {
@@ -73,6 +75,7 @@ mod tests {
             "/sessions/rollout-date-not-a-uuid.jsonl",
         ] {
             let saved = super::super::AgentSession {
+                wsl_launch: None,
                 source: "codex".into(),
                 session_id: Some("saved-thread".into()),
                 session_file: Some(path.into()),
@@ -100,6 +103,7 @@ mod tests {
     fn an_unrecognized_file_still_needs_a_safe_existing_id_to_resume() {
         for id in [None, Some("".into()), Some("bad; echo injected".into()), Some("x".repeat(65))] {
             let mut saved = super::super::AgentSession {
+                wsl_launch: None,
                 source: "codex".into(),
                 session_id: id.clone(),
                 session_file: Some("/sessions/conversation.jsonl".into()),
@@ -115,6 +119,7 @@ mod tests {
     fn snapshot_resume_uses_the_rollout_thread_instead_of_the_hook_group() {
         for id in [Some("different-hook-group".into()), None] {
             let mut saved = super::super::AgentSession {
+                wsl_launch: None,
                 source: "codex".into(),
                 session_id: id,
                 session_file: Some(format!(

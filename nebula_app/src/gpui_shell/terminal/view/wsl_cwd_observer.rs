@@ -17,6 +17,7 @@ const MAX_UNCERTAIN_MISSES: u8 = 8;
 pub(super) struct WslCwdObserver {
     boundary: Option<NativeLaunchBoundary>,
     command_id: Option<String>,
+    literal_invocation: Option<(Option<String>, Vec<String>)>,
     command_candidate: bool,
     command_started: bool,
     identity_suppressed: bool,
@@ -29,16 +30,12 @@ pub(super) struct WslCwdObserver {
     misses: u8,
     launcher: Option<ProcessStamp>,
     observed: Option<ObservedWslLocation>,
+    saved_agent: Option<crate::session::AgentSession>,
+    saved_agent_owner: Option<(ProcessStamp, ProcessStamp)>,
     closed: AtomicBool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct WslIdentityScope {
-    pub(super) epoch: u64,
-    pub(super) command_id: String,
-    pub(super) boundary: NativeLaunchBoundary,
-    pub(super) launcher: ProcessStamp,
-}
+pub(super) use crate::platform::ai_session_identity::ObservedWslSessionScope as WslIdentityScope;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct ProbeCompletion {
@@ -58,6 +55,7 @@ impl Default for WslCwdObserver {
         Self {
             boundary: None,
             command_id: None,
+            literal_invocation: None,
             command_candidate: false,
             command_started: false,
             identity_suppressed: false,
@@ -70,6 +68,8 @@ impl Default for WslCwdObserver {
             misses: 0,
             launcher: None,
             observed: None,
+            saved_agent: None,
+            saved_agent_owner: None,
             closed: AtomicBool::new(false),
         }
     }
@@ -80,6 +80,7 @@ impl WslCwdObserver {
         self.invalidate();
         self.boundary = boundary;
         self.command_id = None;
+        self.literal_invocation = None;
         self.command_candidate = false;
         self.command_started = false;
         self.identity_suppressed = false;
@@ -94,8 +95,14 @@ impl WslCwdObserver {
         {
             return;
         }
+        let had_command_id = self.command_id.is_some();
         self.invalidate();
         self.command_id = valid_command_id(command_id).then(|| command_id.to_owned());
+        if had_command_id {
+            self.literal_invocation = None;
+        } else if let Some((binding, _)) = &mut self.literal_invocation {
+            *binding = self.command_id.clone();
+        }
         self.active = false;
         self.reset_probe_state();
         self.pending_title_changed |= self.clear_observed();
@@ -103,6 +110,8 @@ impl WslCwdObserver {
 
     pub(super) fn accept_command_line(&mut self, value: &str) {
         self.command_candidate = command_line_contains_wsl(value);
+        self.literal_invocation = crate::session::WslAgentLaunch::literal_invocation(value)
+            .map(|args| (self.command_id.clone(), args));
         if !self.command_candidate {
             self.invalidate();
             self.active = false;
@@ -137,6 +146,7 @@ impl WslCwdObserver {
         self.active = false;
         self.boundary = None;
         self.command_id = None;
+        self.literal_invocation = None;
         self.command_candidate = false;
         self.command_started = false;
         self.identity_suppressed = false;
@@ -156,8 +166,82 @@ impl WslCwdObserver {
         self.observed.as_ref()
     }
 
+    pub(super) fn saved_agent(&self) -> Option<&crate::session::AgentSession> {
+        (self.command_started
+            && self.boundary.is_some()
+            && self.command_id.is_some()
+            && !self.closed.load(Ordering::Acquire))
+        .then_some(self.saved_agent.as_ref())
+        .flatten()
+    }
+
+    pub(super) fn confirm_saved_identity(&mut self, target: &crate::session::AgentSession) {
+        if self.saved_agent().is_some_and(|saved| saved.source == target.source)
+            && let Some(saved) = &mut self.saved_agent
+        {
+            saved.session_id = target.session_id.clone();
+            saved.session_file = target.session_file.clone();
+        }
+    }
+
+    fn remember_location(&mut self, location: &ObservedWslLocation) {
+        let source = location.agent.kind.slug().to_owned();
+        let literal = self
+            .literal_invocation
+            .as_ref()
+            .filter(|(binding, _)| binding.is_some() && binding == &self.command_id)
+            .and_then(|(_, args)| {
+                Some(crate::session::WslAgentLaunch::capture(
+                    args.first()?,
+                    &args[1..],
+                    &location.distro,
+                    location.user.as_deref(),
+                    &location.cwd,
+                    location.agent.kind,
+                ))
+            });
+        let launch = location.agent_launch.clone().or(literal).unwrap_or_else(|| {
+            crate::session::WslAgentLaunch::unavailable(
+                &location.distro,
+                location.user.as_deref(),
+                &location.cwd,
+            )
+        });
+        let previous = self.saved_agent.as_ref().filter(|saved| {
+            self.saved_agent_owner == Some((location.launcher, location.agent.process))
+                && saved.source == source
+                && saved.wsl_launch.as_ref().is_some_and(|launch| {
+                    launch.distribution == location.distro && launch.user == location.user
+                })
+        });
+        let new_launcher =
+            self.saved_agent_owner.is_none_or(|(launcher, _)| launcher != location.launcher)
+                || previous.is_some_and(|saved| {
+                    saved
+                        .wsl_launch
+                        .as_ref()
+                        .is_some_and(|previous| !previous.is_replayable() && launch.is_replayable())
+                });
+        self.saved_agent = Some(crate::session::AgentSession {
+            session_id: previous.and_then(|saved| saved.session_id.clone()).or_else(|| {
+                new_launcher.then(|| launch.requested_session_id(location.agent.kind)).flatten()
+            }),
+            session_file: previous.and_then(|saved| saved.session_file.clone()),
+            source,
+            wsl_launch: Some(launch),
+        });
+        self.saved_agent_owner = Some((location.launcher, location.agent.process));
+    }
+
     pub(super) fn identity_scope(&self) -> Option<WslIdentityScope> {
-        if !self.command_started || self.identity_suppressed {
+        if self.identity_suppressed {
+            return None;
+        }
+        self.recovery_scope()
+    }
+
+    pub(super) fn recovery_scope(&self) -> Option<WslIdentityScope> {
+        if !self.command_started || self.closed.load(Ordering::Acquire) {
             return None;
         }
         Some(WslIdentityScope {
@@ -174,6 +258,9 @@ impl WslCwdObserver {
 
     #[cfg(test)]
     pub(super) fn set_observed_for_test(&mut self, location: Option<ObservedWslLocation>) {
+        if let Some(location) = &location {
+            self.remember_location(location);
+        }
         self.observed = location;
     }
 
@@ -183,6 +270,8 @@ impl WslCwdObserver {
 
     fn invalidate(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
+        self.saved_agent = None;
+        self.saved_agent_owner = None;
         if let Some(cancelled) = &self.pending {
             cancelled.store(true, Ordering::Release);
         }
@@ -281,6 +370,7 @@ impl WslCwdObserver {
         let before = self.visible_key();
         match result {
             WslLocationProbe::Found(location) => {
+                self.remember_location(&location);
                 self.launcher = Some(location.launcher);
                 self.observed = Some(location);
                 self.last_success = Some(now);
@@ -311,6 +401,8 @@ impl WslCwdObserver {
                 self.record_miss(MAX_UNCERTAIN_MISSES);
             },
             WslLocationProbe::NoLauncher => {
+                self.saved_agent = None;
+                self.saved_agent_owner = None;
                 self.clear_observed();
                 self.launcher = None;
                 self.last_success = None;
@@ -358,9 +450,12 @@ fn valid_command_id(command_id: &str) -> bool {
 
 fn command_line_contains_wsl(value: &str) -> bool {
     // PowerShell prefixes its text with the shell owner; Bash reports raw text.
-    let command = value.split_once('\n')
+    let command = value
+        .split_once('\n')
         .filter(|(owner, _)| owner.starts_with("pwsh:"))
-        .map_or(value, |(_, command)| command);
+        .map_or(value, |(_, command)| command)
+        .trim_start();
+    let command = command.strip_prefix('&').map_or(command, str::trim_start);
     let executable =
         if let Some(quote) = command.chars().next().filter(|quote| matches!(quote, '\'' | '"')) {
             let rest = &command[quote.len_utf8()..];
@@ -462,6 +557,8 @@ mod tests {
     use crate::ai_agents::AgentKind;
     use crate::platform::agent_process_identity::{ForegroundAgent, ProcessStamp};
 
+    const REQUESTED: &str = "01a1aedc-d6f0-7db0-8875-882c249ef4a2";
+
     fn boundary() -> NativeLaunchBoundary {
         NativeLaunchBoundary {
             time: 100,
@@ -472,6 +569,7 @@ mod tests {
 
     fn location(launcher_pid: u32, agent_pid: u32, cwd: &str) -> ObservedWslLocation {
         ObservedWslLocation {
+            agent_launch: None,
             distro: "Ubuntu-22.04".into(),
             user: None,
             cwd: cwd.into(),
@@ -484,6 +582,144 @@ mod tests {
                 process_group: agent_pid,
             },
         }
+    }
+
+    fn recovery_location(cwd: &str) -> ObservedWslLocation {
+        let mut result = location(20, 30, cwd);
+        let script = format!("exec ${{SHELL:-sh}} -lic 'claude --resume {REQUESTED}'");
+        let args = ["-d", "Ubuntu-22.04", "--cd", "/initial", "-e", "sh", "-lc", &script]
+            .map(str::to_owned);
+        result.agent_launch = Some(crate::session::WslAgentLaunch::capture(
+            "wsl.exe",
+            &args,
+            &result.distro,
+            None,
+            cwd,
+            AgentKind::Claude,
+        ));
+        result
+    }
+
+    fn recovery_observer() -> WslCwdObserver {
+        let mut observer = WslCwdObserver::default();
+        observer.prepare_submission(Some(boundary()));
+        observer.accept_command_id("0123456789abcdef0123456789abcdef");
+        observer.accept_command_line("& wsl.exe -d Ubuntu-22.04");
+        observer.mark_command_start();
+        observer
+    }
+
+    #[test]
+    fn saved_launch_survives_temporary_probe_loss_and_follows_the_current_directory() {
+        let mut observer = recovery_observer();
+        let now = Instant::now();
+        observer.apply_probe(WslLocationProbe::Found(recovery_location("/current")), now);
+        let mut confirmed = observer.saved_agent().unwrap().clone();
+        assert_eq!(confirmed.session_id.as_deref(), Some(REQUESTED));
+        confirmed.session_id = Some("confirmed-session".into());
+        confirmed.session_file = Some("/sessions/confirmed-session.jsonl".into());
+        observer.confirm_saved_identity(&confirmed);
+        observer.apply_probe(
+            WslLocationProbe::Unavailable {
+                launcher: Some(ProcessStamp { pid: 20, start_time: 200 }),
+            },
+            now,
+        );
+        observer.expire_stale(now + MAX_STALE_LOCATION + Duration::from_secs(1));
+        assert!(observer.observed().is_none());
+        assert_eq!(observer.saved_agent(), Some(&confirmed));
+        observer.apply_probe(WslLocationProbe::Found(recovery_location("/last-directory")), now);
+        let saved = observer.saved_agent().unwrap();
+        assert_eq!(saved.session_id, confirmed.session_id);
+        assert_eq!(saved.session_file, confirmed.session_file);
+        assert_eq!(saved.wsl_launch.as_ref().unwrap().cwd, "/last-directory");
+        assert!(saved.resume_command().unwrap().contains("--resume confirmed-session"));
+    }
+
+    #[test]
+    fn a_replaced_guest_process_cannot_reuse_the_initial_request_or_confirmed_id() {
+        let mut observer = recovery_observer();
+        let now = Instant::now();
+        observer.apply_probe(WslLocationProbe::Found(recovery_location("/current")), now);
+        let mut target = observer.saved_agent().unwrap().clone();
+        target.session_id = Some("confirmed-session".into());
+        observer.confirm_saved_identity(&target);
+        let mut replacement = recovery_location("/next");
+        replacement.agent.process.start_time += 1;
+        observer.apply_probe(WslLocationProbe::Found(replacement), now);
+        assert!(observer.saved_agent().unwrap().session_id.is_none());
+        assert!(observer.saved_agent().unwrap().session_file.is_none());
+        assert!(observer.saved_agent().unwrap().resume_command().is_none());
+    }
+
+    #[test]
+    fn hook_identity_suppression_keeps_recovery_and_directory_refresh_available() {
+        let mut observer = recovery_observer();
+        let now = Instant::now();
+        observer.apply_probe(WslLocationProbe::Found(recovery_location("/current")), now);
+        observer.suppress_identity_until_next_command();
+        assert!(observer.identity_scope().is_none());
+        assert!(observer.recovery_scope().is_some());
+        let mut confirmed = observer.saved_agent().unwrap().clone();
+        confirmed.session_id = Some("forked-session".into());
+        observer.confirm_saved_identity(&confirmed);
+        observer.apply_probe(WslLocationProbe::Found(recovery_location("/changed")), now);
+        let saved = observer.saved_agent().unwrap();
+        assert_eq!(saved.session_id.as_deref(), Some("forked-session"));
+        assert_eq!(saved.wsl_launch.as_ref().unwrap().cwd, "/changed");
+    }
+
+    #[test]
+    fn saved_recovery_is_cleared_at_authoritative_command_and_owner_boundaries() {
+        let mut observer = recovery_observer();
+        let now = Instant::now();
+        observer.apply_probe(WslLocationProbe::Found(recovery_location("/current")), now);
+        observer.finish_command();
+        assert!(observer.saved_agent().is_none());
+        observer = recovery_observer();
+        observer.apply_probe(WslLocationProbe::Found(recovery_location("/current")), now);
+        observer.accept_command_id("abcdef0123456789abcdef0123456789");
+        assert!(observer.saved_agent().is_none());
+        observer.apply_probe(WslLocationProbe::Found(recovery_location("/current")), now);
+        observer.apply_probe(WslLocationProbe::NoLauncher, now);
+        assert!(observer.saved_agent().is_none());
+        observer.apply_probe(WslLocationProbe::Found(recovery_location("/current")), now);
+        observer.stop();
+        assert!(observer.saved_agent().is_none());
+    }
+
+    #[test]
+    fn a_different_distribution_cannot_inherit_a_same_numbered_guest_identity() {
+        let mut observer = recovery_observer();
+        let now = Instant::now();
+        observer.apply_probe(WslLocationProbe::Found(recovery_location("/current")), now);
+        let mut other = recovery_location("/other");
+        other.distro = "another-distro".into();
+        other.agent_launch = None;
+        observer.apply_probe(WslLocationProbe::Found(other), now);
+        assert!(observer.saved_agent().unwrap().session_id.is_none());
+        assert_eq!(
+            observer.saved_agent().unwrap().wsl_launch.as_ref().unwrap().distribution,
+            "another-distro"
+        );
+    }
+
+    #[test]
+    fn a_literal_nested_wsl_launch_is_bound_to_its_shell_command_token() {
+        let mut observer = WslCwdObserver::default();
+        observer.prepare_submission(Some(boundary()));
+        observer.accept_command_line(r#"wsl.exe -d Ubuntu-22.04 --cd /old -e sh -lc "exec \${SHELL:-sh} -lic 'claude --resume 01a1aedc-d6f0-7db0-8875-882c249ef4a2'""#);
+        observer.accept_command_id("0123456789abcdef0123456789abcdef");
+        observer.mark_command_start();
+        let now = Instant::now();
+        observer.apply_probe(WslLocationProbe::Found(location(20, 30, "/current")), now);
+        let saved = observer.saved_agent().unwrap();
+        assert_eq!(saved.session_id.as_deref(), Some(REQUESTED));
+        assert!(saved.resume_command().unwrap().contains("-e sh -lc"));
+        observer.accept_command_id("abcdef0123456789abcdef0123456789");
+        observer.apply_probe(WslLocationProbe::Found(location(20, 31, "/next")), now);
+        assert!(observer.saved_agent().unwrap().session_id.is_none());
+        assert!(observer.saved_agent().unwrap().resume_command().is_none());
     }
 
     #[test]
