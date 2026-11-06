@@ -14,10 +14,11 @@ pub enum AiLogo {
     OhMyPi,
     CodeBuddy,
     Kimi,
+    Hermes,
 }
 
 impl AiLogo {
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 11] = [
         Self::Claude,
         Self::OpenAi,
         Self::OpenCode,
@@ -28,22 +29,26 @@ impl AiLogo {
         Self::OhMyPi,
         Self::CodeBuddy,
         Self::Kimi,
+        Self::Hermes,
     ];
 
-    /// One source catalog for both shells. Official color assets are embedded unchanged.
-    pub(crate) fn png(self, light_ink: bool) -> &'static [u8] {
+    /// Official raster assets are embedded unchanged; Hermes is rendered from SVG.
+    pub(crate) fn png(self, light_ink: bool) -> Option<&'static [u8]> {
         match self {
-            Self::Claude => include_bytes!("../../../extra/logo/ai_claude.png"),
-            Self::OpenAi => include_bytes!("../../../extra/logo/ai_openai.png"),
-            Self::OpenCode => include_bytes!("../../../extra/logo/ai_opencode.png"),
-            Self::Pi => include_bytes!("../../../extra/logo/ai_pi.png"),
-            Self::Grok if light_ink => include_bytes!("../../../extra/logo/ai_grok_light.png"),
-            Self::Grok => include_bytes!("../../../extra/logo/ai_grok_dark.png"),
-            Self::Antigravity => include_bytes!("../../../extra/logo/ai_antigravity.png"),
-            Self::Trae => include_bytes!("../../../extra/logo/ai_trae.png"),
-            Self::OhMyPi => include_bytes!("../../../extra/logo/ai_omp.png"),
-            Self::CodeBuddy => include_bytes!("../../../extra/logo/ai_codebuddy.png"),
-            Self::Kimi => include_bytes!("../../../extra/logo/ai_kimi.png"),
+            Self::Claude => Some(include_bytes!("../../../extra/logo/ai_claude.png")),
+            Self::OpenAi => Some(include_bytes!("../../../extra/logo/ai_openai.png")),
+            Self::OpenCode => Some(include_bytes!("../../../extra/logo/ai_opencode.png")),
+            Self::Pi => Some(include_bytes!("../../../extra/logo/ai_pi.png")),
+            Self::Grok if light_ink => {
+                Some(include_bytes!("../../../extra/logo/ai_grok_light.png"))
+            },
+            Self::Grok => Some(include_bytes!("../../../extra/logo/ai_grok_dark.png")),
+            Self::Antigravity => Some(include_bytes!("../../../extra/logo/ai_antigravity.png")),
+            Self::Trae => Some(include_bytes!("../../../extra/logo/ai_trae.png")),
+            Self::OhMyPi => Some(include_bytes!("../../../extra/logo/ai_omp.png")),
+            Self::CodeBuddy => Some(include_bytes!("../../../extra/logo/ai_codebuddy.png")),
+            Self::Kimi => Some(include_bytes!("../../../extra/logo/ai_kimi.png")),
+            Self::Hermes => None,
         }
     }
 
@@ -60,13 +65,21 @@ impl AiLogo {
             | Self::Antigravity
             | Self::Trae
             | Self::OhMyPi
-            | Self::CodeBuddy => None,
+            | Self::CodeBuddy
+            | Self::Hermes => None,
         }
     }
 
     /// Reuse a prepared texture only when neither its source nor tint depends on theme.
     pub(crate) fn shares_theme_texture(self) -> bool {
-        self.tint_preserves_luma().is_none() && std::ptr::eq(self.png(false), self.png(true))
+        if self.tint_preserves_luma().is_some() {
+            return false;
+        }
+        match (self.png(false), self.png(true)) {
+            (Some(light), Some(dark)) => std::ptr::eq(light, dark),
+            (None, None) => true,
+            _ => false,
+        }
     }
 
     pub(crate) fn tint_pixels(self, pixels: &mut [u8], ink: [u8; 3]) {
@@ -148,6 +161,7 @@ pub(crate) fn ai_logo_for_program(program: &str) -> Option<AiLogo> {
         AgentKind::OhMyPi => Some(AiLogo::OhMyPi),
         AgentKind::CodeBuddy => Some(AiLogo::CodeBuddy),
         AgentKind::Kimi => Some(AiLogo::Kimi),
+        AgentKind::Hermes => Some(AiLogo::Hermes),
         _ => None,
     }
 }
@@ -196,6 +210,28 @@ mod tests {
     }
 
     #[test]
+    fn hermes_commands_resolve_to_a_brand_logo_without_matching_shell_paths() {
+        for command in ["hermes", "hermes-agent", "HERMES.EXE", r"C:\HERMES.CMD"] {
+            assert_eq!(logo_for_command(command), Some(AiLogo::Hermes), "{command}");
+        }
+
+        for command in [
+            "bash",
+            "pwsh",
+            r"C:\Users\Hermes\bin\pwsh.exe",
+            "hermes-project-shell",
+            "hermes-agent-helper",
+        ] {
+            assert_eq!(logo_for_command(command), None, "{command}");
+        }
+
+        assert_eq!(logo_for_command("claude"), Some(AiLogo::Claude));
+        assert_eq!(logo_for_command("codex"), Some(AiLogo::OpenAi));
+        assert_eq!(logo_for_command("opencode"), Some(AiLogo::OpenCode));
+        assert_eq!(logo_for_command("kimi"), Some(AiLogo::Kimi));
+    }
+
+    #[test]
     fn running_program_identity_normalizes_grok_without_changing_fallbacks() {
         for command in [
             "grok",
@@ -221,7 +257,7 @@ mod tests {
 
         let assets = [
             (
-                AiLogo::Grok.png(false),
+                AiLogo::Grok.png(false).unwrap(),
                 [
                     0x37, 0xdd, 0xbc, 0xb6, 0xe2, 0xa7, 0xf2, 0xe4, 0xb3, 0xbe, 0x78, 0xa7, 0xd4,
                     0x12, 0x96, 0xa3, 0xbc, 0x7e, 0xdf, 0x69, 0x26, 0x36, 0x24, 0x34, 0xef, 0xc0,
@@ -229,7 +265,7 @@ mod tests {
                 ],
             ),
             (
-                AiLogo::Grok.png(true),
+                AiLogo::Grok.png(true).unwrap(),
                 [
                     0x35, 0x90, 0x56, 0xee, 0x89, 0x83, 0xcf, 0xa0, 0xba, 0x7e, 0x72, 0x79, 0x50,
                     0x78, 0xc7, 0xc0, 0xdd, 0xf6, 0xc5, 0xd7, 0xa1, 0x87, 0x04, 0x01, 0xab, 0x96,
@@ -237,7 +273,7 @@ mod tests {
                 ],
             ),
             (
-                AiLogo::Kimi.png(false),
+                AiLogo::Kimi.png(false).unwrap(),
                 [
                     0xfc, 0x3f, 0x90, 0x5a, 0xdc, 0x68, 0xdf, 0xe9, 0xe1, 0x4a, 0xd2, 0x3b, 0x12,
                     0x3f, 0x55, 0xab, 0x71, 0xd3, 0x2b, 0xf0, 0xd8, 0x55, 0xa2, 0xcf, 0x65, 0x80,
@@ -256,7 +292,7 @@ mod tests {
 
     #[test]
     fn official_grok_logos_prepare_sharp_optically_centered_physical_textures() {
-        for png in [AiLogo::Grok.png(false), AiLogo::Grok.png(true)] {
+        for png in [AiLogo::Grok.png(false).unwrap(), AiLogo::Grok.png(true).unwrap()] {
             let (width, height, rgba) = decode_png(png);
             let (rgba, width, height) = prepare_ai_logo_texture(&rgba, width, height, 18);
 
@@ -304,8 +340,8 @@ mod tests {
     fn official_antigravity_logo_keeps_its_bytes_and_colors_on_both_themes() {
         use sha2::{Digest, Sha256};
 
-        let png = AiLogo::Antigravity.png(false);
-        assert_eq!(png, AiLogo::Antigravity.png(true));
+        let png = AiLogo::Antigravity.png(false).unwrap();
+        assert_eq!(png, AiLogo::Antigravity.png(true).unwrap());
         assert_eq!(
             Sha256::digest(png).as_slice(),
             [
@@ -360,7 +396,7 @@ mod tests {
     #[test]
     fn vector_sourced_logos_keep_color_and_antialiased_edges_at_tab_sizes() {
         for logo in [AiLogo::Claude, AiLogo::Trae, AiLogo::OhMyPi, AiLogo::Kimi] {
-            let (width, height, source) = decode_png(logo.png(false));
+            let (width, height, source) = decode_png(logo.png(false).unwrap());
             assert_eq!((width, height), (1024, 1024));
             for size in [16, 18, 24, 27, 36, 48] {
                 let (pixels, width, height) = prepare_ai_logo_texture(&source, width, height, size);
@@ -416,7 +452,7 @@ mod tests {
     #[test]
     fn codebuddy_square_logo_smooths_edges_without_recoloring_the_brand() {
         let logo = AiLogo::CodeBuddy;
-        let (width, height, source) = decode_png(logo.png(false));
+        let (width, height, source) = decode_png(logo.png(false).unwrap());
         assert_eq!((width, height), (1024, 1024));
         let original = image::RgbaImage::from_raw(width, height, source.clone()).unwrap();
         let partial_coverage =

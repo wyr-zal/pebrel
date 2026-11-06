@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use gpui::{Context, RenderImage, Task};
+use gpui::{AssetSource, Context, RenderImage, Task};
 use image::Frame;
 
 use super::NebulaWorkspace;
@@ -78,7 +78,16 @@ fn decode_sidebar_logo(
     dark: bool,
     target_size: u32,
 ) -> Option<Arc<RenderImage>> {
-    let mut rgba = image::load_from_memory(logo.png(dark)).ok()?.into_rgba8();
+    if logo == crate::display::AiLogo::Hermes {
+        let svg = crate::gpui_shell::assets::NebulaAssets
+            .load(crate::gpui_shell::assets::nav::AGENT_HERMES)
+            .ok()??;
+        // GPUI's SVG frame is 2x the viewBox at scale 1.
+        return gpui::SvgRenderer::new(Arc::new(()))
+            .render_single_frame(svg.as_ref(), target_size as f32 / 2048.0)
+            .ok();
+    }
+    let mut rgba = image::load_from_memory(logo.png(dark)?).ok()?.into_rgba8();
     logo.tint_pixels(&mut rgba, if dark { [236, 239, 245] } else { [35, 40, 50] });
     // 直接复用旧壳的 Lanczos3 物理像素预缩放与 alpha 质量中心校正。
     // 先 tint 再缩放，避免 1024px 原图在 GPUI paint 阶段临时压到十几个
@@ -136,12 +145,22 @@ mod tests {
             let images = sidebar_logo_images(target, &AtomicBool::new(false)).unwrap();
             assert_eq!(images.len(), AiLogo::ALL.len() * 2);
             let unique = images.values().map(Arc::as_ptr).collect::<std::collections::HashSet<_>>();
-            assert_eq!(unique.len(), 15, "five color assets must not be prepared twice");
+            assert_eq!(unique.len(), 16, "six color assets must not be prepared twice");
             for logo in AiLogo::ALL {
                 let light = &images[&(logo, false)];
                 let dark = &images[&(logo, true)];
                 assert_eq!(u32::from(light.size(0).width), target);
                 assert_eq!(u32::from(dark.size(0).height), target);
+                if logo == AiLogo::Hermes {
+                    let colors = light
+                        .as_bytes(0)
+                        .unwrap()
+                        .chunks_exact(4)
+                        .filter(|pixel| pixel[3] > 0)
+                        .map(|pixel| [pixel[0], pixel[1], pixel[2]])
+                        .collect::<std::collections::HashSet<_>>();
+                    assert!(colors.len() > 1, "Hermes SVG should retain its colors");
+                }
                 if Arc::ptr_eq(light, dark) {
                     // Compare the omitted dark preparation against the actual output,
                     // so a later asset/tint change cannot silently change its pixels.

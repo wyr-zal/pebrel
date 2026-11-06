@@ -2212,7 +2212,7 @@ impl Display {
         if let Some(cached) = self.nebula_ai_logo_cache.get(&key) {
             return Some(cached.clone());
         }
-        let bytes = logo.png(grok_uses_light_mark);
+        let bytes = logo.png(grok_uses_light_mark)?;
         let (width, height, mut rgba) = match crate::renderer::image::decode_png_bytes(bytes) {
             Ok(decoded) => decoded,
             // Unreachable for a valid embedded asset; degrade to no icon.
