@@ -2,6 +2,9 @@
 
 use super::*;
 
+#[cfg(all(test, feature = "gpui-test-support"))]
+mod restart_cwd_tests;
+
 impl NebulaWorkspace {
     /// 冷启动回退（没有恢复出任何标签）时首个终端的 cwd：与 `add_terminal`
     /// 同一合同，设置页「启动目录」优先，未设置或失效时才继承进程启动目录。

@@ -20,6 +20,8 @@ mod environment;
 mod powershell_launch;
 
 #[cfg(test)]
+mod cwd_tests;
+#[cfg(test)]
 mod proxy_tests;
 
 use blocking::{UnblockedReader, UnblockedWriter};
@@ -427,7 +429,9 @@ if (-not $global:PebrelShellToken) {
     $global:PebrelShellToken = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(
         "pwsh:$PID`:$([Guid]::NewGuid().ToString('N'))"))
 }
-
+"#,
+    include_str!("cwd.ps1"),
+    r#"
 $global:NebulaPromptTemplate = {
     # Same principle as Oh My Posh: prompt rendering may execute external
     # commands, so preserve the previous command status. Errors inside the
@@ -495,6 +499,13 @@ $global:NebulaPromptTemplate = {
         if ($outermost) { [Console]::Write("$e]133;D;$nebExit$([char]7)") }
         $reset = "$e[0m"
         $cwd = (Get-Location).Path
+        # Match the native path decoded from OSC 7. Different slash styles
+        # would record one location change twice when this prompt appears.
+        $reportedCwd = $cwd
+        $location = $ExecutionContext.SessionState.Path.CurrentLocation
+        if ($location.Provider.Name -eq 'FileSystem') {
+            $reportedCwd = $location.ProviderPath.Replace('\', '/')
+        }
         $loc = $cwd
         $hp = $env:USERPROFILE
         # `loc` 只负责提示符的紧凑显示；功能协议必须发送绝对 cwd。否则 home
@@ -505,7 +516,7 @@ $global:NebulaPromptTemplate = {
         if ($LASTEXITCODE -eq 0 -and $b) { $branch = $b }
         $time = Get-Date -Format 'HH:mm:ss'
 
-        $boundary = if ($outermost) { "$e]133;A$([char]7)$e]2;NEBULA|$cwd|$branch$([char]7)" } else { '' }
+        $boundary = if ($outermost) { "$e]133;A$([char]7)$e]2;NEBULA|$reportedCwd|$branch$([char]7)" } else { '' }
         $leadingNewline = ''
         try {
             # PowerShell cursor Y is zero-based. Like Oh My Posh's cancelNewline,
@@ -1261,18 +1272,6 @@ mod test {
     }
 
     #[test]
-    fn powershell_reports_absolute_cwd_while_displaying_home_as_tilde() {
-        assert!(NEBULA_PROMPT_PS1.contains("$cwd = (Get-Location).Path"));
-        assert!(NEBULA_PROMPT_PS1.contains("$loc = $cwd"));
-        assert!(NEBULA_PROMPT_PS1.contains("$loc = '~' + $loc.Substring($hp.Length)"));
-        assert!(NEBULA_PROMPT_PS1.contains("NEBULA|$cwd|$branch"));
-        assert!(
-            !NEBULA_PROMPT_PS1.contains("NEBULA|$loc|$branch"),
-            "the display-only tilde path must not leak into cwd consumers"
-        );
-    }
-
-    #[test]
     fn disabling_powerline_keeps_the_complete_osc_lifecycle() {
         let toggle = NEBULA_PROMPT_PS1
             .find("Get-NebulaBoolSetting 'powerline'")
@@ -1296,15 +1295,13 @@ mod test {
         let report = NEBULA_PROMPT_PS1
             .find("SetUserVar=pebrel_command_id=")
             .expect("command id is reported to the pane");
-        let input = NEBULA_PROMPT_PS1
-            .find("SetUserVar=pebrel_input=")
-            .expect("accepted input is reported");
+        let input =
+            NEBULA_PROMPT_PS1.find("SetUserVar=pebrel_input=").expect("accepted input is reported");
         let command = NEBULA_PROMPT_PS1
             .find("SetUserVar=pebrel_command=")
             .expect("resolved command is reported");
-        let start = NEBULA_PROMPT_PS1
-            .find("]133;C")
-            .expect("command start marker follows metadata");
+        let start =
+            NEBULA_PROMPT_PS1.find("]133;C").expect("command start marker follows metadata");
         assert!(id < report && report < input && input < command && command < start);
     }
 
