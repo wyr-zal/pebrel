@@ -987,6 +987,8 @@
     "save_failed": "Could not save the workspace. The application will stay open. Check free space and folder permissions, then retry.",
     "identity_pending": "Some running AI sessions have not reported a recovery identity. Try again after their startup finishes.",
     "restore_failed": "This AI conversation could not be restored. Its saved target is preserved. Use Retry recovery in the tab menu, or locate it in session history.",
+    "restore_hermes_missing_id": "Saved record kept; no resumable session ID. Manually locate and select the original conversation in Hermes' native history.",
+    "restore_hermes_wsl_unreplayable": "Saved record kept; WSL launch data cannot be safely replayed. Manually locate the original conversation in Hermes' native history.",
     "restore_choose_codex": "The saved Codex conversation is unavailable. Choose a conversation in Codex to continue.",
     "restore_ambiguous": "More than one native session file matches this conversation. The saved target is preserved; choose the exact conversation from session history.",
     "retry": "Retry session recovery"

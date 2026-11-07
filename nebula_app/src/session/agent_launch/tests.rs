@@ -178,6 +178,65 @@ fn old_snapshots_load_without_guessing_a_missing_claude_id() {
 }
 
 #[test]
+fn hermes_saved_session_resumes_its_exact_native_id() {
+    for id in ["20261107_091523_a1b2c3".to_owned(), format!("local-{}", "a".repeat(64))] {
+        let saved: AgentSession = serde_json::from_value(serde_json::json!({
+            "source": "hermes", "session_id": id,
+        }))
+        .unwrap();
+        let restored: AgentSession =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(restored, saved);
+        assert_eq!(restored.resume_command(), Some(format!("hermes --resume {id}")));
+    }
+}
+
+#[test]
+fn hermes_wsl_resume_keeps_guest_scope_and_replaces_the_saved_target() {
+    let old = "20261106_101112_123abc";
+    let current = "20261107_091523_a1b2c3";
+    for argv in [
+        vec!["hermes", "--resume", old],
+        vec!["hermes", "chat", "-r", old, "--model", "fixture-model"],
+    ] {
+        let launch = capture(AgentKind::Hermes, &argv, "/mnt/f/Hermes O'Brien 项目");
+        assert!(launch.is_replayable(), "{argv:?}");
+        assert_eq!(launch.requested_session_id(AgentKind::Hermes).as_deref(), Some(old));
+        let text =
+            launch.resume_command(AgentKind::Hermes, current, PathQuote::PowerShell).unwrap();
+        assert!(text.contains("--cd '/mnt/f/Hermes O''Brien 项目' -d Ubuntu-22.04"));
+        assert!(text.contains(&format!("--resume {current}")));
+        assert!(text.contains("--no-restore-cwd"));
+        assert!(!text.contains(old));
+        assert!(!text.contains("/old"));
+    }
+}
+
+#[test]
+fn hermes_login_shell_and_profile_survive_resume_of_a_full_local_id() {
+    let id = format!("local-{}", "b".repeat(64));
+    let inner = format!("exec ${{SHELL:-sh}} -lic 'hermes --profile fixture --resume {id}'");
+    let launch = capture(AgentKind::Hermes, &["sh", "-lc", &inner], "/current");
+    assert_eq!(launch.requested_session_id(AgentKind::Hermes).as_deref(), Some(id.as_str()));
+    let text = launch.resume_command(AgentKind::Hermes, &id, PathQuote::PowerShell).unwrap();
+    assert!(text.contains("-e sh -lc"));
+    assert!(text.contains("--profile fixture"));
+    assert!(text.contains("--no-restore-cwd"));
+    assert!(text.contains(&id));
+    assert_eq!(AgentKind::Claude.resume_command(&id), None);
+}
+
+#[test]
+fn hermes_missing_or_unsafe_identity_never_selects_a_different_conversation() {
+    let saved: AgentSession = serde_json::from_str(r#"{"source":"hermes"}"#).unwrap();
+    assert_eq!(saved.resume_command(), None);
+    assert_eq!(serde_json::to_value(&saved).unwrap(), serde_json::json!({"source": "hermes"}));
+    for id in ["latest", "a title", "20261107_091523_a1b2c3;exit", "", "-c"] {
+        assert_eq!(AgentKind::Hermes.resume_command(id), None, "{id}");
+    }
+}
+
+#[test]
 fn durable_launch_roundtrip_prefers_the_native_rollout_thread() {
     let agent = AgentSession {
         source: "codex".into(),

@@ -367,8 +367,26 @@ impl TerminalView {
                 self.run_command(command, cx);
             } else {
                 self.recovery.mark_failed();
+                let message = if crate::ai_agents::AgentKind::parse(&agent.source)
+                    == Some(crate::ai_agents::AgentKind::Hermes)
+                {
+                    if agent
+                        .session_id
+                        .as_deref()
+                        .and_then(|id| crate::ai_agents::AgentKind::Hermes.resume_command(id))
+                        .is_none()
+                    {
+                        crate::i18n::Message::SessionRestoreHermesMissingId
+                    } else if agent.wsl_launch.is_some() {
+                        crate::i18n::Message::SessionRestoreHermesWslUnreplayable
+                    } else {
+                        crate::i18n::Message::SessionRestoreFailed
+                    }
+                } else {
+                    crate::i18n::Message::SessionRestoreFailed
+                };
                 cx.emit(TerminalViewEvent::Notification(crate::notify::Notification::Text {
-                    body: ui_language().text(crate::i18n::Message::SessionRestoreFailed).to_owned(),
+                    body: crate::gpui_shell::config::ui_language(cx).text(message).to_owned(),
                     program: Some(agent.source),
                 }));
                 cx.notify();
@@ -464,7 +482,11 @@ impl TerminalView {
     pub(crate) fn can_retry_recovery(&self) -> bool {
         self.recovery.failed
             && !self.recovery.resolving
-            && self.recovery.retry_candidate.is_some()
+            && self.recovery.retry_candidate.as_ref().is_some_and(|target| {
+                crate::ai_agents::AgentKind::parse(&target.source)
+                    != Some(crate::ai_agents::AgentKind::Hermes)
+                    || target.resume_command_for_quote(self.path_quote()).is_some()
+            })
             && self.running_program.is_none()
             && self.pending_shell_command.is_none()
     }

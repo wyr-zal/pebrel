@@ -987,6 +987,8 @@
     "save_failed": "无法保存工作区，应用将保持打开。请检查剩余空间和目录权限后重试。",
     "identity_pending": "部分运行中的 AI 会话尚未提供恢复身份，请等待它们启动完成后重试。",
     "restore_failed": "此 AI 对话未能恢复，原恢复记录已保留。可在标签菜单中重试恢复，或到历史会话中定位。",
+    "restore_hermes_missing_id": "原恢复记录已保留，但缺少可恢复的精确会话 ID。请在 Hermes 原生历史中手动定位并选择原对话。",
+    "restore_hermes_wsl_unreplayable": "原恢复记录已保留，但 WSL 启动信息无法安全重放。请在 Hermes 原生历史中手动定位原对话。",
     "restore_choose_codex": "保存的 Codex 对话已不可用。请在 Codex 的会话列表中选择要继续的对话。",
     "restore_ambiguous": "有多个原生会话文件匹配此对话，原恢复记录已保留。请在历史会话中选择准确的对话。",
     "retry": "重试会话恢复"

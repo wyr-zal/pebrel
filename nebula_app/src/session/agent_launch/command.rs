@@ -3,7 +3,7 @@
 use super::{AgentCommand, AgentKind, CommandWrapper, valid_value};
 
 pub(super) fn parse(argv: &[String], kind: AgentKind) -> Option<AgentCommand> {
-    if !matches!(kind, AgentKind::Claude | AgentKind::Codex) {
+    if !matches!(kind, AgentKind::Claude | AgentKind::Codex | AgentKind::Hermes) {
         return None;
     }
     let (wrapper, words) = if argv.len() == 3 && argv[0] == "sh" && argv[1] == "-lc" {
@@ -33,7 +33,7 @@ pub(super) fn requested_session_id(command: &AgentCommand, kind: AgentKind) -> O
         return None;
     }
     let id = prepare(command, kind)?.1?;
-    crate::session::valid_session_uuid(&id).then_some(id)
+    (kind == AgentKind::Hermes || crate::session::valid_session_uuid(&id)).then_some(id)
 }
 
 pub(super) fn resumed_args(
@@ -44,12 +44,19 @@ pub(super) fn resumed_args(
     kind.resume_command(id)?;
     let (mut options, _, resume_at) = prepare(command, kind)?;
     let flag = match kind {
-        AgentKind::Claude => "--resume",
+        AgentKind::Claude | AgentKind::Hermes => "--resume",
         AgentKind::Codex => "resume",
         _ => return None,
     };
-    let at = if kind == AgentKind::Codex { resume_at.unwrap_or(options.len()) } else { 0 };
+    let at = match kind {
+        AgentKind::Codex => resume_at.unwrap_or(options.len()),
+        AgentKind::Hermes => resume_at.unwrap_or(0),
+        _ => 0,
+    };
     options.splice(at..at, [flag.into(), id.into()]);
+    if kind == AgentKind::Hermes && !options.iter().any(|arg| arg == "--no-restore-cwd") {
+        options.push("--no-restore-cwd".into());
+    }
     Some(options)
 }
 
@@ -73,31 +80,37 @@ fn prepare(
     let mut id = None;
     let mut options = Vec::new();
     let mut at = 0;
-    let mut codex_resume_at = None;
+    let mut resume_at = None;
+    let mut hermes_chat = false;
     while let Some(arg) = command.args.get(at) {
         let (flag, inline) =
             arg.split_once('=').map_or((arg.as_str(), None), |(key, value)| (key, Some(value)));
         at += 1;
-        if kind == AgentKind::Codex
-            && flag == "resume"
-            && inline.is_none()
-            && codex_resume_at.is_none()
-        {
-            codex_resume_at = Some(options.len());
+        if kind == AgentKind::Hermes && flag == "chat" && inline.is_none() && !hermes_chat {
+            options.push(arg.clone());
+            resume_at = Some(options.len());
+            hermes_chat = true;
+            continue;
+        }
+        if kind == AgentKind::Codex && flag == "resume" && inline.is_none() && resume_at.is_none() {
+            resume_at = Some(options.len());
             if let Some(value) = command.args.get(at).filter(|arg| !arg.starts_with('-')) {
                 remember_id(&mut id, kind, value)?;
                 at += 1;
             }
             continue;
         }
-        let identity =
-            kind == AgentKind::Claude && matches!(flag, "--resume" | "-r" | "--session-id");
+        let identity = match kind {
+            AgentKind::Claude => matches!(flag, "--resume" | "-r" | "--session-id"),
+            AgentKind::Hermes => matches!(flag, "--resume" | "-r"),
+            _ => false,
+        };
         if identity {
             let value = inline.or_else(|| {
                 command.args.get(at).filter(|arg| !arg.starts_with('-')).map(String::as_str)
             });
             let Some(value) = value else {
-                if flag == "--session-id" {
+                if flag == "--session-id" || kind == AgentKind::Hermes {
                     return None;
                 }
                 continue;
@@ -109,11 +122,17 @@ fn prepare(
         let selection = match kind {
             AgentKind::Claude => matches!(flag, "--continue" | "-c" | "--fork-session"),
             AgentKind::Codex => matches!(flag, "--last" | "--all" | "--include-non-interactive"),
+            AgentKind::Hermes => matches!(flag, "--continue" | "-c"),
             _ => return None,
         };
         if selection {
             if inline.is_some() {
                 return None;
+            }
+            if kind == AgentKind::Hermes
+                && command.args.get(at).is_some_and(|value| !value.starts_with('-'))
+            {
+                at += 1;
             }
             continue;
         }
@@ -121,7 +140,8 @@ fn prepare(
         if !allowed || inline.is_some() && !takes_value {
             return None;
         }
-        let replaces_directory = kind == AgentKind::Codex && matches!(flag, "--cd" | "-C");
+        let replaces_directory = (kind == AgentKind::Codex && matches!(flag, "--cd" | "-C"))
+            || (kind == AgentKind::Hermes && flag == "--in");
         if !replaces_directory {
             options.push(arg.clone());
         }
@@ -133,7 +153,7 @@ fn prepare(
             at += 1;
         }
     }
-    Some((options, id, codex_resume_at))
+    Some((options, id, resume_at))
 }
 
 fn remember_id(current: &mut Option<String>, kind: AgentKind, value: &str) -> Option<()> {
@@ -184,6 +204,20 @@ fn allowed_option(kind: AgentKind, flag: &str) -> (bool, bool) {
                 | "--disable"
                 | "--local-provider"
         ),
+        AgentKind::Hermes => matches!(
+            flag,
+            "--model"
+                | "-m"
+                | "--provider"
+                | "--profile"
+                | "-p"
+                | "--toolsets"
+                | "--skills"
+                | "-s"
+                | "--max-turns"
+                | "--reasoning"
+                | "--in"
+        ),
         _ => false,
     };
     let boolean = match kind {
@@ -209,6 +243,10 @@ fn allowed_option(kind: AgentKind, flag: &str) -> (bool, bool) {
                 | "--oss"
                 | "--no-daemon"
                 | "--strict-config"
+        ),
+        AgentKind::Hermes => matches!(
+            flag,
+            "--verbose" | "--compact" | "--no-restore-cwd" | "--cli" | "--tui" | "--yolo"
         ),
         _ => false,
     };

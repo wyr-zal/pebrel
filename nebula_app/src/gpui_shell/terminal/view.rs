@@ -14,6 +14,8 @@ mod conversation;
 pub(super) mod cursor;
 mod cwd_report;
 mod editor;
+#[cfg(all(test, feature = "gpui-test-support"))]
+mod hermes_recovery_tests;
 mod image_paste;
 mod layout;
 #[cfg(all(test, windows, feature = "gpui-test-support"))]

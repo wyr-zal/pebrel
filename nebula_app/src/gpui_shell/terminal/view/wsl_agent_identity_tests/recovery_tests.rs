@@ -1,5 +1,56 @@
 use super::super::startup_tests::feed;
 use super::*;
+
+#[gpui::test]
+fn hermes_native_identity_round_trips_the_guest_and_submits_a_cold_resume(cx: &mut TestAppContext) {
+    let (entity, window, _) = open(cx);
+    let id = format!("local-{}", "a".repeat(64));
+    let saved = entity.update(window, |view, cx| {
+        let ticket = start_host_wsl(view, '7', cx);
+        let location = recovery_location(AgentKind::Hermes, REQUESTED, "/mnt/f/guest B");
+        view.apply_wsl_cwd_probe_result(&ticket, WslLocationProbe::Found(location), true, cx);
+        view.apply_probed_session_identity(
+            AgentSession {
+                source: "hermes".into(),
+                session_id: Some(id.clone()),
+                session_file: None,
+                wsl_launch: None,
+            },
+            Some("/creation-directory".into()),
+            true,
+            cx,
+        );
+        assert_eq!(view.cwd, r"C:\Users\12704", "guest metadata must not replace the host cwd");
+        let saved = view.session_agent().unwrap();
+        assert_eq!(saved.session_id.as_deref(), Some(id.as_str()));
+        assert_eq!(saved.wsl_launch.as_ref().unwrap().cwd, "/mnt/f/guest B");
+        assert_eq!(saved.wsl_launch.as_ref().unwrap().distribution, "Ubuntu-22.04");
+        serde_json::from_str::<AgentSession>(&serde_json::to_string(&saved).unwrap()).unwrap()
+    });
+    let expected = saved.resume_command().unwrap();
+    let (entity, window, receiver) = open(cx);
+    entity.update(window, |view, cx| {
+        let mut options = nebula_terminal::tty::Options::default();
+        options.shell = Some(nebula_terminal::tty::Shell::new("pwsh.exe".into(), vec![]));
+        view.exec_context = Some(crate::runtime_exec::PaneExecContext::from_pty_options(&options));
+        view.suggest.suggest_env = crate::display::SuggestEnv::Local;
+        view.restore_agent(saved.clone(), cx);
+        assert!(!view.can_retry_recovery());
+        assert!(view.ai_session.is_none());
+        assert_eq!(view.session_agent(), Some(saved.clone()));
+        feed(view, b"\x1b]133;A\x07PS C:\\fixture> ");
+        view.flush_pending_shell_command(cx);
+        assert!(receiver.try_iter().any(|message| {
+            matches!(message, Msg::Input(bytes) if bytes.as_ref() == expected.as_bytes())
+        }));
+        assert!(expected.contains(&id));
+        assert!(expected.contains("--cd '/mnt/f/guest B' -d Ubuntu-22.04"));
+        assert!(expected.contains("--no-restore-cwd"));
+        view.finish_foreground_command(Some(1), cx);
+        assert!(view.can_retry_recovery());
+        assert_eq!(view.session_agent(), Some(saved));
+    });
+}
 use crate::session::AgentSession;
 
 const REQUESTED: &str = "01a1aedc-d6f0-7db0-8875-882c249ef4a2";

@@ -261,9 +261,14 @@ impl AgentKind {
     /// Shell-safe resume command. Session ids are untrusted hook/file input,
     /// so an unsupported shape returns `None` instead of being quoted.
     pub fn resume_command(self, session_id: &str) -> Option<String> {
-        valid_session_id(session_id)?;
+        if self == Self::Hermes {
+            valid_hermes_session_id(session_id)?;
+        } else {
+            valid_session_id(session_id)?;
+        }
         Some(match self {
             Self::Claude => format!("claude --resume {session_id}"),
+            Self::Hermes => format!("hermes --resume {session_id}"),
             Self::Codex => format!("codex resume {session_id}"),
             Self::Gemini => format!("gemini --resume {session_id}"),
             Self::OpenCode => format!("opencode --session {session_id}"),
@@ -277,7 +282,6 @@ impl AgentKind {
             | Self::Goose
             | Self::Droid
             | Self::Auggie
-            | Self::Hermes
             | Self::Vibe
             | Self::Antigravity
             | Self::Qwen
@@ -323,6 +327,19 @@ impl AgentKind {
             _ => return None,
         })
     }
+}
+
+fn valid_hermes_session_id(id: &str) -> Option<()> {
+    // Hermes also uses full SHA256 local IDs. Titles and `latest` are selectors,
+    // not durable identities, and must never redirect an automatic recovery.
+    static IDS: OnceLock<Regex> = OnceLock::new();
+    let ids = IDS.get_or_init(|| {
+        Regex::new(
+            r"^(?:[0-9]{8}_[0-9]{6}_[0-9a-fA-F]{6,32}|local-[0-9a-fA-F]{64}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})$",
+        )
+        .expect("literal Hermes identity pattern")
+    });
+    (id.len() <= 128 && ids.is_match(id)).then_some(())
 }
 
 fn valid_session_id(id: &str) -> Option<()> {

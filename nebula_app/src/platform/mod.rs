@@ -32,6 +32,7 @@ pub(crate) mod file_preview;
 pub mod fonts;
 #[cfg(target_os = "linux")]
 pub(crate) mod global_shortcut;
+pub(crate) mod hermes_session;
 #[cfg(all(windows, feature = "gpui-shell"))]
 pub(crate) mod keyboard;
 pub(crate) mod local_paths;
