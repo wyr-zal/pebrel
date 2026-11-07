@@ -230,11 +230,55 @@ fn wsl_hook_uses_authenticated_events_and_rejects_osc_forgery_and_shutdown(
         let wire = |event: &str, sequence: u64| format!("nebula-hook/1 source=claude process=20:200\n{{\"hook_event_name\":\"{event}\",\"session_id\":\"authenticated\",\"bridge_sequence\":{sequence}}}").into_bytes();
         view.process_event(TermEvent::AiHookEnvelope(wire("UserPromptSubmit", 999)), cx);
         assert!(!view.agent_activity.hook_seen(), "OSC cannot bypass host owner validation");
-        for (index, (event, status)) in [("SessionStart", AgentStatus::Idle), ("UserPromptSubmit", AgentStatus::Working), ("Stop", AgentStatus::Done)].into_iter().enumerate() {
-            view.process_event(SessionEvent::WslHook { generation: generation.clone(), envelope: wire(event, index as u64 + 1) }, cx);
-            assert!(view.agent_activity.hook_seen());
-            assert_eq!(view.agent_activity.status(), status);
-        }
+        let session_start_sequence = crate::ai_hook::next_receive_sequence();
+        view.process_event_with_sequence(
+            SessionEvent::WslHook {
+                generation: generation.clone(),
+                envelope: wire("SessionStart", 1),
+            },
+            Some(session_start_sequence),
+            cx,
+        );
+        assert!(view.agent_activity.hook_seen());
+        assert_eq!(view.agent_activity.status(), AgentStatus::Idle);
+
+        let queued_before_input = crate::ai_hook::next_receive_sequence();
+        view.agent_activity.input_sent();
+        view.process_event_with_sequence(
+            SessionEvent::WslHook {
+                generation: generation.clone(),
+                envelope: wire("UserPromptSubmit", 2),
+            },
+            Some(queued_before_input),
+            cx,
+        );
+        assert_eq!(
+            view.agent_activity.status(),
+            AgentStatus::Idle,
+            "a Hook queued before input cannot start the newly submitted turn"
+        );
+
+        let current_prompt_sequence = crate::ai_hook::next_receive_sequence();
+        view.process_event_with_sequence(
+            SessionEvent::WslHook {
+                generation: generation.clone(),
+                envelope: wire("UserPromptSubmit", 2),
+            },
+            Some(current_prompt_sequence),
+            cx,
+        );
+        assert_eq!(view.agent_activity.status(), AgentStatus::Working);
+
+        let stop_sequence = crate::ai_hook::next_receive_sequence();
+        view.process_event_with_sequence(
+            SessionEvent::WslHook {
+                generation: generation.clone(),
+                envelope: wire("Stop", 3),
+            },
+            Some(stop_sequence),
+            cx,
+        );
+        assert_eq!(view.agent_activity.status(), AgentStatus::Done);
         view.shutdown();
         view.process_event(SessionEvent::WslHook { generation, envelope: wire("UserPromptSubmit", 4) }, cx);
         assert_eq!(view.agent_activity.status(), AgentStatus::Done, "shutdown revokes queued events");

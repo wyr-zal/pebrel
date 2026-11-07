@@ -234,6 +234,95 @@ fn claude_turn_event(name: &str, prompt: &str, sequence: u64, trigger: &str) -> 
     parse_remote_envelope(wire.as_bytes(), Some(1)).expect("supported Claude lifecycle event")
 }
 
+fn claude_event_for_session(
+    name: &str,
+    session: &str,
+    prompt: Option<&str>,
+    bridge_sequence: u64,
+    received_sequence: u64,
+) -> AiHookEvent {
+    let mut payload = serde_json::json!({
+        "hook_event_name": name,
+        "session_id": session,
+        "bridge_sequence": bridge_sequence,
+    });
+    if let Some(prompt) = prompt {
+        payload["prompt_id"] = serde_json::json!(prompt);
+    }
+    let wire = format!("nebula-hook/1 source=claude process=4100:70\n{payload}");
+    let mut event =
+        parse_remote_envelope(wire.as_bytes(), Some(1)).expect("supported Claude lifecycle event");
+    event.received_sequence = received_sequence;
+    event
+}
+
+#[test]
+fn claude_hook_queued_before_input_is_rejected_by_the_ingress_fence() {
+    let mut activity = AgentActivity::default();
+    assert!(activity.apply_hook(&claude_event_for_session("SessionStart", "session", None, 1, 1,)));
+    assert!(activity.apply_hook(&claude_event_for_session(
+        "UserPromptSubmit",
+        "session",
+        Some("turn-a"),
+        2,
+        2,
+    )));
+
+    activity.input_sent_at(10);
+    let stale = claude_event_for_session("Stop", "session", Some("turn-a"), 3, 9);
+    assert!(!activity.accepts_hook(&stale));
+    let current = claude_event_for_session("Stop", "session", Some("turn-a"), 4, 10);
+    assert!(activity.accepts_hook(&current));
+}
+
+#[test]
+fn claude_prompt_ids_are_deduplicated_for_one_session_and_reset_for_a_new_one() {
+    let mut activity = AgentActivity::default();
+    assert!(activity.apply_hook(&claude_event_for_session(
+        "SessionStart",
+        "session-a",
+        None,
+        1,
+        1,
+    )));
+    assert!(activity.apply_hook(&claude_event_for_session(
+        "UserPromptSubmit",
+        "session-a",
+        Some("reused-prompt"),
+        2,
+        2,
+    )));
+    assert!(activity.apply_hook(&claude_event_for_session(
+        "UserPromptSubmit",
+        "session-a",
+        Some("second-prompt"),
+        3,
+        3,
+    )));
+    assert!(!activity.apply_hook(&claude_event_for_session(
+        "UserPromptSubmit",
+        "session-a",
+        Some("reused-prompt"),
+        4,
+        4,
+    )));
+
+    assert!(activity.apply_hook(&claude_event_for_session(
+        "SessionStart",
+        "session-b",
+        None,
+        5,
+        5,
+    )));
+    assert!(activity.apply_hook(&claude_event_for_session(
+        "UserPromptSubmit",
+        "session-b",
+        Some("reused-prompt"),
+        6,
+        6,
+    )));
+}
+
 fn runtime_prompt_hook(program: &str, name: &str, turn: &str, sequence: u64) -> AiHookEvent {
     match program {
         "codex" => codex_verified_turn_event(name, turn, sequence),

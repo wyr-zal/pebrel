@@ -3,6 +3,8 @@
 //! Hook events are facts; screen matches are observations with limited authority.
 //! Command ownership ends at the shell boundary, never because output goes quiet.
 
+use std::collections::HashSet;
+
 use crate::ai_agents::{
     AgentKind, AgentStatus, AgentStatusSource, AgentStatusUncertainty, Detection,
 };
@@ -83,6 +85,11 @@ pub(crate) struct AgentActivity {
     verified_foreground: bool,
     native_codex: bool,
     turn_id: Option<String>,
+    /// Retain every Claude prompt identity for the current native session so
+    /// a delayed Hook cannot become valid after later turns replace `turn_id`.
+    claude_prompt_ids: HashSet<String>,
+    /// Reject Claude events that entered a queue before the most recent input.
+    submit_receive_sequence: u64,
     last_remote_sequence: Option<u64>,
     compaction: Option<Compaction>,
     retired_compaction: Option<String>,
@@ -111,6 +118,8 @@ impl Default for AgentActivity {
             verified_foreground: false,
             native_codex: false,
             turn_id: None,
+            claude_prompt_ids: HashSet::new(),
+            submit_receive_sequence: 0,
             last_remote_sequence: None,
             compaction: None,
             retired_compaction: None,
@@ -329,6 +338,11 @@ impl AgentActivity {
     /// Physical Enter alone can also dismiss a menu. It only permits observing a
     /// new turn; it is not itself a successful submission or a completion.
     pub fn input_sent(&mut self) {
+        self.input_sent_at(super::current_receive_sequence());
+    }
+
+    fn input_sent_at(&mut self, received_sequence: u64) {
+        self.submit_receive_sequence = received_sequence;
         self.codex_input_pending |= self.native_codex && self.turn_id.is_some();
         self.cancel_requested = false;
         self.screen_armed = true;
@@ -339,6 +353,11 @@ impl AgentActivity {
     /// Check ownership before the ordering gate records this event. An ignored
     /// legacy notification must not reopen the gate's already completed stream.
     pub fn accepts_hook(&self, event: &AiHookEvent) -> bool {
+        // Claude has no provider sequence. This ingress fence keeps raw Hooks
+        // queued before a new input from being reinterpreted after that input.
+        if event.source == "claude" && event.received_sequence < self.submit_receive_sequence {
+            return false;
+        }
         if self.command_ended
             && self.coverage == HookCoverage::None
             && (event.kind != AiHookKind::SessionStart || event.session_compacted)
@@ -354,6 +373,15 @@ impl AgentActivity {
         // Once this session proves its native bridge is active, notify cannot
         // downgrade its coverage or emit a second completion notification.
         if self.native_codex && event.source == "codex" && event.codex_hooks.is_none() {
+            return false;
+        }
+        if event.source == "claude"
+            && event.kind == AiHookKind::PromptSubmit
+            && event
+                .turn_id
+                .as_deref()
+                .is_some_and(|turn_id| self.claude_prompt_ids.contains(turn_id))
+        {
             return false;
         }
         // Codex reports a session/group ID for internal work, but its concrete
@@ -643,6 +671,21 @@ impl AgentActivity {
         if new_codex_turn || new_codex_session {
             self.codex_input_pending = false;
             self.retired_codex_idle = None;
+        }
+        if event.source == "claude"
+            && event.kind == AiHookKind::SessionStart
+            && !event.session_compacted
+            && event.session_id.as_ref().is_some_and(|session_id| {
+                self.owner.as_ref().and_then(|owner| owner.session.as_ref()) != Some(session_id)
+            })
+        {
+            self.claude_prompt_ids.clear();
+        }
+        if event.source == "claude"
+            && event.kind == AiHookKind::PromptSubmit
+            && let Some(turn_id) = event.turn_id.as_ref()
+        {
+            self.claude_prompt_ids.insert(turn_id.clone());
         }
         self.record_owner(event);
         if matches!(

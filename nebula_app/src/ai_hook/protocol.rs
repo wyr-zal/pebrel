@@ -14,12 +14,24 @@ const ID_MAX_CHARS: usize = 512;
 const TURN_RESULT_MAX_CHARS: usize = 4_000;
 static RECEIVE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+pub(crate) fn current_receive_sequence() -> u64 {
+    RECEIVE_SEQUENCE.load(Ordering::SeqCst)
+}
+
+/// Stamp an event at ingress, before an application queue can delay parsing.
+pub(crate) fn next_receive_sequence() -> u64 {
+    RECEIVE_SEQUENCE.fetch_add(1, Ordering::SeqCst)
+}
+
 /// Parse one pipe message: a `nebula-hook/1 source=<s> pane=<n>` header line,
 /// then the hook's raw JSON payload verbatim (the helper never re-encodes;
 /// all JSON work happens here, off the turn's hot path).
 pub(super) fn parse_envelope(bytes: &[u8]) -> Option<AiHookEvent> {
+    parse_envelope_with_sequence(bytes, next_receive_sequence())
+}
+
+fn parse_envelope_with_sequence(bytes: &[u8], received_sequence: u64) -> Option<AiHookEvent> {
     let received_at_ms = unix_time_ms();
-    let received_sequence = RECEIVE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let nl = bytes.iter().position(|&b| b == b'\n')?;
     let header = std::str::from_utf8(&bytes[..nl]).ok()?.trim();
     let raw = &bytes[nl + 1..];
@@ -376,7 +388,15 @@ fn unix_time_ms() -> u64 {
 /// 远端会话只能提交事件语义，Pane 身份始终由本地 PTY 通道覆盖，
 /// 防止远端载荷把通知路由到同一窗口中的其他标签页。
 pub(crate) fn parse_remote_envelope(bytes: &[u8], pane: Option<u64>) -> Option<AiHookEvent> {
-    let mut event = parse_envelope(bytes)?;
+    parse_remote_envelope_with_sequence(bytes, pane, next_receive_sequence())
+}
+
+pub(crate) fn parse_remote_envelope_with_sequence(
+    bytes: &[u8],
+    pane: Option<u64>,
+    received_sequence: u64,
+) -> Option<AiHookEvent> {
+    let mut event = parse_envelope_with_sequence(bytes, received_sequence)?;
     // Only this entrypoint is reached after SSH/WSL token verification. Ignore
     // claimed process metadata on the local named-pipe path.
     let header = std::str::from_utf8(bytes.split(|byte| *byte == b'\n').next()?).ok()?;

@@ -28,7 +28,10 @@ pub use event::{
 pub use ordering::GateVerdict;
 pub(crate) use ordering::{accept_for_pane, reorder_batch};
 use protocol::parse_envelope;
-pub(crate) use protocol::parse_remote_envelope;
+pub(crate) use protocol::{
+    current_receive_sequence, next_receive_sequence, parse_remote_envelope,
+    parse_remote_envelope_with_sequence,
+};
 
 #[cfg(test)]
 mod native_tests;

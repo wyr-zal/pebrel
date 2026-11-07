@@ -2,7 +2,10 @@
 use super::ordering::AiHookEventGate;
 use super::payload::RAW_CONTEXT_MAX_BYTES;
 
-use super::{AiHookKind, GateVerdict, capabilities_for, parse_remote_envelope, reorder_batch};
+use super::{
+    AiHookKind, GateVerdict, capabilities_for, parse_remote_envelope,
+    parse_remote_envelope_with_sequence, reorder_batch,
+};
 
 #[test]
 fn remote_envelope_uses_local_pane_identity() {
@@ -18,6 +21,14 @@ fn claude_events_carry_their_session_id_for_cold_resume() {
     let raw = b"nebula-hook/1 source=claude pane=3\n{\"session_id\":\"0199a213-c2a4-7cf5-8f6b-d746fbb6e86c\",\"hook_event_name\":\"Stop\"}";
     let event = parse_remote_envelope(raw, Some(3)).unwrap();
     assert_eq!(event.session_id.as_deref(), Some("0199a213-c2a4-7cf5-8f6b-d746fbb6e86c"));
+}
+
+#[test]
+fn remote_hook_keeps_its_ingress_sequence_when_parsed_after_a_queue() {
+    let raw =
+        b"nebula-hook/1 source=claude\n{\"hook_event_name\":\"Stop\",\"session_id\":\"session\"}";
+    let event = parse_remote_envelope_with_sequence(raw, Some(7), 42).unwrap();
+    assert_eq!(event.received_sequence, 42);
 }
 
 /// 串台门的第二层。第一层（`nebula_hook::foreign_hook_runner`）是环境变量

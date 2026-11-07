@@ -17,6 +17,12 @@ pub(super) enum SessionEvent {
     },
 }
 
+/// Preserve Hook ingress order while UI work is deferred behind this queue.
+pub(super) struct QueuedEvent {
+    pub(super) event: SessionEvent,
+    pub(super) received_sequence: Option<u64>,
+}
+
 impl From<Event> for SessionEvent {
     fn from(event: Event) -> Self {
         Self::Terminal(event)
@@ -25,7 +31,7 @@ impl From<Event> for SessionEvent {
 
 #[derive(Clone)]
 pub(super) struct EventSender {
-    sender: mpsc::UnboundedSender<SessionEvent>,
+    sender: mpsc::UnboundedSender<QueuedEvent>,
     wake_pending: Arc<AtomicBool>,
     pub(super) native_prompt: NativePromptState,
 }
@@ -42,7 +48,7 @@ pub(super) struct NativePrompt {
 }
 
 pub(super) struct EventReceiver {
-    receiver: mpsc::UnboundedReceiver<SessionEvent>,
+    receiver: mpsc::UnboundedReceiver<QueuedEvent>,
     wake_pending: Arc<AtomicBool>,
 }
 
@@ -133,10 +139,17 @@ impl NativePromptState {
 impl EventSender {
     #[cfg(windows)]
     pub(super) fn send_wsl_hook(&self, generation: String, envelope: Vec<u8>) -> bool {
-        self.sender.unbounded_send(SessionEvent::WslHook { generation, envelope }).is_ok()
+        self.sender
+            .unbounded_send(QueuedEvent {
+                event: SessionEvent::WslHook { generation, envelope },
+                received_sequence: Some(crate::ai_hook::next_receive_sequence()),
+            })
+            .is_ok()
     }
 
     pub(super) fn send(&self, event: Event) {
+        let received_sequence =
+            matches!(&event, Event::AiHookEnvelope(_)).then(crate::ai_hook::next_receive_sequence);
         if matches!(&event, Event::UserVar { name, value }
             if name == "pebrel_cmd_prompt" && value == "1")
         {
@@ -146,15 +159,20 @@ impl EventSender {
         if wake && self.wake_pending.swap(true, Ordering::AcqRel) {
             return;
         }
-        if self.sender.unbounded_send(event.into()).is_err() && wake {
+        if self
+            .sender
+            .unbounded_send(QueuedEvent { event: event.into(), received_sequence })
+            .is_err()
+            && wake
+        {
             self.wake_pending.store(false, Ordering::Release);
         }
     }
 }
 
 impl EventReceiver {
-    fn acknowledge(&self, event: &SessionEvent) {
-        if matches!(event, SessionEvent::Terminal(Event::Wakeup)) {
+    fn acknowledge(&self, queued: &QueuedEvent) {
+        if matches!(&queued.event, SessionEvent::Terminal(Event::Wakeup)) {
             // Clear before processing: output arriving during UI work must
             // still enqueue a subsequent repaint, even on an inactive tab.
             self.wake_pending.store(false, Ordering::Release);
@@ -162,18 +180,22 @@ impl EventReceiver {
     }
 
     pub(super) fn try_recv(&mut self) -> Result<SessionEvent, mpsc::TryRecvError> {
-        let event = self.receiver.try_recv()?;
-        self.acknowledge(&event);
-        Ok(event)
+        Ok(self.try_recv_queued()?.event)
+    }
+
+    pub(super) fn try_recv_queued(&mut self) -> Result<QueuedEvent, mpsc::TryRecvError> {
+        let queued = self.receiver.try_recv()?;
+        self.acknowledge(&queued);
+        Ok(queued)
     }
 }
 
 impl Stream for EventReceiver {
-    type Item = SessionEvent;
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<SessionEvent>> {
+    type Item = QueuedEvent;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<QueuedEvent>> {
         let result = Pin::new(&mut self.receiver).poll_next(cx);
-        if let Poll::Ready(Some(event)) = &result {
-            self.acknowledge(event);
+        if let Poll::Ready(Some(queued)) = &result {
+            self.acknowledge(queued);
         }
         result
     }
@@ -188,11 +210,25 @@ mod tests {
     fn wsl_hook_queue_reports_whether_authenticated_input_was_enqueued() {
         let (sender, mut receiver) = channel();
         assert!(sender.send_wsl_hook("active".into(), b"envelope".to_vec()));
+        let queued = receiver.try_recv_queued().unwrap();
+        assert!(queued.received_sequence.is_some());
         assert!(
-            matches!(receiver.try_recv().unwrap(), SessionEvent::WslHook { generation, .. } if generation == "active")
+            matches!(queued.event, SessionEvent::WslHook { generation, .. } if generation == "active")
         );
         drop(receiver);
         assert!(!sender.send_wsl_hook("active".into(), b"late".to_vec()));
+    }
+
+    #[test]
+    fn terminal_hook_gets_an_ingress_sequence_before_queue_delivery() {
+        let (sender, mut receiver) = channel();
+        sender.send(Event::AiHookEnvelope(b"hook".to_vec()));
+        let queued = receiver.try_recv_queued().unwrap();
+        assert!(queued.received_sequence.is_some());
+        assert!(matches!(
+            queued.event,
+            SessionEvent::Terminal(Event::AiHookEnvelope(ref bytes)) if bytes == b"hook"
+        ));
     }
 
     fn terminal(receiver: &mut EventReceiver) -> Event {

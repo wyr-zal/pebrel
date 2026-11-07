@@ -593,17 +593,34 @@ impl TerminalView {
         event: impl Into<super::event_mailbox::SessionEvent>,
         cx: &mut Context<Self>,
     ) {
+        self.process_event_with_sequence(event, None, cx);
+    }
+
+    pub(super) fn process_event_with_sequence(
+        &mut self,
+        event: impl Into<super::event_mailbox::SessionEvent>,
+        received_sequence: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
         let event = match event.into() {
             super::event_mailbox::SessionEvent::Terminal(event) => event,
             #[cfg(windows)]
             super::event_mailbox::SessionEvent::WslHook { generation, envelope } => {
-                if self
+                let accepted = self
                     .session
                     .as_ref()
                     .and_then(|session| session.wsl_hook.as_ref())
-                    .is_some_and(|channel| channel.accepts(&generation))
-                    && let Some(hook) = crate::ai_hook::parse_remote_envelope(&envelope, None)
-                {
+                    .is_some_and(|channel| channel.accepts(&generation));
+                if !accepted {
+                    return;
+                }
+                let hook = match received_sequence {
+                    Some(sequence) => crate::ai_hook::parse_remote_envelope_with_sequence(
+                        &envelope, None, sequence,
+                    ),
+                    None => crate::ai_hook::parse_remote_envelope(&envelope, None),
+                };
+                if let Some(hook) = hook {
                     if self.handle_ai_hook(&hook, cx)
                         && let Some(session) = &mut self.session
                     {
@@ -782,7 +799,13 @@ impl TerminalView {
                 // ——比 OSC 133 的命令行嗅探准，后者漏掉包装启动和没有 shell
                 // 集成的会话。少了这一条，远端 agent 的侧栏图标和会话身份
                 // （fork/恢复要用）全都缺席。
-                if let Some(hook) = crate::ai_hook::parse_remote_envelope(&envelope, None) {
+                let hook = match received_sequence {
+                    Some(sequence) => crate::ai_hook::parse_remote_envelope_with_sequence(
+                        &envelope, None, sequence,
+                    ),
+                    None => crate::ai_hook::parse_remote_envelope(&envelope, None),
+                };
+                if let Some(hook) = hook {
                     self.handle_ai_hook(&hook, cx);
                 }
             },
