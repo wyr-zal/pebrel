@@ -1,0 +1,18 @@
+{
+  "name": "Pebrel Mobile",
+  "short_name": "Pebrel",
+  "description": "从手机操作电脑上的 Claude Code 和 Codex 会话",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0c0e12",
+  "theme_color": "#0f1115",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

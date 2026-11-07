@@ -171,6 +171,7 @@ pub fn run_shell(
     }
     if runtime_server.is_some() {
         crate::mobile_connection::resume_saved();
+        crate::mobile_web::resume_saved();
     }
     let _runtime_server = runtime_server;
     let _acrylic = crate::platform::acrylic::RunGuard::default();
@@ -202,6 +203,7 @@ pub fn run_shell(
             shell_id,
         );
     });
+    crate::mobile_web::shutdown();
     crate::tray::shutdown();
     crate::ai_hook::shutdown();
 }

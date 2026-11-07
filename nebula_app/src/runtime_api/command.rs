@@ -259,7 +259,8 @@ impl RuntimeCommand {
     pub(super) fn from_request(request: &ApiRequest) -> Result<Self, ApiError> {
         match request.method.as_str() {
             "runtime.snapshot" => Ok(Self::Snapshot),
-            "conversation.read"
+            "conversation.status"
+            | "conversation.read"
             | "conversation.send"
             | "conversation.choose"
             | "conversation.key" => super::conversation::parse(request),

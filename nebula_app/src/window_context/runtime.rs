@@ -83,6 +83,7 @@ impl WindowContext {
                         active: pane.id == tab.active_pane,
                         title: pane.title.clone(),
                         cwd: pane.nebula_state.cwd.clone(),
+                        execution: None,
                         branch: pane.nebula_state.branch.clone(),
                         ssh_destination: pane.ssh_destination.clone(),
                         running_program: pane.nebula_state.running_program.clone(),

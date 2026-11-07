@@ -227,6 +227,7 @@ pub(super) fn runtime_description() -> Value {
                 "tab.focus",
                 "tab.open",
                 "tab.read",
+                "conversation.status",
                 "conversation.read",
                 "conversation.send",
                 "conversation.choose",

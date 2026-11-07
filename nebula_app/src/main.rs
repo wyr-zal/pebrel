@@ -87,6 +87,8 @@ mod math;
 mod message_bar;
 mod migrate;
 mod mobile_connection;
+#[cfg(feature = "gpui-shell")]
+mod mobile_web;
 mod motion;
 mod mux;
 mod nebula_history;

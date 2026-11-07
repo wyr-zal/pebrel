@@ -97,9 +97,25 @@ impl TerminalView {
                 })?;
             Location::Ssh(reader)
         } else {
-            Location::Local(self.exec_context.clone().ok_or_else(|| {
+            let context = self.exec_context.clone().ok_or_else(|| {
                 ApiError::new("conversation_unavailable", "the pane environment is unavailable")
-            })?)
+            })?;
+            #[cfg(windows)]
+            let context = if let Some(location) = self.wsl_cwd_observer.observed() {
+                let scope = self.wsl_cwd_observer.identity_scope().ok_or_else(|| {
+                    ApiError::new("conversation_unavailable", "WSL owner is unavailable")
+                })?;
+                context.for_observed_wsl(
+                    &location.distro,
+                    location.user.as_deref(),
+                    &scope.command_id,
+                )
+            } else if self.wsl_identity_override.is_some() {
+                return Err(ApiError::new("conversation_unavailable", "WSL location is pending"));
+            } else {
+                context
+            };
+            Location::Local(context)
         };
         Ok(Source { identity, path, location, cwd: self.cwd.clone() })
     }
@@ -115,8 +131,16 @@ impl TerminalView {
     ) -> Result<Value, ApiError> {
         let identity = self.runtime_conversation_check(expected)?;
         let prompt = self.conversation_prompt().map(|(_, prompt)| prompt);
+        let can_send = prompt.is_none()
+            && self.session.is_some()
+            && self.term_mode().contains(nebula_terminal::term::TermMode::BRACKETED_PASTE)
+            && self.pending_runtime_submit.is_none()
+            && matches!(
+                self.runtime_task_state(),
+                RuntimeTaskState::Idle | RuntimeTaskState::Finished
+            );
         Ok(json!({"identity": identity, "state": self.runtime_task_state(), "prompt": prompt,
-            "can_send": self.pending_runtime_submit.is_none() && matches!(self.runtime_task_state(), RuntimeTaskState::Idle | RuntimeTaskState::Finished)}))
+            "can_send": can_send}))
     }
 
     pub(crate) fn runtime_conversation_apply(
@@ -125,6 +149,9 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) -> Result<Value, ApiError> {
         let identity = self.runtime_conversation_check(request.identity())?;
+        if matches!(request, Request::Status { .. }) {
+            return self.runtime_conversation_status(&identity);
+        }
         if self.pending_runtime_submit.is_some() {
             return Err(ApiError::new(
                 "input_in_progress",
@@ -132,11 +159,14 @@ impl TerminalView {
             ));
         }
         match request {
+            Request::Status { .. } => unreachable!("read-only status returned above"),
             Request::Send { text, .. } => {
-                if !matches!(
-                    self.runtime_task_state(),
-                    RuntimeTaskState::Idle | RuntimeTaskState::Finished
-                ) {
+                if self.conversation_prompt().is_some()
+                    || !matches!(
+                        self.runtime_task_state(),
+                        RuntimeTaskState::Idle | RuntimeTaskState::Finished
+                    )
+                {
                     return Err(ApiError::new(
                         "agent_busy",
                         "the Agent is working or awaiting a terminal interaction",
@@ -180,6 +210,44 @@ impl TerminalView {
 mod tests {
     use super::*;
     use nebula_terminal::term::TermMode;
+
+    #[cfg(feature = "gpui-test-support")]
+    #[gpui::test]
+    fn conversation_status_uses_live_identity_without_a_transcript(cx: &mut gpui::TestAppContext) {
+        let (view, window, _) = super::super::startup_tests::open(cx);
+        view.update(window, |view, cx| {
+            view.running_program = Some("codex".into());
+            view.command_running_disproved = false;
+            view.command_running = false;
+            view.ai_session = Some(crate::display::AiSessionIdentity {
+                source: "codex".into(),
+                session_id: "new-session".into(),
+            });
+            view.ai_session_probe_epoch = 17;
+            view.recovery.target = None;
+            let identity =
+                Identity { kind: "codex".into(), session_id: "new-session".into(), epoch: None };
+            assert!(view.runtime_conversation_source(&identity).is_err());
+            let state = view
+                .runtime_conversation_apply(&Request::Status { identity: identity.clone() }, cx)
+                .unwrap();
+            assert_eq!(state["identity"]["epoch"], 17);
+            assert_eq!(state["can_send"], false, "wait for native safe input mode");
+            assert!(state.get("messages").is_none());
+            super::super::startup_tests::feed(view, b"\x1b[?2004h");
+            let ready = view
+                .runtime_conversation_apply(&Request::Status { identity: identity.clone() }, cx)
+                .unwrap();
+            assert_eq!(ready["can_send"], true);
+            let stale = Identity { epoch: Some(16), ..identity };
+            assert_eq!(
+                view.runtime_conversation_apply(&Request::Status { identity: stale }, cx)
+                    .unwrap_err()
+                    .code,
+                "conversation_identity_changed"
+            );
+        });
+    }
 
     #[test]
     fn conversation_projection_keeps_native_question_identity_and_single_key_semantics() {

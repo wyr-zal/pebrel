@@ -470,6 +470,8 @@ pub struct RuntimePane {
     pub active: bool,
     pub title: String,
     pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<RuntimePaneExecution>,
     pub branch: String,
     pub ssh_destination: Option<String>,
     pub running_program: Option<String>,
@@ -490,6 +492,14 @@ pub struct RuntimePane {
     pub active_run: Option<RuntimePaneRun>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_run: Option<RuntimeRunOutcome>,
+}
+
+/// The observed execution location is separate from the host shell's cwd.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RuntimePaneExecution {
+    Host,
+    Wsl { distribution: Option<String>, cwd: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -877,6 +887,7 @@ pub enum RuntimeCommand {
         name: String,
         kind: crate::ai_agents::AgentKind,
         cwd: Option<PathBuf>,
+        shell_id: Option<String>,
         session_id: Option<String>,
         command: String,
         worktree: Option<crate::git_worktree::WorktreeProvenance>,

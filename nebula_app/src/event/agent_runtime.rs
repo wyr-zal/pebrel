@@ -41,6 +41,7 @@ impl Processor {
                 name,
                 kind,
                 cwd,
+                shell_id: _,
                 session_id,
                 command,
                 worktree,

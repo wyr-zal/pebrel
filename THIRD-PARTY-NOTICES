@@ -21,6 +21,18 @@ The embedded Latin Modern Math font is distributed under the GUST Font
 License 1.0. Its complete license text is included as
 licenses/LICENSE-LATIN-MODERN-MATH.
 
+The browser remote Companion protocol in nebula_app/src/mobile_web adapts
+the dsh-e2ee-v1 protocol from april-jk/dsh-mobile-plugin (revision
+fafd12c4866de6d14d84e6c6386293ce8c5390ca) and interoperates with
+april-jk/dsh-relay 0.1.8 (revision
+709af7262b0ebf80821c99a73f7a9c9fc03819e6).
+Copyright (c) 2026 dsh-mobile contributors. MIT License (full text below).
+The Relay, login UI, Service Worker and browser cryptography remain in
+the separately deployed DSH Mobile Suite, with their original notices.
+Pebrel's maintained patch adds database migration, tunnel and cold-worker
+recovery, desktop-confirmed one-time enrollment, and a 130-second Relay
+handshake timeout. The original crypto.js is unchanged.
+
 The SSH Bash login-startup replay in nebula_app/res/shell/bashrc adapts
 the source-observation startup logic by l0ng-ai (revision 4da3868,
 shell_integration.rs).

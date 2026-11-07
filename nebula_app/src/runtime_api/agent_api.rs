@@ -21,6 +21,8 @@ struct AgentStartParams {
     #[serde(default)]
     cwd: Option<PathBuf>,
     #[serde(default)]
+    shell_id: Option<String>,
+    #[serde(default)]
     resume_session_id: Option<String>,
 }
 
@@ -113,9 +115,9 @@ pub(super) fn command_from_request(request: &ApiRequest) -> Result<RuntimeComman
         "agent.start" => {
             let params: AgentStartParams = parse_params(&request.params)?;
             validate_agent_name(&params.name)?;
-            if params.pane_id.is_some() && params.cwd.is_some() {
+            if params.pane_id.is_some() && (params.cwd.is_some() || params.shell_id.is_some()) {
                 return Err(ApiError::invalid_params(
-                    "agent.start cannot combine pane_id with cwd; an existing pane keeps its shell cwd",
+                    "agent.start cannot combine pane_id with cwd or shell_id; an existing pane keeps its shell and cwd",
                 ));
             }
             let (kind, session_id, command) =
@@ -126,6 +128,7 @@ pub(super) fn command_from_request(request: &ApiRequest) -> Result<RuntimeComman
                 name: params.name,
                 kind,
                 cwd: params.cwd,
+                shell_id: params.shell_id,
                 session_id,
                 command,
                 worktree: None,
@@ -299,6 +302,7 @@ pub(super) fn prepare_dispatch_command(
             name,
             kind,
             cwd: Some(cwd),
+            shell_id: None,
             session_id,
             command,
             worktree: Some(provenance),

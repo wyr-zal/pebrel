@@ -23,6 +23,7 @@ impl Identity {
 
 #[derive(Clone, Debug)]
 pub enum Request {
+    Status { identity: Identity },
     Read { identity: Identity, before: Option<u64>, revision: Option<String> },
     Send { identity: Identity, text: String },
     Choose { identity: Identity, prompt_id: String, option: usize },
@@ -32,7 +33,8 @@ pub enum Request {
 impl Request {
     pub fn identity(&self) -> &Identity {
         match self {
-            Self::Read { identity, .. }
+            Self::Status { identity }
+            | Self::Read { identity, .. }
             | Self::Send { identity, .. }
             | Self::Choose { identity, .. }
             | Self::Key { identity, .. } => identity,
@@ -71,6 +73,9 @@ pub(super) fn parse(request: &ApiRequest) -> Result<RuntimeCommand, ApiError> {
     let read_only =
         p.text.is_none() && p.prompt_id.is_none() && p.option.is_none() && p.key.is_none();
     let request = match request.method.as_str() {
+        "conversation.status" if read_only && p.before.is_none() && p.revision.is_none() => {
+            Request::Status { identity: p.identity }
+        },
         "conversation.read" if read_only => {
             Request::Read { identity: p.identity, before: p.before, revision: p.revision }
         },

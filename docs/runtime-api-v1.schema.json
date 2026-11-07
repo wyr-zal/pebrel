@@ -100,6 +100,7 @@
             "tab.focus",
             "tab.open",
             "tab.read",
+            "conversation.status",
             "conversation.read",
             "conversation.send",
             "conversation.choose",
@@ -731,6 +732,22 @@
             "properties": {
               "params": {
                 "$ref": "#/$defs/tab_read_params"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "conversation.status"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/conversation_status_params"
               }
             }
           }
@@ -3040,6 +3057,16 @@
           ],
           "minimum": 0
         }
+      },
+      "additionalProperties": false
+    },
+    "conversation_status_params": {
+      "type": "object",
+      "required": ["window_id", "pane_id", "identity"],
+      "properties": {
+        "window_id": { "type": "integer", "minimum": 1 },
+        "pane_id": { "type": "integer", "minimum": 1 },
+        "identity": { "$ref": "#/$defs/conversation_identity" }
       },
       "additionalProperties": false
     },

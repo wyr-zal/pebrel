@@ -905,6 +905,7 @@ mod tests {
                         active: true,
                         title: "shell".into(),
                         cwd: "D:/work".into(),
+                        execution: None,
                         branch: "main".into(),
                         ssh_destination: None,
                         running_program: None,

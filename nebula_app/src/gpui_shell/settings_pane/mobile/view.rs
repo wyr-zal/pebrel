@@ -55,7 +55,10 @@ impl PortFocus {
     }
 }
 
-pub(super) fn description(text: impl Into<SharedString>, cx: &App) -> gpui::Div {
+pub(in crate::gpui_shell::settings_pane::mobile) fn description(
+    text: impl Into<SharedString>,
+    cx: &App,
+) -> gpui::Div {
     div()
         .text_size(px(13.0))
         .line_height(px(21.0))
@@ -63,7 +66,10 @@ pub(super) fn description(text: impl Into<SharedString>, cx: &App) -> gpui::Div 
         .child(text.into())
 }
 
-pub(super) fn group_heading(text: impl Into<SharedString>, cx: &App) -> gpui::Div {
+pub(in crate::gpui_shell::settings_pane::mobile) fn group_heading(
+    text: impl Into<SharedString>,
+    cx: &App,
+) -> gpui::Div {
     super::super::design::group_heading(text, 14.0, cx)
 }
 
@@ -166,6 +172,7 @@ impl SettingsPane {
                     .child(language.text(failure_message(failure))),
             );
         }
+        page = page.child(self.browser_remote(window, cx));
         page = match phase {
             Phase::Off => page.child(self.mobile_off(cx)),
             Phase::Pairing => page.child(self.mobile_pairing(narrow, cx)),

@@ -10,6 +10,18 @@ fn conversation_mutations_require_current_identity_and_read_cannot_smuggle_input
         ApiRequest::new("token".into(), method, params)
     };
     assert!(RuntimeCommand::from_request(&request("conversation.read", json!({}))).is_ok());
+    assert!(matches!(
+        RuntimeCommand::from_request(&request("conversation.status", json!({}))),
+        Ok(RuntimeCommand::Conversation { request: conversation::Request::Status { .. }, .. })
+    ));
+    for extra in [
+        json!({"text":"bad"}),
+        json!({"key":"Esc"}),
+        json!({"before":1}),
+        json!({"revision":"old"}),
+    ] {
+        assert!(RuntimeCommand::from_request(&request("conversation.status", extra)).is_err());
+    }
     assert!(
         RuntimeCommand::from_request(&request("conversation.read", json!({"text":"echo bad"})))
             .is_err()
@@ -105,6 +117,7 @@ fn snapshot(state: RuntimeTaskState) -> RuntimeSnapshot {
                     active: true,
                     title: "shell".into(),
                     cwd: "D:/work".into(),
+                    execution: None,
                     branch: "main".into(),
                     ssh_destination: None,
                     running_program: None,
@@ -152,6 +165,7 @@ fn delegation_snapshot(
         active,
         title: title.into(),
         cwd: "D:/work".into(),
+        execution: None,
         branch: "main".into(),
         ssh_destination: None,
         running_program: agent.as_ref().map(|agent: &RuntimeAgent| agent.kind.clone()),
@@ -438,6 +452,19 @@ fn agent_start_exposes_only_verified_launch_contracts() {
             ..
         }) if command == "codex"
     ));
+
+    let scoped = ApiRequest::new(
+        "token".into(),
+        "agent.start",
+        json!({ "name": "mobile-task", "kind": "codex", "shell_id": "wsl:Ubuntu" }),
+    );
+    assert!(matches!(
+        RuntimeCommand::from_request(&scoped),
+        Ok(RuntimeCommand::AgentStart { shell_id: Some(ref id), .. }) if id == "wsl:Ubuntu"
+    ));
+    let mut existing_pane = scoped;
+    existing_pane.params["pane_id"] = json!(3);
+    assert_eq!(RuntimeCommand::from_request(&existing_pane).unwrap_err().code, "invalid_params");
 
     let unsupported = ApiRequest::new(
         "token".into(),

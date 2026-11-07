@@ -664,6 +664,7 @@ impl NebulaWorkspace {
                 name,
                 kind,
                 cwd,
+                shell_id,
                 session_id,
                 command,
                 worktree,
@@ -681,7 +682,15 @@ impl NebulaWorkspace {
                         }
                         *pane_id
                     },
-                    None => self.add_terminal_at(cwd.clone(), None, window, cx),
+                    None => match shell_id {
+                        Some(shell_id) => {
+                            let launch =
+                                super::shell_launch::resolve_shell_at(shell_id, cwd.as_deref())
+                                    .map_err(|error| ApiError::new("invalid_shell", error))?;
+                            self.add_terminal_with(launch, cwd.clone(), None, window, cx)
+                        },
+                        None => self.add_terminal_at(cwd.clone(), None, window, cx),
+                    },
                 };
                 let agent = match self.runtime_hub.register_agent(
                     name.clone(),
@@ -721,18 +730,27 @@ impl NebulaWorkspace {
                         .clone(),
                     _ => unreachable!("tab_of_pane only resolves terminal tabs"),
                 };
-                if let Err(error) =
-                    view.update(cx, |view, cx| view.runtime_prompt(command.clone(), true, cx))
-                {
-                    self.runtime_hub.close_agent(&agent.agent_id, "launch_failed");
+                let launch_result = view.update(cx, |view, cx| {
                     if created_tab {
-                        self.discard_runtime_agent_tab(pane_id, window, cx);
+                        view.runtime_run(command.clone(), cx).map(Some)
+                    } else {
+                        view.runtime_prompt(command.clone(), true, cx).map(|()| None)
                     }
-                    return Err(error);
-                }
+                });
+                let run_id = match launch_result {
+                    Ok(run_id) => run_id,
+                    Err(error) => {
+                        self.runtime_hub.close_agent(&agent.agent_id, "launch_failed");
+                        if created_tab {
+                            self.discard_runtime_agent_tab(pane_id, window, cx);
+                        }
+                        return Err(error);
+                    },
+                };
                 self.runtime_result(
                     json!({
                         "agent": agent,
+                        "run_id": run_id,
                         "window_id": self.runtime_window_id,
                         "pane_id": pane_id
                     }),
@@ -871,6 +889,7 @@ impl NebulaWorkspace {
                                     active: pane.id == *focused,
                                     title: view.title.clone(),
                                     cwd: view.cwd.clone(),
+                                    execution: view.runtime_execution(),
                                     branch: view.branch.clone(),
                                     ssh_destination: view.ssh_destination.clone(),
                                     running_program: view.running_program.clone(),

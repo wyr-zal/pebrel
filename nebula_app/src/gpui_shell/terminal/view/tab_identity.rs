@@ -43,6 +43,28 @@ impl TerminalView {
         None
     }
 
+    pub(crate) fn runtime_execution(&self) -> Option<crate::runtime_api::RuntimePaneExecution> {
+        use crate::runtime_api::RuntimePaneExecution;
+        if let Some((distro, cwd)) = self.observed_wsl_cwd() {
+            return Some(RuntimePaneExecution::Wsl {
+                distribution: Some(distro.to_owned()),
+                cwd: cwd.to_owned(),
+            });
+        }
+        #[cfg(windows)]
+        if self.wsl_identity_override.is_some() {
+            return None;
+        }
+        let context = self.exec_context.as_ref()?;
+        Some(match context.wsl_distribution() {
+            Some(distro) => RuntimePaneExecution::Wsl {
+                distribution: distro.map(str::to_owned),
+                cwd: self.cwd.clone(),
+            },
+            None => RuntimePaneExecution::Host,
+        })
+    }
+
     #[cfg(all(test, windows, feature = "gpui-test-support"))]
     pub(crate) fn set_observed_wsl_location_for_test(
         &mut self,

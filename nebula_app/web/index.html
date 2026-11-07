@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#0f1115">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'">
+  <title>Pebrel Mobile</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img src="/icon.svg" width="34" height="34" alt="">
+      <div>
+        <strong>Pebrel</strong>
+        <span id="computer-name">正在连接电脑</span>
+      </div>
+    </div>
+    <div id="connection-state" class="connection" role="status" aria-live="polite">
+      <span class="dot"></span>
+      <span>连接中</span>
+    </div>
+  </header>
+
+  <main>
+    <section id="offline-card" class="card offline hidden" role="alert">
+      <div>
+        <h2>电脑暂时不可达</h2>
+        <p>任务仍在电脑上运行。恢复连接后会校准状态，不会自动重放未确认的操作。</p>
+      </div>
+      <button id="reconnect" class="secondary" type="button">重新连接</button>
+    </section>
+
+    <section id="empty-state" class="hero card">
+      <img src="/icon.svg" width="58" height="58" alt="">
+      <h1>从手机启动下一项任务</h1>
+      <p>选择一个电脑端已授权的项目，再交给 Claude Code 或 Codex。</p>
+      <button id="focus-new" class="primary" type="button">新建会话</button>
+    </section>
+
+    <button id="new-toggle" class="secondary" type="button" aria-controls="composer-card" aria-expanded="true">新建会话</button>
+    <section id="composer-card" class="card">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">新任务</p>
+          <h2>在电脑上启动会话</h2>
+        </div>
+        <button id="collapse-new" class="icon" type="button" aria-label="收起新建会话">−</button>
+      </div>
+      <form id="new-session-form">
+        <label>
+          <span>项目</span>
+          <select id="project-select" required></select>
+        </label>
+        <fieldset>
+          <legend>Agent</legend>
+          <div class="segmented">
+            <label><input type="radio" name="agent-kind" value="codex" checked><span>Codex</span></label>
+            <label><input type="radio" name="agent-kind" value="claude"><span>Claude Code</span></label>
+          </div>
+        </fieldset>
+        <label>
+          <span>任务说明</span>
+          <textarea id="new-prompt" rows="4" placeholder="说明要完成的工作。可换行，发送前请检查内容。" required></textarea>
+        </label>
+        <button id="new-submit" class="primary full" type="submit">在电脑上启动</button>
+      </form>
+    </section>
+
+    <section id="sessions-card" class="card">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">已授权</p>
+          <h2>活动会话</h2>
+        </div>
+        <button id="refresh" class="icon" type="button" aria-label="刷新状态">↻</button>
+      </div>
+      <div id="session-list" class="session-list"></div>
+      <p id="no-sessions" class="muted hidden">当前没有可继续的 Claude Code 或 Codex 会话。</p>
+    </section>
+
+    <section id="conversation-card" class="card conversation hidden" aria-labelledby="conversation-title">
+      <div class="conversation-head">
+        <button id="close-conversation" class="icon" type="button" aria-label="返回会话列表">‹</button>
+        <div class="conversation-title">
+          <h2 id="conversation-title">会话</h2>
+          <span id="conversation-meta"></span>
+        </div>
+        <button id="stop" class="danger subtle" type="button">停止</button>
+      </div>
+      <div id="sync-note" class="sync-note">正在读取电脑上的原生会话</div>
+      <div id="message-list" class="messages" aria-live="polite"></div>
+      <div id="prompt-card" class="prompt-card hidden"></div>
+      <form id="send-form" class="sendbar">
+        <textarea id="send-text" rows="1" placeholder="继续输入任务…" aria-label="继续输入任务"></textarea>
+        <button id="send-submit" class="primary" type="submit" aria-label="发送">发送</button>
+      </form>
+    </section>
+
+    <section id="projects-card" class="card">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">权限范围</p>
+          <h2>已授权项目</h2>
+        </div>
+      </div>
+      <div id="project-list" class="project-list"></div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+  <script src="/app.js" type="module"></script>
+</body>
+</html>

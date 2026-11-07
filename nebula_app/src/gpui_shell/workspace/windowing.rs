@@ -1954,6 +1954,7 @@ mod tests {
                 name: "agent".to_owned(),
                 kind: AgentKind::Codex,
                 cwd: None,
+                shell_id: None,
                 session_id: None,
                 command: "codex".to_owned(),
                 worktree: None,

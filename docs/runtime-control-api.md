@@ -163,7 +163,7 @@ Pane ID 当前在 Window 内稳定，而不是进程内全局唯一。存在多�
 | `runtime.orchestrate` | 一次提交强类型布局、PTY、命令与 Agent 首任务工作流 | `steps`, `on_error?` |
 | `events.subscribe` | 从 revision 开始订阅状态变化 | `since_revision?` |
 | `agents.list` | 只列出 Pebrel 已识别的 Agent Pane、会话身份、状态和证据来源 | `window_id?` |
-| `agent.start` | 在新 Tab 或指定既有 Pane 中启动命名 Agent | `window_id?`, `pane_id?`, `name`, `kind`, `cwd?`, `resume_session_id?` |
+| `agent.start` | 在新 Tab 或指定既有 Pane 中启动命名 Agent | `window_id?`, `pane_id?`, `name`, `kind`, `cwd?`, `shell_id?`, `resume_session_id?` |
 | `agent.fork` | 事务化创建独立 Git branch/worktree，再启动命名 Agent | `source_pane_id?`/`source_cwd?`, `name`, `kind`, `branch?`, `base?`, `path?`, `allow_dirty_source?` |
 | `agent.get` | 按稳定 id 或名称解析 Agent generation 与 worktree provenance | `agent`, `generation?` |
 | `agent.delegate` | 绑定调用方身份派发任务，并在目标回合完成后自动回传最终消息 | `agent`, `generation?`, `text`, `origin_pane_id` |
@@ -401,3 +401,5 @@ token。无 token 的连接会被静默丢弃。该边界用于阻止其他本�
 
 旧版 `PING/ATTACH` 文本请求仍由同一服务端接受，保证单实例与会话重新挂载不因协议升级
 失效；新功能只通过版本化 JSON 协议开放。
+
+浏览器远控复用的原生会话接口中，`conversation.status`只读取当前身份、epoch、任务状态、可识别问答和can_send，不要求transcript存在；它接受window_id/pane_id/identity，拒绝文本、按键与历史游标。`conversation.read`继续读取原生历史。首次任务先等status允许发送，所有写操作仍校验epoch。手机读取历史暂不可用时可返回明确的transcriptUnavailable状态，保留已有消息，不能把它视为历史读取成功。

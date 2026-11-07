@@ -1,0 +1,370 @@
+--- a/.env.example
++++ b/.env.example
+@@ -26,7 +26,7 @@
+ MAX_SECURE_TUNNEL_BYTES=536870912
+ SECURE_FRAME_RATE_LIMIT_PER_MINUTE=2400
+ SECURE_TUNNEL_IDLE_TIMEOUT_MS=300000
+-SECURE_HANDSHAKE_TIMEOUT_MS=10000
++SECURE_HANDSHAKE_TIMEOUT_MS=130000
+ API_RATE_LIMIT_PER_MINUTE=300
+ AUTH_RATE_LIMIT_PER_MINUTE=20
+ PAIR_RATE_LIMIT_PER_MINUTE=30
+--- a/src/server.ts
++++ b/src/server.ts
+@@ -101,7 +101,7 @@
+ );
+ const secureHandshakeTimeoutMs = envInteger(
+   "SECURE_HANDSHAKE_TIMEOUT_MS",
+-  10_000,
++  130_000,
+ );
+ const allowLegacyWebProxy = ["1", "true"].includes(
+   (process.env.ALLOW_LEGACY_WEB_PROXY ?? "").toLowerCase(),
+--- a/web/app/app.js
++++ b/web/app/app.js
+@@ -391,8 +391,12 @@
+ function initializeTunnel(worker, options) {
+   return new Promise((resolve, reject) => {
+     const channel = new MessageChannel();
+-    const timer = setTimeout(() => reject(new Error("加密连接启动超时。")), 15000);
++    const timer = setTimeout(() => reject(new Error("加密连接启动超时。")), 125000);
+     channel.port1.onmessage = (event) => {
++      if (event.data?.pending) {
++        elements["connecting-device"].textContent = `首次连接请在电脑确认。核对码：${event.data.code}`;
++        return;
++      }
+       clearTimeout(timer);
+       event.data?.ok ? resolve() : reject(new Error(event.data?.error || "无法建立加密连接。"));
+     };
+--- /dev/null
++++ b/web/app/database.js
+@@ -0,0 +1,36 @@
++/* Pebrel compatibility patch; DSH Suite retains its original wire protocol. */
++(function (scope) {
++  "use strict";
++  let database;
++  scope.DshDatabase = {
++    open() {
++      if (database) return database;
++      database = new Promise((resolve, reject) => {
++        const request = indexedDB.open("dsh-remote-web", 3);
++        request.onupgradeneeded = () => {
++          const db = request.result;
++          if (!db.objectStoreNames.contains("device-keys")) db.createObjectStore("device-keys");
++          if (!db.objectStoreNames.contains("tunnel-sessions")) db.createObjectStore("tunnel-sessions", { keyPath: "deviceId" });
++        };
++        request.onblocked = () => { database = null; reject(new Error("请关闭此 Relay 的旧标签页，再重新打开。")); };
++        request.onsuccess = () => {
++          const db = request.result;
++          db.onversionchange = () => { db.close(); database = null; };
++          resolve(db);
++        };
++        request.onerror = () => { database = null; reject(request.error); };
++      });
++      return database;
++    },
++    async transact(storeName, mode, action) {
++      const db = await this.open();
++      return new Promise((resolve, reject) => {
++        const transaction = db.transaction(storeName, mode);
++        const request = action(transaction.objectStore(storeName));
++        transaction.oncomplete = () => resolve(request.result);
++        transaction.onabort = () => reject(transaction.error || request.error);
++        transaction.onerror = () => reject(transaction.error || request.error);
++      });
++    },
++  };
++})(globalThis);
+--- a/web/app/index.html
++++ b/web/app/index.html
+@@ -9,6 +9,7 @@
+     <title>DSH Remote</title>
+     <link rel="stylesheet" href="/app/app.css?v=0.1.8">
+     <script src="/app/crypto.js" defer></script>
++    <script src="/app/database.js" defer></script>
+     <script src="/app/key-store.js" defer></script>
+     <script src="/app/qr-scanner.umd.min.js" defer></script>
+     <script src="/app/app.js?v=0.1.8" defer></script>
+--- a/web/app/key-store.js
++++ b/web/app/key-store.js
+@@ -1,22 +1,7 @@
+ (function (scope) {
+   "use strict";
+ 
+-  const database = new Promise((resolve, reject) => {
+-    const request = indexedDB.open("dsh-remote-web", 1);
+-    request.onupgradeneeded = () => request.result.createObjectStore("device-keys");
+-    request.onsuccess = () => resolve(request.result);
+-    request.onerror = () => reject(request.error);
+-  });
+-
+-  async function transact(mode, action) {
+-    const db = await database;
+-    return new Promise((resolve, reject) => {
+-      const transaction = db.transaction("device-keys", mode);
+-      const request = action(transaction.objectStore("device-keys"));
+-      request.onsuccess = () => resolve(request.result);
+-      request.onerror = () => reject(request.error);
+-    });
+-  }
++  const transact = (mode, action) => DshDatabase.transact("device-keys", mode, action);
+ 
+   scope.DshKeyStore = {
+     get(deviceId) {
+--- a/web/app/sw.js
++++ b/web/app/sw.js
+@@ -1,30 +1,30 @@
+ /* global DshCrypto */
+ "use strict";
+ 
+-importScripts("/app/crypto.js");
++importScripts("/app/crypto.js", "/app/database.js");
+ 
+ const tunnels = new Map();
++const reconnecting = new Map();
+ const remoteClients = new Map();
+ const encoder = new TextEncoder();
+ const decoder = new TextDecoder();
+ 
+-const sessionDatabase = new Promise((resolve, reject) => {
+-  const request = indexedDB.open("dsh-remote-web", 2);
+-  request.onupgradeneeded = () => {
+-    if (!request.result.objectStoreNames.contains("tunnel-sessions"))
+-      request.result.createObjectStore("tunnel-sessions", { keyPath: "deviceId" });
+-  };
+-  request.onsuccess = () => resolve(request.result);
+-  request.onerror = () => reject(request.error);
+-});
++async function deviceForClient(clientId) {
++  if (!clientId) return undefined;
++  if (remoteClients.has(clientId)) return remoteClients.get(clientId);
++  const client = await clients.get(clientId);
++  if (!client) return undefined;
++  const url = new URL(client.url);
++  if (url.origin !== self.location.origin) return undefined;
++  const remote = /^\/remote\/([^/]+)(?:\/|$)/.exec(url.pathname);
++  if (!remote) return undefined;
++  const deviceId = decodeURIComponent(remote[1]);
++  remoteClients.set(clientId, deviceId);
++  return deviceId;
++}
+ 
+ function sessionTransaction(mode, action) {
+-  return sessionDatabase.then((db) => new Promise((resolve, reject) => {
+-    const transaction = db.transaction("tunnel-sessions", mode);
+-    const request = action(transaction.objectStore("tunnel-sessions"));
+-    request.onsuccess = () => resolve(request.result);
+-    request.onerror = () => reject(request.error);
+-  }));
++  return DshDatabase.transact("tunnel-sessions", mode, action);
+ }
+ 
+ function readSession(deviceId) {
+@@ -36,16 +36,7 @@
+ }
+ 
+ function readMasterKey(deviceId) {
+-  return new Promise((resolve, reject) => {
+-    const request = indexedDB.open("dsh-remote-web", 1);
+-    request.onsuccess = () => {
+-      const transaction = request.result.transaction("device-keys", "readonly");
+-      const keyRequest = transaction.objectStore("device-keys").get(deviceId);
+-      keyRequest.onsuccess = () => resolve(keyRequest.result || null);
+-      keyRequest.onerror = () => reject(keyRequest.error);
+-    };
+-    request.onerror = () => reject(request.error);
+-  });
++  return DshDatabase.transact("device-keys", "readonly", (store) => store.get(deviceId));
+ }
+ 
+ function id(prefix) {
+@@ -170,6 +161,7 @@
+     this.cookieJar = new Map();
+     this.sendQueue = Promise.resolve();
+     this.receiveQueue = Promise.resolve();
++    this.onApproval = options.onApproval;
+   }
+ 
+   connect() {
+@@ -177,11 +169,13 @@
+       const encodedTicket = DshCrypto.base64Url(encoder.encode(this.ticket));
+       const socket = new WebSocket(this.tunnelUrl, ["dsh-e2ee-v1", `dsh-ticket.${encodedTicket}`]);
+       this.socket = socket;
+-      const timer = setTimeout(() => reject(new Error("加密握手超时")), 10000);
++      const timer = setTimeout(() => { this.fail(new Error("加密握手超时")); reject(new Error("加密握手超时")); }, 120000);
++      this.finishEnrollment = () => { clearTimeout(timer); resolve(); };
+       socket.addEventListener("open", async () => {
+         try {
+           const hello = await DshCrypto.clientHello(this.masterKey, this.accessSessionId);
+           this.clientRandomB64 = hello.clientRandomB64;
++          this.onApproval?.(this.accessSessionId.slice(-6));
+           socket.send(JSON.stringify(envelope("client_hello", hello.payload)));
+         } catch (error) {
+           clearTimeout(timer);
+@@ -198,8 +192,7 @@
+               this.clientRandomB64,
+               message.payload,
+             );
+-            clearTimeout(timer);
+-            resolve();
++            if (!message.payload.enrollmentRequired) this.finishEnrollment();
+             return;
+           }
+           if (message.type === "sealed" && this.cipher) {
+@@ -212,9 +205,10 @@
+       });
+       socket.addEventListener("error", () => {
+         clearTimeout(timer);
++        this.fail(new Error("无法连接加密隧道"));
+         reject(new Error("无法连接加密隧道"));
+       });
+-      socket.addEventListener("close", () => this.fail(new Error("加密隧道已断开")));
++      socket.addEventListener("close", () => { clearTimeout(timer); this.fail(new Error("加密隧道已断开")); reject(new Error("加密隧道已断开")); });
+     });
+   }
+ 
+@@ -223,9 +217,13 @@
+       this.socket.send(JSON.stringify(envelope("client_close", { accessSessionId: this.accessSessionId, reason })));
+       this.socket.close(code, reason);
+     }
++    this.fail(new Error(reason));
+   }
+ 
+   fail(error) {
++    this.closed = true;
++    if (tunnels.get(this.deviceId) === this) tunnels.delete(this.deviceId);
++    if (this.socket?.readyState < WebSocket.CLOSING) this.socket.close();
+     for (const pending of this.pendingHttp.values()) pending.reject(error);
+     this.pendingHttp.clear();
+     for (const entry of this.virtualSockets.values()) this.postSocket(entry.clientId, entry.channel, "close", { code: 1011, reason: "secure tunnel failed", wasClean: false });
+@@ -336,6 +334,13 @@
+   }
+ 
+   async handleInner(message) {
++    if (message.type === "pebrel_browser_enrolled") {
++      DshCrypto.fromBase64Url(message.payload.masterKey, 32);
++      await DshDatabase.transact("device-keys", "readwrite", (store) => store.put(message.payload.masterKey, this.deviceId));
++      this.masterKey = message.payload.masterKey;
++      this.finishEnrollment?.();
++      return;
++    }
+     if (message.type === "http_res") return this.handleHttpResponse(message);
+     const entry = this.virtualSockets.get(message.channel);
+     if (!entry) return;
+@@ -386,6 +391,15 @@
+ }
+ 
+ async function resumeTunnel(deviceId) {
++  const live = tunnels.get(deviceId);
++  if (live && !live.closed) return live;
++  if (reconnecting.has(deviceId)) return reconnecting.get(deviceId);
++  const pending = reconnectTunnel(deviceId).finally(() => reconnecting.delete(deviceId));
++  reconnecting.set(deviceId, pending);
++  return pending;
++}
++
++async function reconnectTunnel(deviceId) {
+   const session = await readSession(deviceId);
+   const masterKey = await readMasterKey(deviceId);
+   if (!session || !masterKey) return null;
+@@ -404,10 +418,10 @@
+     return tunnel;
+   };
+   try {
+-    return await connect(session);
++    return await connect(await freshTicket(deviceId));
+   } catch {
+     try {
+-      return await connect(await freshTicket(deviceId));
++      return null;
+     } catch {
+       return null;
+     }
+@@ -424,7 +438,7 @@
+     event.waitUntil((async () => {
+       try {
+         tunnels.get(message.deviceId)?.close();
+-        const tunnel = new Tunnel(message);
++        const tunnel = new Tunnel({ ...message, onApproval: (code) => respond({ pending: true, code }) });
+         await tunnel.connect();
+         tunnels.set(message.deviceId, tunnel);
+         await writeSession({
+@@ -441,18 +455,20 @@
+     return;
+   }
+   const clientId = event.source?.id;
+-  const deviceId = clientId ? remoteClients.get(clientId) : undefined;
+-  const tunnel = deviceId ? tunnels.get(deviceId) : undefined;
+-  if (!clientId || !tunnel) return;
+-  if (message.type === "remote-ws-open") event.waitUntil(tunnel.openVirtualSocket(clientId, message));
+-  if (message.type === "remote-ws-send") {
+-    const data = message.text !== undefined ? encoder.encode(message.text) : new Uint8Array(message.buffer);
+-    event.waitUntil(tunnel.sendInner("ws_frame", { dataB64: bytesToBase64(data), opcode: message.text !== undefined ? 1 : 2 }, message.channel));
+-  }
+-  if (message.type === "remote-ws-close") {
+-    tunnel.virtualSockets.delete(message.channel);
+-    event.waitUntil(tunnel.sendInner("ws_close", { code: message.code, reason: message.reason }, message.channel));
+-  }
++  event.waitUntil((async () => {
++    const deviceId = await deviceForClient(clientId);
++    const tunnel = deviceId ? await resumeTunnel(deviceId) : undefined;
++    if (!clientId || !tunnel) return;
++    if (message.type === "remote-ws-open") await tunnel.openVirtualSocket(clientId, message);
++    if (message.type === "remote-ws-send") {
++      const data = message.text !== undefined ? encoder.encode(message.text) : new Uint8Array(message.buffer);
++      await tunnel.sendInner("ws_frame", { dataB64: bytesToBase64(data), opcode: message.text !== undefined ? 1 : 2 }, message.channel);
++    }
++    if (message.type === "remote-ws-close") {
++      tunnel.virtualSockets.delete(message.channel);
++      await tunnel.sendInner("ws_close", { code: message.code, reason: message.reason }, message.channel);
++    }
++  })());
+ });
+ 
+ self.addEventListener("fetch", (event) => {
+@@ -466,14 +482,13 @@
+     const resultingId = event.resultingClientId || event.clientId;
+     if (resultingId) remoteClients.set(resultingId, deviceId);
+   }
+-  if (!deviceId) return;
+   const path = launch ? `${launch[2] || "/"}${url.search}` : `${url.pathname}${url.search}`;
+   event.respondWith((async () => {
++    deviceId ||= await deviceForClient(event.clientId);
++    if (!deviceId) return fetch(event.request);
+     const tunnel = tunnels.get(deviceId) || await resumeTunnel(deviceId);
+     if (!tunnel) {
+-      if (event.clientId) remoteClients.delete(event.clientId);
+-      if (event.resultingClientId) remoteClients.delete(event.resultingClientId);
+-      return fetch("/remote/unavailable.html");
++      return new Response("Computer unavailable", { status: 503 });
+     }
+     return tunnel.request(path, event.request).catch(() => new Response("Secure tunnel failed", { status: 502 }));
+   })());
+--- a/src/web.ts
++++ b/src/web.ts
+@@ -18,6 +18,7 @@
+   ["/app/app.css", "app/app.css"],
+   ["/app/app.js", "app/app.js"],
+   ["/app/crypto.js", "app/crypto.js"],
++  ["/app/database.js", "app/database.js"],
+   ["/app/key-store.js", "app/key-store.js"],
+   ["/app/qr-scanner.umd.min.js", "app/qr-scanner.umd.min.js"],
+   ["/app/qr-scanner-worker.min.js", "app/qr-scanner-worker.min.js"],
+--- a/test/web-assets.test.ts
++++ b/test/web-assets.test.ts
+@@ -34,6 +34,15 @@
+     result.stdout,
+     "voqHzLsUCWC__C-NBr-s0t1AshPpTEwNwSoOrhx_ihApnwkPlwKxr7EX28kmqOjoVQus161QnjXyzjxDil_WXgnkvu0pgQfiGV27QIgL97KPe2X0nv9vlzLUmwMll0ipeUo2IZKgM-Rt_WRa_-TyyL9SEkozijz1Z6HBxk1hfLiwQEb602fzHVGQP4Wh3Q2B41mrL_-AGQ",
+   );
++});
++
++test("browser database is served as an explicit public asset", () => {
++  const web = readFileSync("src/web.ts", "utf8");
++  const app = readFileSync("web/app/index.html", "utf8");
++  const database = readFileSync("web/app/database.js", "utf8");
++  assert.match(web, /\["\/app\/database\.js", "app\/database\.js"\]/);
++  assert.match(app, /src="\/app\/database\.js"/);
++  assert.match(database, /DshDatabase/);
+ });
+ 
+ test("container and release archives include browser assets", () => {

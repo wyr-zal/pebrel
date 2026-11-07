@@ -8,6 +8,7 @@ use crate::{
 };
 use pebrel_mobile_link::{endpoint::RelayAccess, qr::PairingQr};
 
+mod browser;
 mod relay;
 #[cfg(all(test, feature = "gpui-test-support"))]
 mod tests;
@@ -21,6 +22,7 @@ pub(super) enum Phase {
 }
 
 pub(super) struct MobileState {
+    browser: browser::BrowserRemoteState,
     initialized: bool,
     loading: bool,
     syncing: bool,
@@ -70,6 +72,7 @@ impl MobileState {
             cx.notify();
         });
         Self {
+            browser: browser::BrowserRemoteState::new(window, cx),
             initialized: false,
             loading: false,
             syncing: false,
