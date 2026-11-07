@@ -11,8 +11,8 @@
 
 ## Windows Debug 构建与 WSL 标签修复验收
 
-- 使用正式源码工作树 `F:/ProjectsWork/pebrel-personal-merge-20261010` 构建 Windows 产品；从 WSL 执行：
-  `/mnt/c/Users/12704/AppData/Local/Microsoft/WindowsApps/pwsh.exe -NoProfile -File F:/ProjectsWork/pebrel-personal-merge-20261010/scripts/build-windows-product.ps1 -Configuration debug`
+- Windows Debug 完整构建与测试 bundle 交付统一执行：`/mnt/c/Users/12704/AppData/Local/Microsoft/WindowsApps/pwsh.exe -NoProfile -File F:/ProjectsWork/pebrel-personal-merge-20261010/scripts/build-windows-product.ps1 -Configuration debug -DeployDebugBundle`。
+- `build-windows-product.ps1` 仍是 Release 打包共用的构建入口；`-DeployDebugBundle` 让它一次构建后继续备份、部署并校验四件 Debug bundle 产物。目标 bundle 正被 Pebrel 使用时会在改动文件前停止，关闭对应窗口后重跑即可。
 - 该脚本按 `nebula/gpui-shell` 构建 `pebrel.exe` 和 `pebrel-hook.exe`；`.cargo/config.toml` 将共享 target 固定到 `F:/ProjectsWork/pebrel-debug-daily-20261013/cargo-target`。不得中断正在此 target 中运行的 Cargo/linker。
 - Debug 产物位于 `cargo-target/debug/`：`pebrel.exe`、`pebrel.pdb`、`pebrel-hook.exe`、`pebrel_hook.pdb`。部署时将前两项放目标根目录，后两项放 `runtime/`。
 - WSL 标签修复的构建和交付目标是测试 bundle `F:/ProjectsWork/pebrel-debug-daily-20261013`：覆盖前将四个旧文件备份到 `F:/12704/temp-backups/yyyyMMdd/<task>/bundle/`，再复制构建产物并逐项比对 SHA256。`F:/Dev/Tools/Pebrel` 是用户的个人日用安装；除非用户本轮明确要求，否则不得备份、替换、重启或向它发送运行时命令。
