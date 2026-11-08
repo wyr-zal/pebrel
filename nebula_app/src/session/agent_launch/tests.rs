@@ -17,6 +17,29 @@ fn magpie(kind: AgentKind, cwd: &str) -> WslAgentLaunch {
 }
 
 #[test]
+fn wsl_agent_intent_uses_only_a_literal_agent_execution() {
+    for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Hermes] {
+        let direct = format!("wsl.exe -d Ubuntu-22.04 -e {}", kind.slug());
+        let argv = WslAgentLaunch::literal_invocation(&direct).unwrap();
+        assert_eq!(WslAgentLaunch::requested_agent(&argv), Some(kind));
+        let inner = quoted(&[kind.resume_command(CURRENT).unwrap()], PathQuote::Posix).unwrap();
+        let guest = format!("exec ${{SHELL:-sh}} -lic {inner}");
+        let argv = ["wsl.exe", "-d", "Ubuntu-22.04", "-e", "sh", "-lc", &guest].map(str::to_owned);
+        assert_eq!(WslAgentLaunch::requested_agent(&argv), Some(kind));
+    }
+    for command in [
+        "wsl.exe -e cargo build",
+        "wsl.exe -e printf claude",
+        "wsl.exe -e sh -c 'echo claude'",
+        "wsl.exe -e claude -p 'only print'",
+        "wsl.exe --help",
+    ] {
+        let argv = WslAgentLaunch::literal_invocation(command).unwrap();
+        assert_eq!(WslAgentLaunch::requested_agent(&argv), None, "{command}");
+    }
+}
+
+#[test]
 fn magpie_keeps_login_shell_and_replaces_directory_and_resume_target() {
     for kind in [AgentKind::Claude, AgentKind::Codex] {
         let launch = magpie(kind, "/mnt/f/Project O'Brien 项目");

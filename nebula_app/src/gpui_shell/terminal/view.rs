@@ -967,6 +967,12 @@ impl TerminalView {
                     } else if name == "pebrel_command" {
                         self.wsl_cwd_observer.accept_command_line(&value);
                         self.wsl_cwd_observer.refresh_command_metadata()
+                    } else if name == crate::completion_context::ARGV_VAR
+                        && value.split_once('\n').is_some_and(|(owner, _)| {
+                            self.suggest.completion_context.owns_current(owner)
+                        })
+                    {
+                        self.wsl_cwd_observer.accept_connection_argv(&value)
                     } else {
                         false
                     };
@@ -1444,8 +1450,7 @@ impl TerminalView {
         // `nebula_input_text` 的防注入契约一致）。
         if !self.term_mode().contains(TermMode::ALT_SCREEN) {
             crate::display::nebula_input_text(&mut self.suggest, &normalized);
-            self.wsl_cwd_observer.accept_command_line(&normalized);
-            if self.wsl_cwd_observer.start_command() {
+            if self.accept_pasted_wsl_command(&normalized) {
                 cx.emit(TerminalViewEvent::TitleChanged);
             }
         }

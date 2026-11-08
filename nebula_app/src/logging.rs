@@ -143,6 +143,19 @@ pub(crate) fn auto_continue_diagnostic(pane: u64, stage: &'static str, reason: &
     append_bounded_log(&path, record.as_bytes());
 }
 
+/// Reason-only, command-budgeted observations remain available at Warn level.
+pub(crate) fn agent_state_diagnostic(pane: u64, epoch: u64, reason: &'static str) {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let pid = process::id();
+    let path = env::temp_dir().join(format!("Pebrel-agent-state-{pid}.log"));
+    let record =
+        format!("[{timestamp} pid={pid} pane={pane} epoch={epoch}] wsl_agent: reason={reason}\n");
+    append_bounded_log(&path, record.as_bytes());
+}
+
 /// User configurable extra log targets to include.
 fn extra_log_targets() -> &'static [String] {
     static EXTRA_LOG_TARGETS: OnceLock<Vec<String>> = OnceLock::new();
@@ -469,6 +482,15 @@ mod tests {
         assert!(
             records.contains("pane=42] auto_continue: stage=send_paused reason=agent_history\n")
         );
+        assert!(fs::metadata(path).unwrap().len() <= MAX_LOG_FILE_BYTES);
+    }
+
+    #[test]
+    fn agent_state_diagnostic_persists_only_owner_and_reason_metadata() {
+        agent_state_diagnostic(42, 7, "missing_launch_boundary");
+        let path = env::temp_dir().join(format!("Pebrel-agent-state-{}.log", process::id()));
+        let records = fs::read_to_string(&path).unwrap();
+        assert!(records.contains("pane=42 epoch=7] wsl_agent: reason=missing_launch_boundary\n"));
         assert!(fs::metadata(path).unwrap().len() <= MAX_LOG_FILE_BYTES);
     }
 

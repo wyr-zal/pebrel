@@ -13,12 +13,14 @@ const LOCATION_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 const MAX_START_MISSES: u8 = 4;
 const MAX_NO_AGENT_MISSES: u8 = 8;
 const MAX_UNCERTAIN_MISSES: u8 = 8;
+const MAX_DIAGNOSTICS_PER_COMMAND: u8 = 24;
 
 pub(super) struct WslCwdObserver {
     boundary: Option<NativeLaunchBoundary>,
     command_id: Option<String>,
     literal_invocation: Option<(Option<String>, Vec<String>)>,
     command_candidate: bool,
+    agent_expected: bool,
     command_started: bool,
     identity_suppressed: bool,
     active: bool,
@@ -32,6 +34,8 @@ pub(super) struct WslCwdObserver {
     observed: Option<ObservedWslLocation>,
     saved_agent: Option<crate::session::AgentSession>,
     saved_agent_owner: Option<(ProcessStamp, ProcessStamp)>,
+    last_diagnostic: Option<&'static str>,
+    diagnostics_remaining: u8,
     closed: AtomicBool,
 }
 
@@ -57,6 +61,7 @@ impl Default for WslCwdObserver {
             command_id: None,
             literal_invocation: None,
             command_candidate: false,
+            agent_expected: false,
             command_started: false,
             identity_suppressed: false,
             active: false,
@@ -70,6 +75,8 @@ impl Default for WslCwdObserver {
             observed: None,
             saved_agent: None,
             saved_agent_owner: None,
+            last_diagnostic: None,
+            diagnostics_remaining: MAX_DIAGNOSTICS_PER_COMMAND,
             closed: AtomicBool::new(false),
         }
     }
@@ -82,6 +89,8 @@ impl WslCwdObserver {
         self.command_id = None;
         self.literal_invocation = None;
         self.command_candidate = false;
+        self.agent_expected = false;
+        self.reset_diagnostics();
         self.command_started = false;
         self.identity_suppressed = false;
         self.active = false;
@@ -100,6 +109,8 @@ impl WslCwdObserver {
         self.command_id = valid_command_id(command_id).then(|| command_id.to_owned());
         if had_command_id {
             self.literal_invocation = None;
+            self.agent_expected = false;
+            self.reset_diagnostics();
         } else if let Some((binding, _)) = &mut self.literal_invocation {
             *binding = self.command_id.clone();
         }
@@ -112,6 +123,9 @@ impl WslCwdObserver {
         self.command_candidate = command_line_contains_wsl(value);
         self.literal_invocation = crate::session::WslAgentLaunch::literal_invocation(value)
             .map(|args| (self.command_id.clone(), args));
+        self.agent_expected = self.literal_invocation.as_ref().is_some_and(|(_, args)| {
+            crate::session::WslAgentLaunch::requested_agent(args).is_some()
+        });
         if !self.command_candidate {
             self.invalidate();
             self.active = false;
@@ -119,7 +133,60 @@ impl WslCwdObserver {
         }
     }
 
+    /// The shell supplies its expanded argv; callers verify the reporting shell.
+    pub(super) fn accept_connection_argv(&mut self, value: &str) -> bool {
+        if self.command_id.is_none() || !self.command_candidate || value.len() > 64 * 1024 {
+            return false;
+        }
+        let Some((_, argv)) = value.split_once('\n') else { return false };
+        let args: Vec<_> = argv.split('\0').map(str::to_owned).collect();
+        if args.len() > 32
+            || args
+                .iter()
+                .any(|arg| arg.is_empty() || arg.len() > 4096 || arg.chars().any(char::is_control))
+            || !args.first().is_some_and(|arg| crate::shell_detect::is_wsl_launcher(arg))
+        {
+            return false;
+        }
+        let expected = crate::session::WslAgentLaunch::requested_agent(&args).is_some();
+        let changed = self.agent_expected != expected;
+        self.agent_expected = expected;
+        self.literal_invocation = Some((self.command_id.clone(), args));
+        changed
+    }
+
+    pub(super) fn expects_agent(&self) -> bool {
+        self.command_started
+            && self.command_candidate
+            && self.command_id.is_some()
+            && self.agent_expected
+            && !self.identity_suppressed
+            && !self.closed.load(Ordering::Acquire)
+    }
+
+    fn take_diagnostic(&mut self, reason: &'static str) -> bool {
+        if self.last_diagnostic == Some(reason) || self.diagnostics_remaining == 0 {
+            return false;
+        }
+        self.last_diagnostic = Some(reason);
+        self.diagnostics_remaining -= 1;
+        true
+    }
+
+    fn reset_diagnostics(&mut self) {
+        self.last_diagnostic = None;
+        self.diagnostics_remaining = MAX_DIAGNOSTICS_PER_COMMAND;
+    }
+
     pub(super) fn start_command(&mut self) -> bool {
+        self.mark_command_start()
+    }
+
+    pub(super) fn accept_pasted_command(&mut self, value: &str) -> bool {
+        if self.command_started {
+            return false;
+        }
+        self.accept_command_line(value);
         self.mark_command_start()
     }
 
@@ -148,6 +215,7 @@ impl WslCwdObserver {
         self.command_id = None;
         self.literal_invocation = None;
         self.command_candidate = false;
+        self.agent_expected = false;
         self.command_started = false;
         self.identity_suppressed = false;
         self.reset_probe_state();
@@ -370,6 +438,7 @@ impl WslCwdObserver {
         let before = self.visible_key();
         match result {
             WslLocationProbe::Found(location) => {
+                self.agent_expected = true;
                 self.remember_location(&location);
                 self.launcher = Some(location.launcher);
                 self.observed = Some(location);
@@ -468,9 +537,24 @@ fn command_line_contains_wsl(value: &str) -> bool {
 }
 
 impl TerminalView {
+    fn diagnose_wsl_agent(&mut self, reason: &'static str, cx: &Context<Self>) {
+        if self.wsl_cwd_observer.take_diagnostic(reason) {
+            let pane = self.pane_id;
+            let epoch = self.wsl_cwd_observer.epoch;
+            cx.background_executor()
+                .spawn(async move {
+                    crate::logging::agent_state_diagnostic(pane, epoch, reason);
+                })
+                .detach();
+        }
+    }
+
     pub(crate) fn refresh_wsl_cwd_observation(&mut self, cx: &mut Context<Self>) {
         let now = Instant::now();
         let path_changed = self.wsl_cwd_observer.expire_stale(now);
+        if path_changed {
+            self.diagnose_wsl_agent("receipt_expired", cx);
+        }
         let identity_changed = self.sync_wsl_agent_identity_with_context(cx);
         if path_changed || identity_changed {
             cx.emit(TerminalViewEvent::TitleChanged);
@@ -486,6 +570,9 @@ impl TerminalView {
         let Some(context) = self.exec_context.as_ref().cloned() else {
             return;
         };
+        if self.wsl_cwd_observer.expects_agent() && self.wsl_cwd_observer.boundary.is_none() {
+            self.diagnose_wsl_agent("missing_launch_boundary", cx);
+        }
         let Some(ticket) = self.wsl_cwd_observer.begin_probe(now) else { return };
         crate::logging::debug_log("wsl_cwd_observer event=probe_start");
         let Some(session) = &self.session else { return };
@@ -536,12 +623,26 @@ impl TerminalView {
         same_pty_and_shell: bool,
         cx: &mut Context<Self>,
     ) {
+        let reason = match &result {
+            WslLocationProbe::Found(_) => "receipt_found",
+            WslLocationProbe::NoLauncher => "no_launcher",
+            WslLocationProbe::NoAgent { .. } => "no_agent",
+            WslLocationProbe::Unavailable { .. } => "probe_unavailable",
+            WslLocationProbe::Ambiguous => "ambiguous_owner",
+            WslLocationProbe::Unknown { .. } => "unknown_launcher",
+        };
         let completion = self.wsl_cwd_observer.complete_probe(
             ticket,
             result,
             same_pty_and_shell && self.exited.is_none() && self.error.is_none(),
             Instant::now(),
         );
+        if completion.accepted {
+            self.diagnose_wsl_agent(reason, cx);
+            if !self.wsl_cwd_observer.active {
+                self.diagnose_wsl_agent("probe_budget_exhausted", cx);
+            }
+        }
         let identity_changed = (completion.accepted || completion.path_changed)
             && self.sync_wsl_agent_identity_with_context(cx);
         if completion.path_changed || identity_changed {
@@ -565,6 +666,63 @@ mod tests {
             shell: ProcessStamp { pid: 10, start_time: 90 },
             existing_branches: Default::default(),
         }
+    }
+
+    #[test]
+    fn agent_intent_requires_a_started_current_command_and_survives_probe_exhaustion() {
+        let mut observer = WslCwdObserver::default();
+        observer.prepare_submission(None);
+        observer.accept_command_line("pwsh:fixture\nwsl.exe -e claude --resume fixture");
+        observer.accept_command_id("0123456789abcdef0123456789abcdef");
+        assert!(!observer.expects_agent());
+        observer.mark_command_start();
+        assert!(observer.expects_agent(), "missing boundary cannot confirm inner task activity");
+        for _ in 0..MAX_UNCERTAIN_MISSES {
+            observer.apply_probe(WslLocationProbe::Unavailable { launcher: None }, Instant::now());
+        }
+        assert!(!observer.active);
+        assert!(observer.expects_agent());
+        observer.accept_command_id("abcdef0123456789abcdef0123456789");
+        assert!(!observer.expects_agent(), "old intent cannot leak into another command");
+        observer.accept_command_line("wsl.exe -e cargo build");
+        assert!(!observer.expects_agent());
+        observer.accept_command_line("wsl.exe -e claude");
+        assert!(observer.expects_agent());
+        observer.finish_command();
+        assert!(!observer.expects_agent());
+    }
+
+    #[test]
+    fn expanded_wsl_argv_keeps_the_existing_command_binding() {
+        let mut observer = recovery_observer();
+        let report = "pwsh:fixture\nwsl.exe\0-d\0Ubuntu-22.04\0-e\0sh\0-lc\0exec ${SHELL:-sh} -lic 'claude --resume fixture'";
+        assert!(observer.accept_connection_argv(report));
+        assert!(observer.expects_agent());
+        let binding = observer.command_id.clone();
+        assert_eq!(observer.literal_invocation.as_ref().unwrap().0, binding);
+        assert!(!observer.accept_connection_argv("pwsh:fixture\ncmd.exe\0/c\0claude"));
+        assert!(observer.expects_agent());
+        observer.suppress_identity_until_next_command();
+        assert!(!observer.expects_agent(), "Hook authority suppresses the weak intent");
+        observer.finish_command();
+        assert!(!observer.accept_connection_argv(report));
+        assert!(!observer.expects_agent());
+    }
+
+    #[test]
+    fn state_diagnostics_are_deduplicated_and_budgeted_per_command() {
+        let mut observer = recovery_observer();
+        assert!(observer.take_diagnostic("probe_unavailable"));
+        let remaining = observer.diagnostics_remaining;
+        assert!(!observer.take_diagnostic("probe_unavailable"));
+        assert_eq!(observer.diagnostics_remaining, remaining);
+        for _ in 0..MAX_DIAGNOSTICS_PER_COMMAND {
+            observer.take_diagnostic("receipt_expired");
+            observer.take_diagnostic("receipt_found");
+        }
+        assert_eq!(observer.diagnostics_remaining, 0);
+        observer.prepare_submission(Some(boundary()));
+        assert_eq!(observer.diagnostics_remaining, MAX_DIAGNOSTICS_PER_COMMAND);
     }
 
     fn location(launcher_pid: u32, agent_pid: u32, cwd: &str) -> ObservedWslLocation {

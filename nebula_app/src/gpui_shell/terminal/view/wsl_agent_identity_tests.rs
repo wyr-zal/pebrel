@@ -88,6 +88,150 @@ fn assert_process_identity(view: &TerminalView) {
     assert!(!view.agent_activity.hook_seen());
 }
 
+#[gpui::test]
+fn wsl_agent_intent_is_unconfirmed_until_a_verified_identity_reaches_live_chrome(
+    cx: &mut TestAppContext,
+) {
+    use crate::runtime_api::RuntimeTaskState;
+    let (entity, window, _) = open(cx);
+    entity.update(window, |view, cx| {
+        let ticket = start_host_wsl(view, 'a', cx);
+        // The real shell wrapper reports argv after PowerShell has unquoted it.
+        let owner = "pwsh:fixture";
+        view.suggest.completion_shell_report(crate::completion_context::SHELL_VAR, owner);
+        let report = format!("{owner}\nwsl.exe\0-d\0Ubuntu-22.04\0-e\0sh\0-lc\0exec ${{SHELL:-sh}} -lic 'claude --resume fixture-session'");
+        view.process_event(
+            Event::UserVar { name: crate::completion_context::ARGV_VAR.into(), value: report },
+            cx,
+        );
+        assert!(view.runtime_agent().is_none());
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running, "outer command is still alive");
+        assert_eq!(view.sidebar_activity(), SidebarActivity::Unconfirmed);
+        assert!(!view.runtime_state_evidence().confirmed);
+        assert!(!view.runtime_read(1, 24, None).unwrap().state_evidence.confirmed);
+        view.paste_now_impl("continue this task", false, cx);
+        assert_eq!(view.sidebar_activity(), SidebarActivity::Unconfirmed);
+        assert!(view.runtime_agent().is_none());
+
+        view.apply_wsl_cwd_probe_result(&ticket, WslLocationProbe::Found(location()), true, cx);
+        assert_process_identity(view);
+        view.paste_now_impl("continue this task", false, cx);
+        assert!(view.wsl_identity_override_is_current());
+        assert_eq!(view.runtime_agent().unwrap().kind, "claude");
+        let composer = "────────\n❯ \n────────\n? for shortcuts";
+        for (text, expected) in [
+            (format!("✻ Thinking… (3s)\n\n{composer}"), SidebarActivity::Running),
+            (format!("✻ Crunched for 2m 35s · done 12:23 PM\n\n{composer}"), SidebarActivity::Idle),
+            (
+                "This command requires approval\nDo you want to proceed?\n❯ 1. Yes\n2. No\nEsc to cancel · Tab to amend · ctrl+e to explain".into(),
+                SidebarActivity::Attention,
+            ),
+        ] {
+            super::startup_tests::feed(view, format!("\x1b[2J\x1b[H{}", text.replace('\n', "\r\n")).as_bytes());
+            for _ in 0..4 {
+                view.refresh_agent_screen_state(cx);
+            }
+            assert_eq!(view.sidebar_activity(), expected, "{text}");
+            assert!(view.runtime_state_evidence().confirmed);
+            assert!(!view.agent_activity.hook_seen());
+            assert_ne!(view.runtime_task_state(), RuntimeTaskState::Finished);
+        }
+        let next = view.wsl_cwd_observer.begin_probe(Instant::now() + std::time::Duration::from_secs(4)).unwrap();
+        view.apply_wsl_cwd_probe_result(&next, WslLocationProbe::NoAgent { launcher: location().launcher }, true, cx);
+        assert!(view.runtime_agent().is_none());
+        assert_eq!(view.sidebar_activity(), SidebarActivity::Unconfirmed, "lost receipt cannot restore the shell spinner");
+        assert!(!view.runtime_state_evidence().confirmed);
+        view.process_event(Event::CommandDone { exit_code: Some(0) }, cx);
+        assert_eq!(view.sidebar_activity(), SidebarActivity::Idle);
+        assert!(view.runtime_state_evidence().confirmed);
+    });
+}
+
+#[gpui::test]
+fn foreign_argv_cannot_hide_a_running_wsl_build_or_create_an_agent(cx: &mut TestAppContext) {
+    let (entity, window, _) = open(cx);
+    entity.update(window, |view, cx| {
+        let _ticket = start_host_wsl(view, 'a', cx);
+        view.wsl_cwd_observer.accept_command_line("wsl.exe -d Ubuntu-22.04 -e cargo build");
+        view.suggest.completion_shell_report(crate::completion_context::SHELL_VAR, "pwsh:owner");
+        view.process_event(
+            Event::UserVar {
+                name: crate::completion_context::ARGV_VAR.into(),
+                value: "pwsh:foreign\nwsl.exe\0-e\0claude".into(),
+            },
+            cx,
+        );
+        assert!(view.runtime_agent().is_none());
+        assert_eq!(view.sidebar_activity(), SidebarActivity::Running);
+        assert!(view.runtime_state_evidence().confirmed);
+        view.process_event(
+            Event::UserVar {
+                name: crate::completion_context::ARGV_VAR.into(),
+                value: "pwsh:owner\nwsl.exe\0-d\0Ubuntu-22.04\0-e\0cargo\0build".into(),
+            },
+            cx,
+        );
+        assert!(view.runtime_agent().is_none());
+        assert_eq!(view.sidebar_activity(), SidebarActivity::Running);
+        assert!(view.runtime_state_evidence().confirmed);
+        view.error = Some("fixture failure".into());
+        assert_eq!(view.sidebar_activity(), SidebarActivity::Failed);
+        assert!(view.runtime_state_evidence().confirmed);
+    });
+}
+
+#[gpui::test]
+fn explicit_program_state_wins_over_pending_or_identity_only_wsl_agent(cx: &mut TestAppContext) {
+    use crate::runtime_api::RuntimeTaskState;
+    let (entity, window, _) = open(cx);
+    entity.update(window, |view, cx| {
+        let (session, _, mut events, proxy) = super::session::test_session_with_events();
+        view.session = Some(session);
+        let ticket = start_host_wsl(view, 'a', cx);
+        view.suggest.completion_shell_report(crate::completion_context::SHELL_VAR, "pwsh:fixture");
+        view.process_event(
+            Event::UserVar {
+                name: crate::completion_context::ARGV_VAR.into(),
+                value: "pwsh:fixture\nwsl.exe\0-e\0claude".into(),
+            },
+            cx,
+        );
+        let mut stream = nebula_terminal::event_loop::StreamProcessor::default();
+        for verified in [false, true] {
+            if verified {
+                view.apply_wsl_cwd_probe_result(
+                    &ticket,
+                    WslLocationProbe::Found(location()),
+                    true,
+                    cx,
+                );
+            }
+            assert_eq!(view.sidebar_activity(), SidebarActivity::Unconfirmed);
+            for (report, state, badge) in [
+                ("working", RuntimeTaskState::Running, SidebarActivity::Running),
+                ("idle", RuntimeTaskState::Idle, SidebarActivity::Idle),
+                ("blocked", RuntimeTaskState::Attention, SidebarActivity::Attention),
+                ("done", RuntimeTaskState::Finished, SidebarActivity::Done),
+                ("error", RuntimeTaskState::Failed, SidebarActivity::CommandFailed),
+                ("clear", RuntimeTaskState::Running, SidebarActivity::Unconfirmed),
+            ] {
+                let bytes = format!("\x1b]7501;state={report}:app=claude-code\x07");
+                {
+                    let mut term = view.session.as_ref().unwrap().term.lock();
+                    stream.feed(&mut term, &proxy, bytes.as_bytes());
+                }
+                while let Ok(event) = events.try_recv() {
+                    view.process_event(event, cx);
+                }
+                assert_eq!(view.runtime_task_state(), state, "{report}, verified={verified}");
+                assert_eq!(view.sidebar_activity(), badge, "{report}, verified={verified}");
+                assert_eq!(view.runtime_state_evidence().confirmed, report != "clear");
+                assert!(!view.agent_activity.hook_seen());
+            }
+        }
+    });
+}
+
 impl TerminalView {
     pub(crate) fn install_wsl_process_identity_test_fixture(&mut self, cx: &mut Context<Self>) {
         self.install_completion_test_session();

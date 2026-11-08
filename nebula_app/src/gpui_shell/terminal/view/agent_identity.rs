@@ -83,6 +83,10 @@ fn additional_binding_is_current(
 
 #[cfg(windows)]
 impl TerminalView {
+    pub(super) fn accept_pasted_wsl_command(&mut self, value: &str) -> bool {
+        self.wsl_cwd_observer.accept_pasted_command(value)
+    }
+
     /// Called only for a shell submission, before any bytes reach the PTY.
     pub(super) fn capture_native_command_boundary(&mut self) -> bool {
         let identity_changed = self.revoke_wsl_agent_identity(true);
@@ -131,6 +135,15 @@ impl TerminalView {
                 && Weak::ptr_eq(&owner.pty, &pty)
                 && owner.shell_pid == shell_pid
         })
+    }
+
+    pub(super) fn wsl_agent_state_unconfirmed(&self) -> bool {
+        self.command_running
+            && !self.command_running_disproved
+            && self.wsl_cwd_observer.expects_agent()
+            && self.wsl_identity_override.is_none()
+            && !self.agent_activity.hook_seen()
+            && self.agent_activity.status() == crate::ai_agents::AgentStatus::Unknown
     }
 
     pub(super) fn sync_wsl_agent_identity(&mut self) -> bool {
@@ -246,6 +259,14 @@ impl TerminalView {
 
 #[cfg(not(windows))]
 impl TerminalView {
+    pub(super) fn accept_pasted_wsl_command(&mut self, _value: &str) -> bool {
+        false
+    }
+
+    pub(super) fn wsl_agent_state_unconfirmed(&self) -> bool {
+        false
+    }
+
     pub(super) fn saved_wsl_agent(&self) -> Option<&crate::session::AgentSession> {
         None
     }

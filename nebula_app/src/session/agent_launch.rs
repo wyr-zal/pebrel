@@ -42,8 +42,29 @@ enum CommandWrapper {
 
 impl WslAgentLaunch {
     pub(crate) fn literal_invocation(value: &str) -> Option<Vec<String>> {
+        let value = value
+            .split_once('\n')
+            .filter(|(owner, _)| owner.starts_with("pwsh:"))
+            .map_or(value, |(_, command)| command)
+            .trim_start();
+        let value = value.strip_prefix("& ").map_or(value, str::trim_start);
         let args = command::literal_words(value)?;
         crate::shell_detect::is_wsl_launcher(args.first()?).then_some(args)
+    }
+
+    /// A literal launch request is only intent, never proof of a live Agent.
+    pub(crate) fn requested_agent(argv: &[String]) -> Option<AgentKind> {
+        if !crate::shell_detect::is_wsl_launcher(argv.first()?) {
+            return None;
+        }
+        let args = &argv[1..];
+        let at = args.iter().position(|arg| matches!(arg.as_str(), "-e" | "--exec" | "--"))?;
+        if !valid_options(&args[..at]) {
+            return None;
+        }
+        [AgentKind::Claude, AgentKind::Codex, AgentKind::Hermes]
+            .into_iter()
+            .find(|kind| command::parse(&args[at + 1..], *kind).is_some())
     }
 
     pub(crate) fn is_replayable(&self) -> bool {

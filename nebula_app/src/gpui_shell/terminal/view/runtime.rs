@@ -338,6 +338,9 @@ impl TerminalView {
     }
 
     fn task_state_uncertainty(&self) -> Option<crate::ai_agents::AgentStatusUncertainty> {
+        if self.effective_program_status().is_some() {
+            return None;
+        }
         let pane_failed = self.error.is_some()
             || self.exited.is_some()
             || matches!(self.ssh_stage.as_ref(), Some(crate::ssh_session::SshStage::Failed(_)));
@@ -347,7 +350,9 @@ impl TerminalView {
             .or_else(|| self.ai_session.as_ref().map(|identity| identity.source.as_str()))
             .and_then(crate::ai_agents::AgentKind::parse)
             .is_some();
-        (!pane_failed && known_agent).then(|| self.agent_activity.uncertainty()).flatten()
+        (!pane_failed && (known_agent || self.wsl_agent_state_unconfirmed()))
+            .then(|| self.agent_activity.uncertainty())
+            .flatten()
     }
 
     pub fn runtime_state_evidence(&self) -> crate::runtime_api::RuntimeStateEvidence {
