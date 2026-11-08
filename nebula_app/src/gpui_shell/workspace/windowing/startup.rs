@@ -99,6 +99,31 @@ pub(super) fn initial_startup(
 mod startup_tests {
     use super::*;
 
+    #[test]
+    fn an_external_folder_opens_a_new_terminal_instead_of_restoring_an_old_directory() {
+        use clap::Parser as _;
+        use nebula_settings::{RawSettings, RuntimeSettings};
+
+        let root = tempfile::Builder::new().prefix("pebrel 首次启动 ").tempdir().unwrap();
+        let invocation = crate::cli::Options::try_parse_from(["pebrel"]).unwrap();
+        for name in ["A folder", "B 目录"] {
+            let directory = root.path().join(name);
+            std::fs::create_dir(&directory).unwrap();
+            for shell_id in ["pwsh", "wsl:Ubuntu-22.04"] {
+                let settings = RuntimeSettings::from_raw(&RawSettings::from_text(&format!(
+                    "shell={shell_id}"
+                )));
+                let cwd = crate::launch_directory(&invocation, &settings, Some(directory.clone()));
+                let WorkspaceStartup::NewTerminal { cwd: Some(actual) } =
+                    initial_startup(cwd, None, false)
+                else {
+                    panic!("external directory must not restore an old workspace")
+                };
+                assert_eq!(actual, directory);
+            }
+        }
+    }
+
     #[cfg(feature = "gpui-test-support")]
     #[gpui::test]
     fn launch_visibility_reaches_the_actual_workspace(cx: &mut gpui::TestAppContext) {

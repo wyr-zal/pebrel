@@ -164,3 +164,87 @@ fn profile_directory_precedes_guest_home_but_explicit_wsl_cd_keeps_precedence() 
         );
     }
 }
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires installed PowerShell 7 and Ubuntu-22.04; uses isolated folders without a GUI"]
+fn explorer_directories_reach_real_default_shells() {
+    use clap::Parser as _;
+    use nebula_settings::{RawSettings, RuntimeSettings};
+    use std::io::Write as _;
+    use std::os::windows::process::CommandExt as _;
+    use std::process::Command;
+
+    const MARKER: &str = "PEBREL_CWD_FIXTURE=";
+
+    assert_eq!(
+        crate::platform::startup::inherited_launch_directory(),
+        std::env::current_dir().ok(),
+        "a direct launch from an external directory must capture the Windows process cwd",
+    );
+    let root = tempfile::Builder::new().prefix("pebrel 目录验证 ").tempdir().unwrap();
+    let invocation = crate::cli::Options::try_parse_from(["pebrel"]).unwrap();
+    for name in ["A folder", "B 目录"] {
+        let directory = root.path().join(name);
+        std::fs::create_dir(&directory).unwrap();
+        let expected = directory.to_str().unwrap();
+        std::fs::write(directory.join(".pebrel-cwd-fixture"), format!("{MARKER}{expected}"))
+            .unwrap();
+        for shell_id in ["pwsh", "wsl:Ubuntu-22.04"] {
+            let settings = RuntimeSettings::from_raw(&RawSettings::from_text(&format!(
+                "shell={shell_id}\nstartup_directory={}",
+                root.path().display(),
+            )));
+            let cwd = crate::launch_directory(&invocation, &settings, Some(directory.clone()));
+            let launch =
+                resolve_shell_at(settings.shell.as_deref().unwrap(), cwd.as_deref()).unwrap();
+            let TerminalLaunch::Local { shell, cwd, .. } =
+                NebulaWorkspace::terminal_launch_from_session(&launch, cwd)
+            else {
+                panic!("default shell must create a local terminal")
+            };
+            let mut options = nebula_terminal::tty::Options {
+                shell,
+                working_directory: cwd,
+                ..Default::default()
+            };
+            crate::platform::launch_directory::prepare_wsl(&mut options, None);
+            let shell = options.shell.unwrap();
+            let mut command = Command::new(shell.program());
+            if crate::platform::launch_directory::is_wsl_program(shell.program()) {
+                // Shell snapshots already quote Windows arguments for the PTY command line.
+                command.raw_arg(shell.args().join(" ")).args([
+                    "--exec",
+                    "/bin/cat",
+                    ".pebrel-cwd-fixture",
+                ]);
+            } else {
+                assert!(shell.program().to_ascii_lowercase().ends_with("pwsh.exe"));
+                let mut args = shell.args().to_vec();
+                assert_eq!(args[args.len() - 2], "-Command");
+                args.retain(|arg| !arg.eq_ignore_ascii_case("-NoExit"));
+                let startup = args.last_mut().unwrap();
+                // Keep the real integration bootstrap; append the query to its command.
+                startup.insert_str(0, "$utf8=[Text.UTF8Encoding]::new($false);[Console]::OutputEncoding=$utf8;$OutputEncoding=$utf8;");
+                startup.push_str(&format!(
+                    ";[Console]::WriteLine(\"`n{MARKER}$((Get-Location).ProviderPath)\");exit"
+                ));
+                command.args(["-NoProfile", "-NonInteractive"]).args(args);
+            }
+            if let Some(cwd) = options.working_directory {
+                command.current_dir(cwd);
+            }
+            let output = crate::platform::process_output::read_cancellable(
+                command,
+                std::time::Duration::from_secs(25),
+                64 * 1024,
+                &|| false,
+            )
+            .unwrap();
+            let output = String::from_utf8(output).unwrap();
+            let actual = output.lines().find_map(|line| line.strip_prefix(MARKER)).unwrap();
+            assert_eq!(actual, expected, "{shell_id} must enter {name}");
+            writeln!(std::io::stdout().lock(), "{shell_id} entered {expected}").unwrap();
+        }
+    }
+}

@@ -72,7 +72,7 @@ pub(super) fn copy_working_directory_item(
     source: &Entity<crate::gpui_shell::terminal::view::TerminalView>,
     cx: &App,
 ) -> PopupMenuItem {
-    let available = source.read(cx).working_directory().is_some();
+    let available = source.read(cx).current_working_directory().is_some();
     let source = source.downgrade();
     PopupMenuItem::new(
         crate::gpui_shell::config::ui_language(cx).text(Message::CommonCopyWorkingDirectory),
@@ -80,6 +80,9 @@ pub(super) fn copy_working_directory_item(
     .icon(IconName::Folder)
     .disabled(!available)
     .on_click(move |_, window, cx| {
+        if !available {
+            return;
+        }
         if let Some(source) = source.upgrade() {
             source.update(cx, |view, cx| {
                 view.copy_working_directory(window, cx);
@@ -94,13 +97,13 @@ fn file_manager_directory(
     if view.ssh_destination.is_some() {
         return None;
     }
+    let cwd = view.current_working_directory()?;
     // Nested WSL uses the observed guest location without replacing the execution cwd.
-    if let Some((distro, guest)) = view.observed_wsl_cwd() {
+    if let Some((distro, _)) = view.observed_wsl_cwd() {
         let located =
-            crate::shell_detect::WslCwd { distro: distro.to_owned(), guest: guest.to_owned() };
+            crate::shell_detect::WslCwd { distro: distro.to_owned(), guest: cwd.to_owned() };
         return crate::shell_detect::wsl_host_cwd(&located);
     }
-    let cwd = view.working_directory()?;
     // A WSL path must never fall through to the host's current drive or default distro.
     if let Some(distro) = view.exec_context.as_ref().and_then(|context| context.wsl_distribution())
     {
@@ -695,6 +698,130 @@ mod cwd_copy_tests {
                 Some("/home/用户/目录 with spaces".into())
             );
         });
+    }
+
+    #[gpui::test]
+    fn disabled_copy_menu_does_not_activate_after_the_directory_becomes_available(
+        cx: &mut TestAppContext,
+    ) {
+        let (source, window) = open_source(cx);
+        source.update(window, |view, _| view.cwd.clear());
+        window.update(|window, cx| {
+            let item = copy_working_directory_item(&source, cx);
+            let menu = PopupMenu::build(window, cx, |menu, _, _| menu.item(item));
+            menu.focus_handle(cx).focus(window, cx);
+            let probe = Root::read(window, cx).view().clone().downcast::<CwdMenuProbe>().unwrap();
+            probe.update(cx, |probe, cx| {
+                probe.menu = menu;
+                cx.notify();
+            });
+            cx.write_to_clipboard(ClipboardItem::new_string("unchanged".into()));
+            source.update(cx, |view, _| view.cwd = "/now available".into());
+        });
+        window.simulate_keystrokes("down enter");
+        window.update(|_, cx| {
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some("unchanged".into()),
+            );
+        });
+    }
+
+    #[cfg(windows)]
+    #[gpui::test]
+    fn cwd_copy_menu_tracks_observed_wsl_instead_of_the_fixed_host_directory(
+        cx: &mut TestAppContext,
+    ) {
+        let (source, window) = open_source(cx);
+        let host = tempfile::tempdir().unwrap();
+        let first = tempfile::Builder::new().prefix("A folder ").tempdir().unwrap();
+        let second = tempfile::Builder::new().prefix("B 目录 ").tempdir().unwrap();
+        source.update(window, |view, _| {
+            view.cwd = host.path().to_string_lossy().into_owned();
+            super::wsl_cwd_tests::observe(view, first.path());
+        });
+        window.update(|window, cx| {
+            let item = copy_working_directory_item(&source, cx);
+            let menu = PopupMenu::build(window, cx, |menu, _, _| menu.item(item));
+            menu.focus_handle(cx).focus(window, cx);
+            let probe = Root::read(window, cx).view().clone().downcast::<CwdMenuProbe>().unwrap();
+            probe.update(cx, |probe, cx| {
+                probe.menu = menu;
+                cx.notify();
+            });
+            source.update(cx, |view, _| {
+                super::wsl_cwd_tests::observe(view, second.path());
+                assert_eq!(file_manager_directory(view), Some(second.path().into()));
+                assert_eq!(view.local_cwd(), Some(host.path().into()));
+            });
+        });
+        window.simulate_keystrokes("down enter");
+        window.update(|_, cx| {
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some(source.read(cx).observed_wsl_cwd().unwrap().1.to_owned()),
+            );
+        });
+    }
+
+    #[cfg(windows)]
+    #[gpui::test]
+    fn observed_wsl_directory_enables_copy_without_host_directory_metadata(
+        cx: &mut TestAppContext,
+    ) {
+        let (source, window) = open_source(cx);
+        let guest = tempfile::tempdir().unwrap();
+        source.update(window, |view, _| {
+            view.cwd.clear();
+            super::wsl_cwd_tests::observe(view, guest.path());
+        });
+        window.update(|_, cx| {
+            let PopupMenuItem::Item { disabled, .. } = copy_working_directory_item(&source, cx)
+            else {
+                panic!("expected a standard menu item")
+            };
+            assert!(!disabled, "an observed guest directory must enable copying");
+        });
+    }
+
+    #[cfg(windows)]
+    #[gpui::test]
+    fn shell_cwd_reports_update_both_menu_actions_for_native_and_wsl(cx: &mut TestAppContext) {
+        let (source, window) = open_source(cx);
+        let root = tempfile::Builder::new().prefix("pebrel 菜单目录 ").tempdir().unwrap();
+        for program in ["pwsh.exe", "wsl.exe"] {
+            for name in ["A folder", "B 目录"] {
+                let directory = root.path().join(name);
+                std::fs::create_dir_all(&directory).unwrap();
+                let host = directory.to_string_lossy().replace('\\', "/");
+                let reported = if program == "wsl.exe" {
+                    format!("/mnt/{}{}", host[..1].to_ascii_lowercase(), &host[2..])
+                } else {
+                    host
+                };
+                window.update(|window, cx| {
+                    source.update(cx, |view, cx| {
+                        let options = nebula_terminal::tty::Options {
+                            shell: Some(nebula_terminal::tty::Shell::new(
+                                program.into(),
+                                vec!["-d".into(), "pebrel-test-not-default-distro".into()],
+                            )),
+                            ..Default::default()
+                        };
+                        view.exec_context =
+                            Some(crate::runtime_exec::PaneExecContext::from_pty_options(&options));
+                        view.report_directory_for_test(reported.clone(), cx);
+                        assert_eq!(file_manager_directory(view), Some(directory.clone()));
+                        assert!(view.copy_working_directory(window, cx));
+                    });
+                    assert_eq!(
+                        cx.read_from_clipboard().and_then(|item| item.text()),
+                        Some(reported),
+                        "{program} must use the current {name}",
+                    );
+                });
+            }
+        }
     }
 
     struct CwdMenuProbe {

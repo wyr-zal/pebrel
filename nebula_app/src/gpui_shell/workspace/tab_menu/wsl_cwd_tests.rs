@@ -7,7 +7,7 @@ use gpui::TestAppContext;
 use gpui_component::menu::PopupMenuItem;
 use std::path::Path;
 
-fn observe(view: &mut TerminalView, host_path: &Path) {
+pub(super) fn observe(view: &mut TerminalView, host_path: &Path) {
     let host = host_path.to_string_lossy().replace('\\', "/");
     let guest = format!("/mnt/{}{}", host[..1].to_ascii_lowercase(), &host[2..]);
     view.set_observed_wsl_location_for_test(Some(ObservedWslLocation {
@@ -91,8 +91,10 @@ fn cleared_wsl_observation_restores_the_host_directory(cx: &mut TestAppContext) 
         view.cwd = host.path().to_string_lossy().into_owned();
         observe(view, guest.path());
         assert_eq!(file_manager_directory(view), Some(guest.path().to_path_buf()));
+        assert_eq!(view.current_working_directory(), Some(view.observed_wsl_cwd().unwrap().1));
         view.set_observed_wsl_location_for_test(None);
         assert_eq!(file_manager_directory(view), Some(host.path().to_path_buf()));
+        assert_eq!(view.current_working_directory(), view.working_directory());
     });
 }
 
@@ -103,6 +105,8 @@ fn observed_wsl_directory_does_not_enable_ssh_file_manager(cx: &mut TestAppConte
     source.update(window, |view, _| {
         observe(view, guest.path());
         view.ssh_destination = Some("remote".into());
+        view.cwd = "/srv/remote project".into();
+        assert_eq!(view.current_working_directory(), Some("/srv/remote project"));
         assert_eq!(file_manager_directory(view), None);
     });
     window.update(|_, cx| {

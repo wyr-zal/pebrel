@@ -43,6 +43,16 @@ impl TerminalView {
         None
     }
 
+    /// Read the live directory for UI actions without replacing the execution cwd.
+    pub(crate) fn current_working_directory(&self) -> Option<&str> {
+        if self.ssh_destination.is_none()
+            && let Some((_, cwd)) = self.observed_wsl_cwd()
+        {
+            return Some(cwd);
+        }
+        self.working_directory()
+    }
+
     pub(crate) fn runtime_execution(&self) -> Option<crate::runtime_api::RuntimePaneExecution> {
         use crate::runtime_api::RuntimePaneExecution;
         if let Some((distro, cwd)) = self.observed_wsl_cwd() {
@@ -73,6 +83,11 @@ impl TerminalView {
         self.wsl_cwd_observer.set_observed_for_test(location);
     }
 
+    #[cfg(all(test, feature = "gpui-test-support"))]
+    pub(crate) fn report_directory_for_test(&mut self, path: String, cx: &mut gpui::Context<Self>) {
+        self.process_event(nebula_terminal::event::Event::CwdReport(path), cx);
+    }
+
     pub fn copy_working_directory(
         &self,
         window: &mut gpui::Window,
@@ -80,7 +95,7 @@ impl TerminalView {
     ) -> bool {
         use crate::i18n::Message;
 
-        let Some(path) = self.working_directory() else { return false };
+        let Some(path) = self.current_working_directory() else { return false };
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(path.to_owned()));
         crate::gpui_shell::toast::toast(
             window,

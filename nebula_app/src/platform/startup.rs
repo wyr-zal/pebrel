@@ -25,6 +25,45 @@ pub(crate) fn resident_launch_directory(
         .and_then(|path| super::launch_directory::validate(path, wsl))
 }
 
+/// Capture an external folder once; application shortcuts retain workspace restore.
+pub(crate) fn inherited_launch_directory() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{
+            GetStartupInfoW, STARTF_TITLEISAPPID, STARTF_TITLEISLINKNAME, STARTUPINFOW,
+        };
+
+        // SAFETY: the zeroed structure is writable and GetStartupInfoW initializes it.
+        let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
+        unsafe { GetStartupInfoW(&mut startup) };
+        external_launch_directory(
+            std::env::current_dir().ok(),
+            std::env::current_exe().ok(),
+            startup.dwFlags & (STARTF_TITLEISLINKNAME | STARTF_TITLEISAPPID) != 0,
+        )
+    }
+    #[cfg(not(windows))]
+    None
+}
+
+#[cfg(any(windows, test))]
+fn external_launch_directory(
+    inherited: Option<std::path::PathBuf>,
+    executable: Option<std::path::PathBuf>,
+    application_launch: bool,
+) -> Option<std::path::PathBuf> {
+    if application_launch {
+        return None;
+    }
+    let directory = inherited?;
+    let executable_directory = executable.as_deref().and_then(std::path::Path::parent);
+    let from_executable_directory = executable_directory
+        .and_then(|path| path.canonicalize().ok())
+        .zip(directory.canonicalize().ok())
+        .is_some_and(|(executable, inherited)| executable == inherited);
+    (!from_executable_directory).then_some(directory)
+}
+
 #[cfg(windows)]
 mod console;
 #[cfg(feature = "gpui-shell")]
@@ -174,6 +213,35 @@ fn startup_shortcut() -> std::io::Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn external_projects_and_application_launches_keep_distinct_directory_intents() {
+        let root = tempfile::tempdir().unwrap();
+        let application = root.path().join("Pebrel");
+        std::fs::create_dir(&application).unwrap();
+        let executable = application.join("pebrel.exe");
+        for name in ["A folder", "B 目录"] {
+            let directory = root.path().join(name);
+            std::fs::create_dir(&directory).unwrap();
+            assert_eq!(
+                super::external_launch_directory(
+                    Some(directory.clone()),
+                    Some(executable.clone()),
+                    false,
+                ),
+                Some(directory.clone()),
+            );
+            assert_eq!(
+                super::external_launch_directory(Some(directory), Some(executable.clone()), true),
+                None,
+            );
+        }
+        assert_eq!(
+            super::external_launch_directory(Some(application.join(".")), Some(executable), false),
+            None,
+        );
+        assert_eq!(super::external_launch_directory(None, None, false), None);
+    }
+
     #[test]
     fn wsl_handover_does_not_reclassify_an_inherited_host_directory_as_explicit() {
         use nebula_settings::{RawSettings, RuntimeSettings};

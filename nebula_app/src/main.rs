@@ -233,20 +233,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         // `--shell <id>`（右键菜单「在 Pebrel 中打开（Ubuntu）」用它）一路带到
         // 首个标签；缺省仍然用设置里的默认 shell。
         let shell_id = terminal_options.shell_id();
-        let requested_shell = terminal_options.command().map(Into::into).or_else(|| {
-            crate::gpui_shell::workspace::shell_launch::startup_shell(shell_id.clone())
-        });
-        let initial_cwd = terminal_options.resolved_working_directory().and_then(|path| {
-            platform::launch_directory::validate(
-                path,
-                platform::launch_directory::is_wsl(requested_shell.as_ref()),
-            )
-        });
+        let initial_cwd = launch_directory(
+            &options,
+            &nebula_settings::RuntimeSettings::load(),
+            platform::startup::inherited_launch_directory(),
+        );
         platform::startup::prepare_gui();
         let _log_file = logging::initialize(&options).expect("Unable to initialize logger");
         let requested_dir = terminal_options.resolved_working_directory();
         logging::startup_diagnostic(format!(
-            "event=launch_begin exe={:?} process_cwd={:?} explicit_cwd={:?} explicit_cwd_is_dir={} shell_override_present={} command_present={} argument_count={}",
+            "event=launch_begin exe={:?} process_cwd={:?} explicit_cwd={:?} explicit_cwd_is_dir={} shell_override_present={} command_present={} argument_count={} initial_cwd={:?}",
             env::current_exe().ok(),
             env::current_dir().ok(),
             requested_dir.as_deref(),
@@ -254,6 +250,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             shell_id.is_some(),
             terminal_options.command().is_some(),
             env::args_os().len().saturating_sub(1),
+            initial_cwd.as_deref(),
         ));
         // 显式点名的 shell 解析不了就别开窗：悄悄换回默认 shell 是这条路径最该
         // 避免的失败（用户点的是 Ubuntu，拿到的却是 PowerShell）。校验排在交接
@@ -266,7 +263,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Err(error.into());
         }
         #[cfg(windows)]
-        if try_hand_over_to_resident(&options) {
+        if try_hand_over_to_resident(&options, initial_cwd.clone()) {
             return Ok(());
         }
         // The first WSL pane spawns before any guest could answer; ask its guest
@@ -418,7 +415,7 @@ fn nebula(mut options: Options) -> Result<(), Box<dyn Error>> {
     // PTYs never stopped) or focuses its window. Explicit intent (-e,
     // --daemon) always starts a real instance.
     #[cfg(windows)]
-    if try_hand_over_to_resident(&options) {
+    if try_hand_over_to_resident(&options, None) {
         return Ok(());
     }
     boot_trace("mux probe done");
@@ -587,7 +584,7 @@ fn wants_gpui_shell(options: &Options) -> bool {
 /// Windows 单实例交接：普通启动或带工作目录、无 `-e` 时，先 ATTACH 到
 /// 驻留进程，再 `tab.new`。GPUI 与 winit 共用，避免第二份进程无声退出。
 #[cfg(windows)]
-fn try_hand_over_to_resident(options: &Options) -> bool {
+fn try_hand_over_to_resident(options: &Options, launch_dir: Option<std::path::PathBuf>) -> bool {
     if platform::elevation::requires_isolation() {
         logging::startup_diagnostic("event=handover_decision result=standalone reason=elevated");
         return false;
@@ -604,7 +601,7 @@ fn try_hand_over_to_resident(options: &Options) -> bool {
     }
     let shell_id = terminal_options.shell_id();
     let settings = nebula_settings::RuntimeSettings::load();
-    let launch_dir = resident_launch_directory(terminal_options, &settings);
+    let launch_dir = launch_dir.or_else(|| resident_launch_directory(terminal_options, &settings));
     logging::startup_diagnostic(format!(
         "event=handover_plan behavior={} cwd={:?} shell_override_present={}",
         settings.windowing_behavior.settings_value(),
@@ -658,11 +655,42 @@ fn resident_launch_directory(
     )
 }
 
+/// Cold startup and handover share this invocation's explicitly selected folder.
+fn launch_directory(
+    options: &Options,
+    settings: &nebula_settings::RuntimeSettings,
+    inherited: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    let terminal_options = &options.window_options.terminal_options;
+    let inherited =
+        if options.launched_at_login || options.daemon || terminal_options.command().is_some() {
+            None
+        } else {
+            inherited
+        };
+    let directory = terminal_options.resolved_working_directory().or(inherited)?;
+    let mut request = terminal_options.clone();
+    request.working_directory = Some(directory);
+    resident_launch_directory(&request, settings)
+}
+
 #[cfg(test)]
 mod resident_launch_tests {
     use super::*;
     use clap::Parser as _;
     use nebula_settings::{RawSettings, RuntimeSettings};
+
+    #[test]
+    fn explorer_bare_launch_keeps_the_current_folder_with_default_wsl() {
+        let settings = RuntimeSettings::from_raw(&RawSettings::from_text(
+            "shell=wsl:Ubuntu-22.04\nstartup_directory=",
+        ));
+        let options = Options::try_parse_from(["pebrel"]).unwrap();
+        assert_eq!(
+            launch_directory(&options, &settings, std::env::current_dir().ok()),
+            Some(std::env::current_dir().unwrap()),
+        );
+    }
 
     #[test]
     fn ordinary_resident_launch_honors_the_configured_directory() {
@@ -713,6 +741,87 @@ mod resident_launch_tests {
                 Some(std::env::current_dir().unwrap()),
             );
         }
+    }
+
+    #[test]
+    fn external_folders_are_selected_for_both_default_terminal_types() {
+        let root = tempfile::Builder::new().prefix("pebrel 外部启动 ").tempdir().unwrap();
+        let options = Options::try_parse_from(["pebrel"]).unwrap();
+        for name in ["A folder", "B 目录"] {
+            let directory = root.path().join(name);
+            std::fs::create_dir(&directory).unwrap();
+            for shell in ["pwsh", "wsl:Ubuntu-22.04"] {
+                let settings = RuntimeSettings::from_raw(&RawSettings::from_text(&format!(
+                    "shell={shell}\nstartup_directory={}",
+                    root.path().display(),
+                )));
+                assert_eq!(
+                    launch_directory(&options, &settings, Some(directory.clone())),
+                    Some(directory.clone()),
+                    "default shell {shell} must retain {name}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_cli_directory_keeps_priority_over_the_external_folder() {
+        let inherited = tempfile::tempdir().unwrap();
+        let configured = tempfile::tempdir().unwrap();
+        for shell in ["pwsh", "wsl:Ubuntu-22.04"] {
+            let settings = RuntimeSettings::from_raw(&RawSettings::from_text(&format!(
+                "shell={shell}\nstartup_directory={}",
+                configured.path().display(),
+            )));
+            for arguments in [vec!["pebrel", "--working-directory", "."], vec!["pebrel", "."]] {
+                let options = Options::try_parse_from(arguments).unwrap();
+                assert_eq!(
+                    launch_directory(&options, &settings, Some(inherited.path().into())),
+                    Some(std::env::current_dir().unwrap()),
+                );
+            }
+            let mut options = Options::try_parse_from(["pebrel"]).unwrap();
+            options.window_options.terminal_options.working_directory =
+                Some(configured.path().join("missing"));
+            assert_eq!(launch_directory(&options, &settings, Some(inherited.path().into())), None);
+        }
+    }
+
+    #[test]
+    fn login_daemon_and_command_launches_keep_their_original_directory_intent() {
+        let inherited = tempfile::tempdir().unwrap();
+        let explicit = tempfile::tempdir().unwrap();
+        let settings = RuntimeSettings::from_raw(&RawSettings::from_text(&format!(
+            "shell=wsl:Ubuntu-22.04\nstartup_directory={}",
+            inherited.path().display(),
+        )));
+        for arguments in [
+            vec!["pebrel", "--launched-at-login"],
+            vec!["pebrel", "--daemon"],
+            vec!["pebrel", "-e", "cmd.exe", "/C", "echo", "fixture"],
+        ] {
+            let options = Options::try_parse_from(arguments.iter().copied()).unwrap();
+            assert_eq!(launch_directory(&options, &settings, Some(inherited.path().into())), None);
+            let mut options = options;
+            options.window_options.terminal_options.working_directory =
+                Some(explicit.path().into());
+            assert_eq!(
+                launch_directory(&options, &settings, Some(inherited.path().into())),
+                Some(explicit.path().into()),
+            );
+        }
+    }
+
+    #[test]
+    fn absence_of_external_directory_context_keeps_cold_restore_intent() {
+        let configured = tempfile::tempdir().unwrap();
+        let mut settings = RuntimeSettings::from_raw(&RawSettings::default());
+        settings.startup_directory = Some(configured.path().to_string_lossy().into_owned());
+        let options = Options::try_parse_from(["pebrel"]).unwrap();
+        assert_eq!(launch_directory(&options, &settings, None), None);
+        let mut options = options;
+        options.window_options.terminal_options.working_directory = Some(configured.path().into());
+        assert_eq!(launch_directory(&options, &settings, None), Some(configured.path().into()));
     }
 }
 
