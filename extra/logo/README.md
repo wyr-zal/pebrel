@@ -92,6 +92,36 @@ by Git and are not required by the asset tests.
 
 ## Third-Party Logo Assets
 
+### Runtime vectors and lossless compression (2026-10-19)
+
+AI logos now embed SVGZ instead of large PNG originals. The SVGZ payload is
+byte-for-byte gzip compression of its adjacent SVG source (`compresslevel=9`,
+`mtime=0`); geometry, colors and numeric precision are unchanged. Runtime SVG
+rasterization uses the existing resvg 0.46.0 dependency at the requested physical
+size, followed by the shared optical centering and theme tint policy. Rasterized
+textures retain the existing per-size/theme cache ownership. PNG originals below
+are retained only as historical test references, not product binary resources.
+
+New provider marks reuse CC Switch revision
+`adc223af322adaeca878e82bf78323865b0db768`, `src/icons/extracted/` (MIT;
+`licenses/cc-switch-MIT.txt`). Existing OpenAI, Claude, Kimi and Agent vectors
+keep their original sources. Antigravity now uses the official full-color SVG:
+https://antigravity.google/assets/image/brand/antigravity-icon__full-color.svg
+
+Regenerate each adjacent SVGZ with Python's standard library:
+
+```python
+import gzip
+from pathlib import Path
+sources = list(Path("extra/logo").glob("ai_*.svg"))
+sources += list(Path("nebula_app/assets/icons").glob("nebula-agent-*.svg"))
+sources += list(Path("nebula_app/assets/icons").glob("nebula-provider-*.svg"))
+for source in sources:
+    source.with_suffix(".svgz").write_bytes(
+        gzip.compress(source.read_bytes(), compresslevel=9, mtime=0)
+    )
+```
+
 ### Agents settings vectors
 
 The Agents settings page renders 24 logical pixel SVG marks rather than enlarging
@@ -119,6 +149,30 @@ Only the unused title, CSS sizing attributes and explicit closing path tags were
 removed. The viewBox and path geometry are unchanged. The two embedded SVGs total
 2,393 bytes; the other settings icons reuse the sidebar's existing small textures.
 These marks identify the installed tools and do not imply endorsement.
+
+### Qoder, Qwen Code, CodeBuddy, Antigravity, Droid and Hermes settings icons
+
+The Agents settings page preserves the source colors through the shared background
+texture cache. Qoder and Qwen Code use `ai_qoder.svg` and `ai_qwen.svg`, retrieved
+unchanged on 2026-10-31 from `@lobehub/icons-static-svg` 1.95.0:
+
+- https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@1.95.0/icons/qoder-color.svg
+- https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@1.95.0/icons/qwen-color.svg
+- License: [MIT](LICENSE-lobe-icons), copyright LobeHub.
+
+CodeBuddy and Antigravity reuse `ai_codebuddy.svg` and `ai_antigravity.svg`, with
+sources and notices below. Their monochrome `nebula-agent-*.svg` assets remain
+available for mask-based controls. The Qoder/Qwen monochrome assets came from the
+same package (`icons/{qoder,qwen}.svg`) on 2026-10-07.
+
+Droid uses `ai_droid.svg`, retrieved unchanged from Factory's official
+https://factory.ai/favicon.svg on 2026-10-31 (also served by
+https://docs.factory.ai/favicon.svg). The official mark is black and white.
+Hermes reuses `nebula_app/assets/icons/nebula-agent-hermes.svg`, including its
+white background and black illustration. Both retain their source artwork rather
+than rendering the opaque background as a single-color mask. These marks identify
+the installed products and do not imply endorsement; trademarks remain with their
+owners. The matching `.svgz` files are lossless gzip copies with timestamp zero.
 
 ### Claude Code and Trae CLI
 
@@ -234,3 +288,21 @@ does not make the logo an open-source asset or imply endorsement. The icon is
 used to identify running `antigravity`, `antigravity-cli` and `agy` processes.
 Both UI shells keep its original colors on light and dark themes and resize it
 only for rendering. No LobeHub asset is embedded for Antigravity.
+
+## Sponsor Logos
+
+### AIAPI
+
+`sponsor_aiapi.png` is the unmodified 2400 x 893 PNG supplied and selected by the
+maintainer for AIAPI sponsorship. Its off-white background, dark brown wordmark,
+letterforms and aspect ratio are preserved. The asset appears first in both
+README sponsor sections and in the application's Sponsors page, linking to
+https://cn.aiapi.bot/invite?code=MCYLZ5H6FR. It is resized only when displayed.
+
+### Sidrune AI
+
+`sponsor_sidrune.png` is based on the 2219 x 558 transparent PNG supplied by the
+maintainer for the Sidrune AI sponsor rename. The black artwork is composited onto
+a white background so it remains visible in both light and dark README themes;
+its dimensions and artwork are otherwise unchanged. The asset is used in the
+English and Simplified Chinese README sponsor sections.

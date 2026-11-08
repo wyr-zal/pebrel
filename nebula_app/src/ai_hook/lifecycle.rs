@@ -9,7 +9,12 @@ use crate::ai_agents::{
     AgentKind, AgentStatus, AgentStatusSource, AgentStatusUncertainty, Detection,
 };
 
+use super::protocol::claude_style;
 use super::{AiHookEvent, AiHookKind};
+
+/// A stop from these sources proves nothing about the answer unless it carries a result, so
+/// an unclassified one returns the pane to idle instead of announcing completion.
+const UNPROVEN_STOP: [&str; 5] = ["pi", "omp", "cursor", "copilot", "antigravity"];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum HookCoverage {
@@ -74,7 +79,14 @@ pub(crate) struct AgentActivity {
     uncertainty: Option<AgentStatusUncertainty>,
     coverage: HookCoverage,
     owner: Option<Owner>,
+    /// Screen-only idle confirmation and remote renewed-work confirmation
+    /// have separate counters; neither can complete a Hook-owned turn.
     idle_samples: u8,
+    working_samples: u8,
+    unmatched_samples: u8,
+    /// Only a preceding Working state may survive a screen form's expiry.
+    screen_blocked_fallback: Option<(AgentStatusSource, Option<String>)>,
+    screen_blocked_agent: Option<AgentKind>,
     turn_observed: bool,
     pending_submit: bool,
     pending_hook_prompt: bool,
@@ -85,9 +97,9 @@ pub(crate) struct AgentActivity {
     verified_foreground: bool,
     native_codex: bool,
     turn_id: Option<String>,
-    /// Retain every Claude prompt identity for the current native session so
+    /// Retain every Claude-style prompt identity for the current native session so
     /// a delayed Hook cannot become valid after later turns replace `turn_id`.
-    claude_prompt_ids: HashSet<String>,
+    claude_style_prompt_ids: HashSet<String>,
     /// Reject Claude events that entered a queue before the most recent input.
     submit_receive_sequence: u64,
     last_remote_sequence: Option<u64>,
@@ -98,6 +110,7 @@ pub(crate) struct AgentActivity {
     retired_codex_failure: Option<CodexFailureTarget>,
     retired_codex_idle: Option<CodexFailureTarget>,
     codex_input_pending: bool,
+    last_activity_at: Option<std::time::Instant>,
 }
 
 impl Default for AgentActivity {
@@ -110,6 +123,10 @@ impl Default for AgentActivity {
             coverage: HookCoverage::None,
             owner: None,
             idle_samples: 0,
+            working_samples: 0,
+            unmatched_samples: 0,
+            screen_blocked_fallback: None,
+            screen_blocked_agent: None,
             turn_observed: false,
             pending_submit: false,
             pending_hook_prompt: false,
@@ -118,7 +135,7 @@ impl Default for AgentActivity {
             verified_foreground: false,
             native_codex: false,
             turn_id: None,
-            claude_prompt_ids: HashSet::new(),
+            claude_style_prompt_ids: HashSet::new(),
             submit_receive_sequence: 0,
             last_remote_sequence: None,
             compaction: None,
@@ -128,6 +145,7 @@ impl Default for AgentActivity {
             retired_codex_failure: None,
             retired_codex_idle: None,
             codex_input_pending: false,
+            last_activity_at: None,
         }
     }
 }
@@ -312,14 +330,20 @@ impl AgentActivity {
     /// A concrete runtime submission or accepted confirmation starts work. The
     /// previous input frame must not manufacture a completion before work starts.
     pub fn submitted(&mut self) {
+        self.last_activity_at = Some(std::time::Instant::now());
         self.end_compaction();
         self.status = AgentStatus::Working;
         self.source = AgentStatusSource::Process;
         self.rule = None;
+        self.screen_blocked_fallback = None;
+        self.screen_blocked_agent = None;
         self.turn_observed = true;
         self.pending_submit = true;
-        self.pending_hook_prompt =
-            self.native_codex || self.owner.as_ref().is_some_and(|owner| owner.source == "claude");
+        self.pending_hook_prompt = self.native_codex
+            || self
+                .owner
+                .as_ref()
+                .is_some_and(|owner| super::capabilities_for(&owner.source).needs_input_fence());
         self.input_sent();
     }
 
@@ -346,16 +370,26 @@ impl AgentActivity {
         self.codex_input_pending |= self.native_codex && self.turn_id.is_some();
         self.cancel_requested = false;
         self.screen_armed = true;
+        self.reset_screen_samples();
+    }
+
+    /// An unavailable or unidentified snapshot interrupts consecutive evidence
+    /// without revoking a state. Only a known agent's real snapshot can do that.
+    pub fn reset_screen_samples(&mut self) {
         self.idle_samples = 0;
+        self.unmatched_samples = 0;
+        self.working_samples = 0;
         self.mark_status_unconfirmed(AgentStatusUncertainty::PendingInput);
     }
 
     /// Check ownership before the ordering gate records this event. An ignored
     /// legacy notification must not reopen the gate's already completed stream.
     pub fn accepts_hook(&self, event: &AiHookEvent) -> bool {
-        // Claude has no provider sequence. This ingress fence keeps raw Hooks
-        // queued before a new input from being reinterpreted after that input.
-        if event.source == "claude" && event.received_sequence < self.submit_receive_sequence {
+        // Unordered lifecycle callbacks queued before input cannot be
+        // reinterpreted as observations about the newly submitted turn.
+        if (event.capabilities().needs_input_fence() || event.source == "codex")
+            && event.received_sequence < self.submit_receive_sequence
+        {
             return false;
         }
         if self.command_ended
@@ -375,12 +409,12 @@ impl AgentActivity {
         if self.native_codex && event.source == "codex" && event.codex_hooks.is_none() {
             return false;
         }
-        if event.source == "claude"
+        if claude_style(&event.source)
             && event.kind == AiHookKind::PromptSubmit
             && event
                 .turn_id
                 .as_deref()
-                .is_some_and(|turn_id| self.claude_prompt_ids.contains(turn_id))
+                .is_some_and(|turn_id| self.claude_style_prompt_ids.contains(turn_id))
         {
             return false;
         }
@@ -402,7 +436,12 @@ impl AgentActivity {
             let new_prompt = event.kind == AiHookKind::PromptSubmit
                 && (self.turn_id.is_none()
                     || event.turn_id.is_some() && event.turn_id != self.turn_id);
-            if !new_session && !new_prompt {
+            // Antigravity's installed PreInvocation is normalized as a tool
+            // edge: it has no prompt callback. A fresh invocation acknowledges
+            // input, while an old queued edge was rejected by the ingress fence.
+            let new_invocation =
+                event.source == "antigravity" && event.kind == AiHookKind::ToolComplete;
+            if !new_session && !new_prompt && !new_invocation {
                 return false;
             }
         }
@@ -457,7 +496,7 @@ impl AgentActivity {
         }
         let active_turn = self.compaction.as_ref().map_or(&self.turn_id, |phase| &phase.prompt_id);
         if (event.codex_hooks.is_some()
-            || event.source == "claude"
+            || claude_style(&event.source)
                 && matches!(
                     event.kind,
                     AiHookKind::TurnDone | AiHookKind::NeedsAttention | AiHookKind::ToolComplete
@@ -474,7 +513,7 @@ impl AgentActivity {
         // the explicit failure that auto-continue already observed.
         if event.kind == AiHookKind::TurnDone
             && (self.status == AgentStatus::Done
-                || event.source == "claude"
+                || claude_style(&event.source)
                     && matches!(self.status, AgentStatus::Idle | AgentStatus::Failed))
             && event.turn_id.is_some()
             && event.turn_id == self.turn_id
@@ -528,7 +567,7 @@ impl AgentActivity {
     }
 
     fn accepts_compaction(&self, event: &AiHookEvent) -> bool {
-        if event.source != "claude" {
+        if !claude_style(&event.source) {
             return true;
         }
         if event.kind == AiHookKind::CompactionStart {
@@ -672,20 +711,20 @@ impl AgentActivity {
             self.codex_input_pending = false;
             self.retired_codex_idle = None;
         }
-        if event.source == "claude"
+        if claude_style(&event.source)
             && event.kind == AiHookKind::SessionStart
             && !event.session_compacted
             && event.session_id.as_ref().is_some_and(|session_id| {
                 self.owner.as_ref().and_then(|owner| owner.session.as_ref()) != Some(session_id)
             })
         {
-            self.claude_prompt_ids.clear();
+            self.claude_style_prompt_ids.clear();
         }
-        if event.source == "claude"
+        if claude_style(&event.source)
             && event.kind == AiHookKind::PromptSubmit
             && let Some(turn_id) = event.turn_id.as_ref()
         {
-            self.claude_prompt_ids.insert(turn_id.clone());
+            self.claude_style_prompt_ids.insert(turn_id.clone());
         }
         self.record_owner(event);
         if matches!(
@@ -731,6 +770,9 @@ impl AgentActivity {
             HookCoverage::Completion
         };
         self.coverage = coverage;
+        self.screen_blocked_fallback = None;
+        self.screen_blocked_agent = None;
+        self.unmatched_samples = 0;
         self.source = AgentStatusSource::Hook;
         self.confirm_status();
         self.rule = None;
@@ -784,7 +826,7 @@ impl AgentActivity {
                 ) {
                     AgentStatus::Failed
                 } else if event.turn_outcome == super::AiTurnOutcome::Cancelled
-                    || (matches!(event.source.as_str(), "pi" | "omp" | "cursor" | "copilot")
+                    || (UNPROVEN_STOP.contains(&event.source.as_str())
                         && event.turn_outcome == super::AiTurnOutcome::Unknown)
                 {
                     AgentStatus::Idle
@@ -795,6 +837,7 @@ impl AgentActivity {
             AiHookKind::NeedsAttention => AgentStatus::Blocked,
             AiHookKind::SessionEnd => unreachable!("handled above"),
         };
+        self.last_activity_at = Some(std::time::Instant::now());
         true
     }
 
@@ -806,11 +849,33 @@ impl AgentActivity {
         }
         let Some(detection) = detection else {
             self.idle_samples = 0;
+            if self.source == AgentStatusSource::Screen
+                && self.status == AgentStatus::Blocked
+                && self.screen_blocked_agent != Some(AgentKind::Codex)
+            {
+                self.unmatched_samples = self.unmatched_samples.saturating_add(1);
+                if self.unmatched_samples < 2 {
+                    return false;
+                }
+                self.unmatched_samples = 0;
+                if let Some((source, rule)) = self.screen_blocked_fallback.take() {
+                    self.status = AgentStatus::Working;
+                    self.source = source;
+                    self.rule = rule;
+                } else {
+                    self.status = AgentStatus::Unknown;
+                    self.source = AgentStatusSource::Unknown;
+                    self.rule = None;
+                }
+                self.confirm_status();
+                return true;
+            }
             if !self.hook_seen() && self.status != AgentStatus::Failed {
                 return self.mark_status_unconfirmed(AgentStatusUncertainty::ScreenAmbiguous);
             }
             return false;
         };
+        self.unmatched_samples = 0;
         let next = match detection.status {
             AgentStatus::Idle => {
                 if detection.agent == AgentKind::Codex {
@@ -886,11 +951,66 @@ impl AgentActivity {
         if next == self.status && self.uncertainty.is_none() {
             return false;
         }
+        self.screen_blocked_fallback =
+            if next == AgentStatus::Blocked && self.status == AgentStatus::Working {
+                Some((self.source, self.rule.take()))
+            } else {
+                None
+            };
+        self.screen_blocked_agent = (next == AgentStatus::Blocked).then_some(detection.agent);
         self.status = next;
         self.confirm_status();
         self.source = AgentStatusSource::Screen;
         self.rule = Some(detection.rule_id);
         true
+    }
+
+    /// Whether the latest explicit submission or accepted hook has been quiet
+    /// for `threshold`. Screen samples, plain Enter and rejected hooks do not
+    /// move this boundary. The caller separately requires hook ownership.
+    pub fn turn_quiet_for(&self, threshold: std::time::Duration) -> bool {
+        self.last_activity_at.is_none_or(|at| at.elapsed() >= threshold)
+    }
+
+    /// A stalled remote screen may reveal renewed work, but cannot prove completion.
+    /// Keep the explicit submission barrier and Hook owner until authoritative evidence.
+    pub fn reconcile_stalled_turn(&mut self, detection: Option<&Detection>, stalled: bool) -> bool {
+        if self.allows_screen()
+            || !stalled
+            || self.pending_submit
+            || self.cancel_requested
+            || self.turn_cancelled
+        {
+            self.working_samples = 0;
+            return false;
+        }
+        let Some(detection) = detection else {
+            self.working_samples = 0;
+            return false;
+        };
+        if detection.status != AgentStatus::Working {
+            self.working_samples = 0;
+            return false;
+        }
+        self.working_samples = self.working_samples.saturating_add(1);
+        if self.working_samples < 2 || self.status == AgentStatus::Working {
+            return false;
+        }
+        self.turn_observed = true;
+        self.status = AgentStatus::Working;
+        self.confirm_status();
+        self.source = AgentStatusSource::Screen;
+        self.rule = Some(detection.rule_id.clone());
+        self.working_samples = 0;
+        true
+    }
+
+    /// Backdate the latest submission/hook boundary without sleeping in tests.
+    #[cfg(test)]
+    pub(crate) fn backdate_activity_for_test(&mut self, back: std::time::Duration) {
+        if let Some(at) = &mut self.last_activity_at {
+            *at = std::time::Instant::now().checked_sub(back).unwrap_or(std::time::Instant::now());
+        }
     }
 }
 

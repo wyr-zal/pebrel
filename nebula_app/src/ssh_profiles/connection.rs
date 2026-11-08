@@ -57,6 +57,18 @@ impl SshConnectionOptions {
     }
 
     pub fn validate(&self, destination: &str) -> Result<(), String> {
+        if destination.starts_with(crate::serial_session::SCHEME) {
+            destination
+                .parse::<crate::serial_session::SerialConfig>()
+                .map_err(|e| e.to_string())?;
+            return if self.is_default() {
+                Ok(())
+            } else {
+                Err(crate::i18n::UiLanguage::EnUs
+                    .text(crate::i18n::Message::TerminalSerialSshOptions)
+                    .to_owned())
+            };
+        }
         validate_ssh_destination(destination)?;
         if self.has_custom_proxy() {
             validate_host(&self.normalized_proxy_host()).map_err(|_| {
@@ -117,6 +129,16 @@ impl SshConnectionOptions {
     }
 }
 
+pub(super) fn valid_ssh_username(username: &str) -> bool {
+    !username.starts_with('-')
+        && !username.split('@').any(str::is_empty)
+        && !username.chars().any(|character| {
+            character.is_whitespace()
+                || character.is_control()
+                || ":/[],;&|<>\"'`\\?#".contains(character)
+        })
+}
+
 pub(crate) fn validate_ssh_destination(value: &str) -> Result<(), String> {
     let value = value.trim();
     if value.is_empty()
@@ -133,7 +155,10 @@ pub(crate) fn validate_ssh_destination(value: &str) -> Result<(), String> {
         return Err("SSH 地址不能以选项前缀开头".to_owned());
     }
     let host_port = if let Some((username, host)) = address.rsplit_once('@') {
-        if username.is_empty() || username.contains(['@', ':', '/', '[', ']']) {
+        // JumpServer encodes the target account in the SSH username (for
+        // example, jumpserverUser@root). The last @ separates the host, just
+        // as it does in SshDestination::parse; empty components remain invalid.
+        if !valid_ssh_username(username) {
             return Err("SSH 用户名无效".to_owned());
         }
         host

@@ -1,4 +1,5 @@
 use super::*;
+use crate::{gpui_shell::widgets::toolbar_button, i18n::Message};
 
 fn title_bar_height(_density: nebula_settings::DensityName) -> f32 {
     // Content density must not compress the application chrome.
@@ -23,14 +24,19 @@ impl TitleBarBackground {
         self.0.set(Some(bounds));
     }
 
-    fn element(&self) -> gpui::Canvas<()> {
+    fn element(&self, top_tabs: bool) -> gpui::Canvas<()> {
         let pane_bounds = self.0.clone();
         canvas(
             |_, _, _| (),
             move |bounds, _, window, cx| {
                 let card = crate::gpui_shell::theme::PaneCardStyle::current(cx);
                 let shell = cx.theme().background;
-                let Some(pane) = pane_bounds.get().filter(|_| card.radius == 0.0) else {
+                let tabs = crate::gpui_shell::theme::tab_bar_background(cx);
+                if top_tabs && crate::gpui_shell::wallpaper::tab_bar_material_is_custom(cx) {
+                    window.paint_quad(fill(bounds, tabs));
+                    return;
+                }
+                let Some(pane) = pane_bounds.get() else {
                     window.paint_quad(fill(bounds, shell));
                     return;
                 };
@@ -38,12 +44,16 @@ impl TitleBarBackground {
                 let title_right = title_left + f32::from(bounds.size.width);
                 let pane_left = f32::from(pane.origin.x).clamp(title_left, title_right);
                 let pane_right = f32::from(pane.right()).clamp(pane_left, title_right);
-                let content = crate::gpui_shell::theme::card_content_bg(cx);
+                let content = if card.radius == 0.0 {
+                    crate::gpui_shell::theme::card_content_bg(cx)
+                } else {
+                    shell
+                };
 
                 // Adjacent bands receive alpha once. The actual pane bounds also
                 // account for a hidden sidebar and an open file tree.
                 for (left, right, color) in [
-                    (title_left, pane_left, shell),
+                    (title_left, pane_left, tabs),
                     (pane_left, pane_right, content),
                     (pane_right, title_right, shell),
                 ] {
@@ -96,7 +106,35 @@ fn title_bar_frame() -> gpui::Div {
     })
 }
 
+/// 标题栏右侧工具组；右缘留白由平台层决定（见 `RIGHT_CONTROLS_INSET`）。
+pub(super) fn title_bar_right_controls() -> gpui::Div {
+    title_bar_panel_controls()
+        .gap(px(8.0))
+        .pr(px(crate::platform::window_chrome::RIGHT_CONTROLS_INSET))
+}
+
 impl NebulaWorkspace {
+    pub(super) fn render_terminal_find_button(
+        &self,
+        settings_active: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui_component::button::Button {
+        let language = crate::gpui_shell::config::ui_language(cx);
+        let disabled = settings_active
+            || self.tabs.get(self.active).and_then(WorkspaceTab::focused_view).is_none();
+        toolbar_button("terminal-find", IconName::Search, disabled)
+            .debug_selector(|| "terminal-find".to_owned())
+            .aria_label(language.text(Message::TerminalReadingOpen))
+            .tooltip(language.text(Message::TerminalReadingShortcut))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.run_workspace_palette_action(
+                    WorkspacePaletteAction::TerminalReading { commands: false },
+                    window,
+                    cx,
+                );
+            }))
+    }
+
     pub(super) fn render_window_title_bar(
         &self,
         settings_active: bool,
@@ -107,8 +145,25 @@ impl NebulaWorkspace {
         let native_layout = crate::platform::window_chrome::layout(window);
         let title_bar_height = effective_title_bar_height(self.density, native_layout);
         let bar = TitleBar::new()
+            .on_close_window(cx.listener(|workspace, _, window, cx| {
+                // Linux 的客户端标题栏默认直接销毁窗口；必须复用系统关窗的会话与文档守卫。
+                if workspace.should_close_window(window, cx) {
+                    window.remove_window();
+                }
+            }))
             .h(px(title_bar_height))
-            .when(!settings_active, |bar| bar.bg(gpui::transparent_black()).border_b_0())
+            .when(!settings_active, |bar| {
+                // Explicit tab surfaces are painted once by TitleBarBackground.
+                // Keep the pre-existing native-wallpaper path for inherited mode.
+                let fill = if crate::gpui_shell::wallpaper::native_underlay_active(cx)
+                    && !crate::gpui_shell::wallpaper::tab_bar_material_is_custom(cx)
+                {
+                    cx.theme().title_bar
+                } else {
+                    gpui::transparent_black()
+                };
+                bar.bg(fill).border_b_0()
+            })
             .when(settings_active, |bar| {
                 bar.border_b_1().border_color(crate::gpui_shell::theme::settings_hairline(cx))
             })
@@ -124,7 +179,7 @@ impl NebulaWorkspace {
 
         title_bar_frame()
             .debug_selector(|| "workspace-titlebar".to_owned())
-            .when(!settings_active, |title| title.child(self.titlebar_background.element()))
+            .when(!settings_active, |title| title.child(self.titlebar_background.element(top_tabs)))
             .child(bar)
     }
 }
@@ -137,6 +192,50 @@ mod tests {
         Root, WindowExt,
         text::{TextView, TextViewState},
     };
+
+    #[gpui::test]
+    fn terminal_find_precedes_command_manager_in_both_tab_layouts(cx: &mut TestAppContext) {
+        use crate::gpui_shell::workspace::windowing;
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::gpui_shell::scientific_render::init(cx);
+            super::super::init(cx);
+            windowing::initialize(cx, crate::runtime_api::RuntimeHub::new());
+        });
+        let mut workspace = None;
+        let (_, window) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| {
+                NebulaWorkspace::new(
+                    window,
+                    None,
+                    None,
+                    1,
+                    crate::runtime_api::RuntimeHub::new(),
+                    windowing::WorkspaceStartup::Empty,
+                    windowing::WindowRole::Regular,
+                    cx,
+                )
+            });
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        window.simulate_resize(gpui::size(px(1200.0), px(800.0)));
+        for position in
+            [nebula_settings::TabsPositionName::Sidebar, nebula_settings::TabsPositionName::Top]
+        {
+            window.update(|window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.tabs_position = position;
+                    cx.notify();
+                });
+                window.draw(cx).clear(cx);
+            });
+            let find = window.debug_bounds("terminal-find").unwrap();
+            let commands = window.debug_bounds("command-manager-toggle").unwrap();
+            assert!(find.right() < commands.left(), "{position:?}");
+        }
+    }
 
     struct DocumentWindow(Entity<TextViewState>);
 

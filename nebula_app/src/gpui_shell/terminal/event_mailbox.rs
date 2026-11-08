@@ -1,4 +1,4 @@
-//! Coalesce repaint wakeups before enqueueing; retain every semantic event.
+//! Coalesce repaint/status invalidations; retain every hook and shell edge.
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +33,7 @@ impl From<Event> for SessionEvent {
 pub(super) struct EventSender {
     sender: mpsc::UnboundedSender<QueuedEvent>,
     wake_pending: Arc<AtomicBool>,
+    status_pending: Arc<AtomicBool>,
     pub(super) native_prompt: NativePromptState,
 }
 
@@ -50,28 +51,46 @@ pub(super) struct NativePrompt {
 pub(super) struct EventReceiver {
     receiver: mpsc::UnboundedReceiver<QueuedEvent>,
     wake_pending: Arc<AtomicBool>,
+    status_pending: Arc<AtomicBool>,
 }
 
 pub(super) fn channel() -> (EventSender, EventReceiver) {
     let (sender, receiver) = mpsc::unbounded();
     let wake_pending = Arc::new(AtomicBool::new(false));
+    let status_pending = Arc::new(AtomicBool::new(false));
     (
         EventSender {
             sender,
             wake_pending: wake_pending.clone(),
+            status_pending: status_pending.clone(),
             native_prompt: NativePromptState::default(),
         },
-        EventReceiver { receiver, wake_pending },
+        EventReceiver { receiver, wake_pending, status_pending },
     )
 }
 
-/// Editing a CMD input line does not invalidate a prompt already received from
+/// Editing a native input line does not invalidate a prompt already received from
 /// the PTY. Submission and unknown control sequences remain conservative.
 pub(super) fn preserves_native_prompt(mut bytes: &[u8]) -> bool {
     let editing_control = |value| {
-        matches!(value, 1 | 2 | 5 | 6 | 8 | 9 | 11 | 12 | 14 | 16 | 18 | 21 | 23 | 25 | 27 | 127)
+        matches!(
+            value,
+            1 | 2 | 5 | 6 | 8 | 9 | 11 | 12 | 14 | 16 | 18 | 21 | 23 | 25 | 27 | 31 | 127
+        )
     };
     while let Some((&byte, rest)) = bytes.split_first() {
+        if let Some(paste) = bytes.strip_prefix(b"\x1b[200~") {
+            let Some(end) = paste.windows(6).position(|part| part == b"\x1b[201~") else {
+                return false;
+            };
+            // A complete single-line paste edits the existing native buffer.
+            // Controls, embedded sentinels and incomplete packets stay conservative.
+            if paste[..end].iter().any(u8::is_ascii_control) {
+                return false;
+            }
+            bytes = &paste[end + 6..];
+            continue;
+        }
         if byte != 0x1b {
             if byte.is_ascii_control() && (byte == 27 || !editing_control(u16::from(byte))) {
                 return false;
@@ -87,6 +106,9 @@ pub(super) fn preserves_native_prompt(mut bytes: &[u8]) -> bool {
         match sequence[end] {
             b'A'..=b'D' | b'H' | b'F' if parameters.is_empty() => {},
             b'~' if matches!(parameters, b"1" | b"2" | b"3" | b"4" | b"5" | b"6") => {},
+            // Ctrl+Shift+F11 is the managed PSReadLine Paste edit. Its legacy
+            // VT encoding must preserve the prompt like its Win32 key record.
+            b'~' if parameters == b"23;6" => {},
             b'_' => {
                 let Ok(parameters) = std::str::from_utf8(parameters) else { return false };
                 let mut fields = parameters.split(';');
@@ -155,23 +177,30 @@ impl EventSender {
         {
             self.native_prompt.observe_prompt();
         }
-        let wake = matches!(event, Event::Wakeup);
-        if wake && self.wake_pending.swap(true, Ordering::AcqRel) {
+        let pending = match &event {
+            Event::Wakeup => Some(&self.wake_pending),
+            Event::ProgramStatusChanged => Some(&self.status_pending),
+            _ => None,
+        };
+        if pending.is_some_and(|flag| flag.swap(true, Ordering::AcqRel)) {
             return;
         }
         if self
             .sender
             .unbounded_send(QueuedEvent { event: event.into(), received_sequence })
             .is_err()
-            && wake
+            && let Some(flag) = pending
         {
-            self.wake_pending.store(false, Ordering::Release);
+            flag.store(false, Ordering::Release);
         }
     }
 }
 
 impl EventReceiver {
     fn acknowledge(&self, queued: &QueuedEvent) {
+        if matches!(&queued.event, SessionEvent::Terminal(Event::ProgramStatusChanged)) {
+            self.status_pending.store(false, Ordering::Release);
+        }
         if matches!(&queued.event, SessionEvent::Terminal(Event::Wakeup)) {
             // Clear before processing: output arriving during UI work must
             // still enqueue a subsequent repaint, even on an inactive tab.
@@ -237,6 +266,41 @@ mod tests {
             #[cfg(windows)]
             _ => panic!("unexpected hook channel"),
         }
+    }
+
+    #[test]
+    fn single_line_bracketed_paste_and_native_undo_preserve_the_prompt() {
+        for input in ["\x1b[200~echo 中文\x1b[201~", "\x1b[200~\x1b[201~", "\x1f"] {
+            assert!(preserves_native_prompt(input.as_bytes()), "{input:?}");
+        }
+        for input in [
+            "\x1b[200~echo\nnext\x1b[201~",
+            "\x1b[200~echo\rnext\x1b[201~",
+            "\x1b[200~echo\x03\x1b[201~",
+            "\x1b[200~echo\x7f\x1b[201~",
+            "\x1b[200~echo",
+            "\x1b[201~",
+            "\x1b[200~\x1b[200~echo\x1b[201~\x1b[201~",
+            "\x1b[200~echo\x1b[201~\r",
+        ] {
+            assert!(!preserves_native_prompt(input.as_bytes()), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn program_status_flood_coalesces_snapshots_without_losing_hook_edges() {
+        let (sender, mut receiver) = channel();
+        for _ in 0..10_000 {
+            sender.send(Event::ProgramStatusChanged);
+        }
+        sender.send(Event::CommandStart);
+        sender.send(Event::AiHookEnvelope(b"done".to_vec()));
+        assert!(matches!(terminal(&mut receiver), Event::ProgramStatusChanged));
+        assert!(matches!(terminal(&mut receiver), Event::CommandStart));
+        assert!(matches!(terminal(&mut receiver), Event::AiHookEnvelope(_)));
+        assert!(receiver.try_recv().is_err());
+        sender.send(Event::ProgramStatusChanged);
+        assert!(matches!(terminal(&mut receiver), Event::ProgramStatusChanged));
     }
 
     #[test]

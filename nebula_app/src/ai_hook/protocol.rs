@@ -11,6 +11,11 @@ use super::{
 };
 
 const ID_MAX_CHARS: usize = 512;
+
+/// Agents documenting Claude Code's hook payload; each signs its own source.
+pub(super) fn claude_style(source: &str) -> bool {
+    matches!(source, "claude" | "qoder" | "codebuddy" | "qwen" | "droid")
+}
 const TURN_RESULT_MAX_CHARS: usize = 4_000;
 static RECEIVE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -75,10 +80,11 @@ fn parse_envelope_with_sequence(bytes: &[u8], received_sequence: u64) -> Option<
     // 写法，把它的 session id 当成 claude 的，就会把一个不存在的会话交给
     // `claude --resume`（见 nebula_hook 的 FOREIGN_HOOK_RUNNERS 注释）。
     let session_id_keys: &[&str] = match source.as_str() {
-        "claude" | "kimi" => &["session_id"],
+        s if claude_style(s) || s == "kimi" => &["session_id"],
         "codex" if native_codex => &["session_id"],
         "codex" => &["thread-id"],
         "cursor" => &["conversation_id", "session_id"],
+        "antigravity" => &["conversationId"],
         "copilot" | "grok" => &["sessionId"],
         // opencode/pi 由我们自己的 bridge 规范化成 snake_case；camelCase 是
         // provider SDK 原样透传时的兼容路径。
@@ -124,12 +130,11 @@ fn parse_envelope_with_sequence(bytes: &[u8], received_sequence: u64) -> Option<
     };
     let mut event_id =
         context_string(&payload, &["event_id", "eventId"]).map(|id| truncate(&id, ID_MAX_CHARS));
-    let turn_id =
-        context_string(&payload, &["turn_id", "turn-id"])
-            .or_else(|| {
-                if source == "claude" { context_string(&payload, &["prompt_id"]) } else { None }
-            })
-            .map(|id| truncate(&id, ID_MAX_CHARS));
+    let turn_id = context_string(&payload, &["turn_id", "turn-id"])
+        .or_else(|| {
+            if claude_style(&source) { context_string(&payload, &["prompt_id"]) } else { None }
+        })
+        .map(|id| truncate(&id, ID_MAX_CHARS));
     // 旧字段名保留：用户机器上可能还装着上一版 bridge，它写的是
     // `provider_sequence`。字段来源始终是 bridge，不是 provider 原生顺序。
     let bridge_sequence = context_u64(
@@ -138,7 +143,15 @@ fn parse_envelope_with_sequence(bytes: &[u8], received_sequence: u64) -> Option<
     );
     let occurred_at_ms =
         context_u64(&payload, &["occurred_at_ms", "occurredAtMs", "occurred_at", "timestamp"]);
-    let background_tasks = background_task_summary(&payload);
+    let background_tasks = if source == "antigravity" {
+        // fullyIdle is a presence signal, not an exact background-task count.
+        payload.get("fullyIdle").and_then(Value::as_bool).map(|idle| super::AiBackgroundTasks {
+            active: u32::from(!idle),
+            total: u32::from(!idle),
+        })
+    } else {
+        background_task_summary(&payload)
+    };
     let permission_mode = context_string(&payload, &["permission_mode", "permissionMode"])
         .as_deref()
         .and_then(AiPermissionMode::parse);
@@ -146,8 +159,8 @@ fn parse_envelope_with_sequence(bytes: &[u8], received_sequence: u64) -> Option<
         // 第二道串台门。第一道在 nebula_hook 里靠环境变量判断调用方是不是别家
         // 的 hook runner；那种门会被上游改名静默失效，所以这里独立再拦一次：
         // 别家 runner 的载荷用 camelCase 字段名，claude 从不这样发。
-        "claude" if payload.get("hookEventName").is_some() => return None,
-        "claude" => match payload.get("hook_event_name").and_then(Value::as_str) {
+        s if claude_style(s) && payload.get("hookEventName").is_some() => return None,
+        s if claude_style(s) => match payload.get("hook_event_name").and_then(Value::as_str) {
             Some("SessionStart") => (AiHookKind::SessionStart, None),
             Some("UserPromptSubmit") => (AiHookKind::PromptSubmit, None),
             Some("PreCompact" | "PostCompact")
@@ -249,7 +262,7 @@ fn parse_envelope_with_sequence(bytes: &[u8], received_sequence: u64) -> Option<
             _ => return None,
         },
         "cursor" if payload.get("hookEventName").is_some() => return None,
-        "cursor" | "copilot" | "grok" => {
+        "cursor" | "copilot" | "grok" | "antigravity" => {
             super::native_events::parse(&source, native_event?, &payload)?
         },
         _ => return None,
@@ -257,7 +270,7 @@ fn parse_envelope_with_sequence(bytes: &[u8], received_sequence: u64) -> Option<
     if source == "codex" && kind == AiHookKind::TurnDone && event_id.is_none() {
         event_id = turn_id.as_ref().map(|id| format!("codex:turn:{id}:done"));
     }
-    let turn_outcome = if matches!(source.as_str(), "claude" | "kimi")
+    let turn_outcome = if (claude_style(&source) || source == "kimi")
         && kind == AiHookKind::TurnDone
     {
         match payload.get("hook_event_name").and_then(Value::as_str) {
@@ -270,7 +283,7 @@ fn parse_envelope_with_sequence(bytes: &[u8], received_sequence: u64) -> Option<
         && payload.get("hook_event_name").and_then(Value::as_str) == Some("Interrupt")
     {
         AiTurnOutcome::Cancelled
-    } else if matches!(source.as_str(), "cursor" | "copilot" | "grok")
+    } else if matches!(source.as_str(), "cursor" | "copilot" | "grok" | "antigravity")
         && kind == AiHookKind::TurnDone
     {
         super::native_events::outcome(&source, native_event?, &payload)
@@ -344,7 +357,7 @@ fn parse_envelope_with_sequence(bytes: &[u8], received_sequence: u64) -> Option<
         session_compacted: kind == AiHookKind::SessionStart
             && payload.get("source").and_then(Value::as_str) == Some("compact"),
         compaction_auto: payload.get("trigger").and_then(Value::as_str) == Some("auto"),
-        legacy_attention: source == "claude"
+        legacy_attention: claude_style(&source)
             && payload.get("hook_event_name").and_then(Value::as_str) == Some("Notification")
             && context_string(&payload, &["notificationType", "notification_type"]).is_none(),
         answer,

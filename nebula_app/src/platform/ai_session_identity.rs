@@ -17,12 +17,34 @@ mod macos;
 #[cfg(windows)]
 mod windows;
 
-/// A short-lived native probe must finish before GUI, hooks or CLI setup.
+/// Native probe helpers run before GUI, hooks or CLI setup.
 pub(crate) fn run_helper_if_requested() -> Option<i32> {
     #[cfg(windows)]
     return windows::run_helper_if_requested();
     #[cfg(not(windows))]
     None
+}
+
+/// Keep owned copies of the application executable stopped during installation.
+/// Acquisition waits on the background executor; cancellation only releases a gate.
+pub(crate) struct UpdatePause {
+    #[cfg(windows)]
+    inner: windows::UpdatePause,
+}
+
+impl UpdatePause {
+    pub(crate) fn acquire() -> io::Result<Self> {
+        Ok(Self {
+            #[cfg(windows)]
+            inner: windows::UpdatePause::acquire()?,
+        })
+    }
+
+    /// A committed handoff must keep probes stopped even when its owner is dropped.
+    pub(crate) fn commit(&mut self) {
+        #[cfg(windows)]
+        self.inner.commit();
+    }
 }
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -133,7 +155,8 @@ pub(crate) struct ObservedWslLocation {
 /// WSL panes are inspected inside the guest because Windows Toolhelp cannot
 /// see Linux processes or their open session files. Linux hosts use the same
 /// process metadata directly. Windows inspects only the pane shell's verified
-/// descendants in a disposable helper, bounding potentially blocking file APIs.
+/// descendants in one reusable, process-owned helper. Each request remains bounded;
+/// a stalled helper is terminated before a later request can replace it.
 pub(crate) fn probe_codex_session(
     pane_id: u64,
     exec_context: Option<&crate::runtime_exec::PaneExecContext>,
@@ -517,6 +540,8 @@ fn read_metadata_line(file: impl Read) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    mod proc_fixture;
 
     const ROOT_ID: &str = "01a079fa-4a9b-7d93-8a4a-4a7a9edaf247";
     const GUARDIAN_ID: &str = "01a079f7-7e36-7232-882b-f06d3bde9df8";
@@ -627,6 +652,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn proc_probes_resolve_session_symlinks_and_preserve_ownership_boundaries() {
+        use std::os::fd::AsRawFd;
         use std::os::unix::fs::symlink;
 
         struct OwnedChild(std::process::Child);
@@ -654,51 +680,98 @@ mod tests {
             "id": ROOT_ID, "source": "cli", "thread_source": "user",
         }});
         std::fs::write(&rollout, format!("{metadata}\n")).unwrap();
-        // 只启动持有样本文件的休眠进程，不运行真实 CLI 或读取用户会话。
+        // 样本只持有日志文件；就绪字节保证 exec 已完成，避免读到继承的测试线程名。
         let program = root.path().join("codex");
-        symlink("/bin/sleep", &program).unwrap();
+        symlink("/bin/sh", &program).unwrap();
         let pane = "session-symlink-fixture";
         let instance = std::process::id().to_string();
-        for (codex_home, expected) in [
+        let fixture_cwd = root.path().canonicalize().unwrap();
+        let fixture_rollout = rollout.canonicalize().unwrap();
+        let first_line = metadata.to_string();
+        for (case, (codex_home, expected)) in [
             (Some(physical.clone()), true),
             (Some(home.join(".codex")), true),
             (None, true),
             (Some(linked_sessions), true),
             (Some(std::path::PathBuf::from("physical data")), true),
             (Some(unrelated), false),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let mut command = Command::new(&program);
             command
-                .arg("30")
+                .args(["-c", "printf R; read -r _"])
                 .current_dir(root.path())
+                .env_clear()
                 .env("HOME", &home)
-                .env_remove("CODEX_HOME")
                 .env("PEBREL_PANE_ID", pane)
                 .env("NEBULA_PANE_ID", pane)
                 .env(crate::agent_env::PROCESS_ENV, &instance)
-                .stdin(std::fs::File::open(&rollout).unwrap())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(std::fs::File::open(&rollout).unwrap());
             if let Some(value) = &codex_home {
                 command.env("CODEX_HOME", value);
             }
-            let _child = OwnedChild(command.spawn().unwrap());
+            let mut child = OwnedChild(command.spawn().unwrap());
+            // stdin 管道维持样本存活；父进程退出时 EOF 也能结束样本，不遗留休眠进程。
+            let mut ready = child.0.stdout.take().unwrap();
+            let mut event =
+                libc::pollfd { fd: ready.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            // SAFETY: pollfd 在调用期间有效；只等待就绪，不重试被测探测器或延长其期限。
+            let signaled =
+                unsafe { libc::poll(&mut event, 1, PROBE_TIMEOUT.as_millis() as libc::c_int) };
+            assert_eq!(signaled, 1, "fixture did not signal readiness");
+            let mut signal = [0];
+            ready.read_exact(&mut signal).unwrap();
+            assert_eq!(signal, [b'R']);
+            let expected_child = proc_fixture::Expected {
+                pane,
+                instance: &instance,
+                home: &home,
+                codex_home: codex_home.as_deref(),
+                cwd: &fixture_cwd,
+                rollout: &fixture_rollout,
+                first_line: &first_line,
+            };
+            proc_fixture::wait_for_child(&mut child.0, &expected_child).unwrap_or_else(|error| {
+                panic!("case={case} home={codex_home:?}: fixture not ready: {error}")
+            });
             for (query_pane, query_instance, matches) in [
                 (pane, instance.as_str(), expected),
                 ("other-pane", instance.as_str(), false),
                 (pane, "other-instance", false),
             ] {
-                let mut guest = Command::new("sh");
-                guest.args(["-c", PROBE_SCRIPT, "probe", query_pane, query_instance]);
-                for found in
-                    [probe_local_proc(query_pane, query_instance), run_probe_command(guest)]
-                {
-                    assert_eq!(found.is_some(), matches, "home={codex_home:?}");
+                let assert_found = |probe, found: Option<CodexSession>, elapsed: Duration| {
+                    let context = format!(
+                        "probe={probe} case={case} child={} pane={query_pane} \
+                         instance={query_instance} home={codex_home:?} elapsed={elapsed:?}",
+                        child.0.id(),
+                    );
+                    assert_eq!(found.is_some(), matches, "{context}");
                     if let Some(found) = found {
-                        assert_eq!(found.session_id, ROOT_ID);
-                        assert_eq!(Path::new(&found.session_file), rollout);
+                        assert_eq!(found.session_id, ROOT_ID, "{context}");
+                        assert_eq!(Path::new(&found.session_file), rollout, "{context}");
                     }
-                }
+                };
+                // Assert immediately after each single probe. An eager array
+                // erased which implementation failed in the original CI log.
+                let started = Instant::now();
+                let found = probe_local_proc(query_pane, query_instance);
+                assert_found("local_proc", found, started.elapsed());
+
+                let mut guest = Command::new("/bin/sh");
+                guest.env_clear().env("PATH", "/usr/bin:/bin").env("HOME", &home).args([
+                    "-c",
+                    PROBE_SCRIPT,
+                    "probe",
+                    query_pane,
+                    query_instance,
+                ]);
+                let started = Instant::now();
+                let found = run_probe_command(guest);
+                assert_found("guest_shell", found, started.elapsed());
             }
         }
     }

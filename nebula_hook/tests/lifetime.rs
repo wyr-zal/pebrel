@@ -139,6 +139,23 @@ fn legacy_notify_still_invokes_the_users_chained_program() {
     );
 }
 
+#[test]
+fn antigravity_stop_returns_a_decision_without_restarting_the_agent() {
+    let mut invocation = Invocation::spawn(&["antigravity", "--event", "done"], None);
+    invocation
+        .0
+        .as_mut()
+        .unwrap()
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"terminationReason\":\"model_stop\",\"fullyIdle\":true}")
+        .unwrap();
+    let output = invocation.finish();
+    assert_eq!(output.stdout, b"{\"decision\":\"stop\"}\n");
+    assert!(output.stderr.is_empty());
+}
+
 /// A server-side named pipe in the exact state the live transport can leave
 /// behind during shutdown: created, never accepted and never drained. The
 /// default harness runs tests in one process, so every name must be unique.

@@ -12,18 +12,40 @@
 
 use super::*;
 
+/// A bare printable key (Enter/space/letters/digits/backspace without
+/// modifiers) bound to a workspace-level action swallows normal typing. The
+/// editor asks for confirmation before assigning one; the real fix for a
+/// swallowed key lives in workspace/keyboard_bindings (Unbind). Tool keys
+/// (F1-F24, arrows, home/end, pageup/pagedown, escape, tab) produce no text
+/// input and need no guard.
+pub(super) fn bare_printable_key_needs_guard(combo: &str) -> bool {
+    let Some((mods, _)) = crate::display::keymap::parse_combo(combo) else { return false };
+    if !mods.is_empty() {
+        return false;
+    }
+    const GUARD_EXEMPT: &[&str] =
+        &["escape", "tab", "up", "down", "left", "right", "home", "end", "pageup", "pagedown"];
+    let name = combo.trim().to_ascii_lowercase();
+    // F1-F24 style function keys produce no text input; exempt them too.
+    if name.starts_with('f') && name.len() > 1 && name[1..].parse::<u32>().is_ok() {
+        return false;
+    }
+    !GUARD_EXEMPT.contains(&name.as_str())
+}
+
 impl SettingsPane {
     fn confirmation_shortcuts_label(cx: &App) -> &'static str {
         crate::gpui_shell::config::ui_language(cx)
             .text(crate::i18n::Message::CommonConfirmationDialogShortcuts)
     }
 
-    fn confirmation_shortcuts_search_text() -> String {
+    fn confirmation_shortcuts_search_text(language: crate::display::UiLanguage) -> String {
         let message = crate::i18n::Message::CommonConfirmationDialogShortcuts;
         format!(
-            "{} {} Enter / Esc",
+            "{} {} {} Enter / Esc",
             crate::i18n::UiLanguage::ZhCn.text(message),
             crate::i18n::UiLanguage::EnUs.text(message),
+            language.text(message),
         )
         .to_lowercase()
     }
@@ -40,7 +62,11 @@ impl SettingsPane {
         }
     }
 
-    pub(super) fn keymap_matches_query(&self, query: &str) -> bool {
+    pub(super) fn keymap_matches_query(
+        &self,
+        query: &str,
+        language: crate::display::UiLanguage,
+    ) -> bool {
         use crate::display::keymap;
         let query = query.trim().to_lowercase();
         let matches = |text: String| query.split_whitespace().all(|word| text.contains(word));
@@ -49,17 +75,19 @@ impl SettingsPane {
                 crate::platform::CAPABILITIES.quick_terminal_hotkey
                     || *flat != keymap::QUICK_TERMINAL_ROW
             })
-            .any(|flat| matches(self.keymap_row_haystack(flat)))
-            || keymap::READONLY_ROWS
+            .any(|flat| matches(self.keymap_row_haystack(flat, language)))
+            || keymap::GPUI
+                .readonly_rows()
                 .iter()
-                .any(|(zh, en, combo)| matches(format!("{zh} {en} {combo}").to_lowercase()))
-            || matches(Self::confirmation_shortcuts_search_text())
+                .enumerate()
+                .any(|(index, _)| matches(Self::keymap_readonly_haystack(index, language)))
+            || matches(Self::confirmation_shortcuts_search_text(language))
     }
 
     // ---- 按键映射编辑器（模型层 `display::keymap`，两壳同读同写）----
 
-    /// 搜索口径与旧壳一致：动作名（中/英）+ 当前生效键文本。
-    fn keymap_row_haystack(&self, flat: usize) -> String {
+    /// Search the displayed action name, existing Chinese/English aliases and current keys.
+    fn keymap_row_haystack(&self, flat: usize, language: crate::display::UiLanguage) -> String {
         use crate::display::keymap;
         let custom = keymap::build_bindings(&self.keymap_binds);
         let combo = if flat == keymap::QUICK_TERMINAL_ROW {
@@ -67,28 +95,44 @@ impl SettingsPane {
         } else {
             keymap::EDITABLE_ACTIONS
                 .get(flat - 1)
-                .and_then(|(action, ..)| keymap::effective_combo(action, &custom))
+                .and_then(|(action, ..)| keymap::GPUI.effective_combo(action, &custom))
                 .map(|(combo, _)| combo)
                 .unwrap_or_default()
         };
-        let (zh, en) = if flat == keymap::QUICK_TERMINAL_ROW {
-            ("快速终端", "Quick terminal")
+        let (zh, en, label) = if flat == keymap::QUICK_TERMINAL_ROW {
+            (
+                "快速终端",
+                "Quick terminal",
+                language.text(crate::i18n::Message::SettingsKeymapQuickTerminal),
+            )
         } else {
-            keymap::EDITABLE_ACTIONS.get(flat - 1).map(|(_, zh, en)| (*zh, *en)).unwrap_or(("", ""))
+            keymap::EDITABLE_ACTIONS
+                .get(flat - 1)
+                .map(|row| (row.1, row.2, keymap::action_label(row, language)))
+                .unwrap_or(("", "", ""))
         };
-        format!("{zh} {en} {combo}").to_lowercase()
+        format!("{zh} {en} {label} {combo}").to_lowercase()
+    }
+
+    fn keymap_readonly_haystack(index: usize, language: crate::display::UiLanguage) -> String {
+        use crate::display::keymap;
+        let (zh, en, combo) = keymap::GPUI.readonly_rows()[index];
+        let label = keymap::readonly_label(index, language);
+        format!("{zh} {en} {label} {combo}").to_lowercase()
     }
 
     /// 过滤后的可见行（flat 下标，升序）。空查询 = 全部。
     fn keymap_visible(&self, cx: &App) -> Vec<usize> {
         use crate::display::keymap;
         let query = self.keymap_query(cx);
+        let language = crate::gpui_shell::config::ui_language(cx);
         // 快速终端热键在没实现该功能的平台上不列出：改了也没有效果。
         let quick_terminal = crate::platform::CAPABILITIES.quick_terminal_hotkey;
         (0..keymap::editable_row_count())
             .filter(|flat| quick_terminal || *flat != keymap::QUICK_TERMINAL_ROW)
             .filter(|flat| {
-                query.split_whitespace().all(|word| self.keymap_row_haystack(*flat).contains(word))
+                let haystack = self.keymap_row_haystack(*flat, language);
+                query.split_whitespace().all(|word| haystack.contains(word))
             })
             .collect()
     }
@@ -106,14 +150,14 @@ impl SettingsPane {
             } else {
                 keymap::EDITABLE_ACTIONS
                     .get(flat - 1)
-                    .and_then(|(action, ..)| keymap::effective_combo(action, &custom))
+                    .and_then(|(action, ..)| keymap::GPUI.effective_combo(action, &custom))
                     .map(|(combo, _)| combo)
             };
             combos.push(combo.filter(|combo| !combo.is_empty()));
         }
         let name = |flat: usize| -> String {
             if flat == keymap::QUICK_TERMINAL_ROW {
-                language.pick("快速终端", "Quick terminal").to_owned()
+                language.text(crate::i18n::Message::SettingsKeymapQuickTerminal).to_owned()
             } else {
                 keymap::EDITABLE_ACTIONS
                     .get(flat - 1)
@@ -149,6 +193,7 @@ impl SettingsPane {
     pub(super) fn handle_keymap_capture(
         &mut self,
         keystroke: &gpui::Keystroke,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(row) = self.keymap_capture else { return };
@@ -162,7 +207,7 @@ impl SettingsPane {
                 self.keymap_clear_custom(row, cx);
             },
             crate::display::keymap::CaptureOutcome::Bind(combo) => {
-                self.keymap_assign(row, combo, cx);
+                self.keymap_assign(row, combo, window, cx, false);
             },
             crate::display::keymap::CaptureOutcome::Pending => {},
         }
@@ -171,16 +216,55 @@ impl SettingsPane {
     /// 捕获完成：一个动作只保留一条自定义绑定，但同一 combo 可以同时归属
     /// 多个动作。冲突不再靠静默注销旧动作来“解决”，而是由
     /// `keymap_clashes` 标记双方并显示警告条，让用户自己决定改哪一行。
-    fn keymap_assign(&mut self, row: usize, combo: String, cx: &mut Context<Self>) {
+    fn keymap_assign(
+        &mut self,
+        row: usize,
+        combo: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        skip_bare_key_guard: bool,
+    ) {
         use crate::display::keymap;
         self.keymap_capture = None;
         self.keymap_capture_preview.clear();
+        // Guard: binding a bare printable key (Enter/space/letters/digits) to a
+        // workspace-level action swallows normal typing from then on. Ask once;
+        // confirming replays the assignment with the guard skipped.
+        if !skip_bare_key_guard && bare_printable_key_needs_guard(&combo) {
+            let language = crate::gpui_shell::config::ui_language(cx);
+            let pane = cx.entity().downgrade();
+            let description = language.format(
+                crate::i18n::Message::SettingsKeymapBareDescription,
+                &[("combo", combo.as_str())],
+            );
+            window.open_dialog(cx, move |dialog, window, _cx| {
+                let pane = pane.clone();
+                let combo = combo.clone();
+                confirm_dialog(
+                    dialog,
+                    window,
+                    language.text(crate::i18n::Message::SettingsKeymapBareTitle),
+                    description.as_str(),
+                    language.text(crate::i18n::Message::SettingsKeymapBareConfirm),
+                    language.text(crate::i18n::Message::CommonCancel),
+                    ButtonVariant::Danger,
+                )
+                .on_ok(move |_, window, cx| {
+                    let _ = pane.update(cx, |this, cx| {
+                        this.keymap_assign(row, combo.clone(), window, cx, true)
+                    });
+                    true
+                })
+            });
+            cx.notify();
+            return;
+        }
         if row == keymap::QUICK_TERMINAL_ROW {
             self.persist(&[("quick_terminal_hotkey", combo)], cx);
             return;
         }
         let Some((action, ..)) = keymap::EDITABLE_ACTIONS.get(row - 1) else { return };
-        keymap::rebind_action(&mut self.keymap_binds, action, combo);
+        keymap::GPUI.rebind_action(&mut self.keymap_binds, action, combo);
         self.persist_keybinds(cx);
     }
 
@@ -194,7 +278,7 @@ impl SettingsPane {
             return;
         }
         let Some((action, ..)) = keymap::EDITABLE_ACTIONS.get(row - 1) else { return };
-        keymap::clear_action(&mut self.keymap_binds, action);
+        keymap::GPUI.clear_action(&mut self.keymap_binds, action);
         self.persist_keybinds(cx);
     }
 
@@ -210,7 +294,7 @@ impl SettingsPane {
             return;
         }
         let Some((action, ..)) = keymap::EDITABLE_ACTIONS.get(row - 1) else { return };
-        keymap::reset_action(&mut self.keymap_binds, action);
+        keymap::GPUI.reset_action(&mut self.keymap_binds, action);
         self.persist_keybinds(cx);
     }
 
@@ -268,7 +352,8 @@ impl SettingsPane {
             })
             .child(if text.is_empty() && !capturing {
                 SharedString::from(
-                    crate::gpui_shell::config::ui_language(cx).pick("未绑定", "Unbound"),
+                    crate::gpui_shell::config::ui_language(cx)
+                        .text(crate::i18n::Message::SettingsKeymapUnbound),
                 )
             } else {
                 SharedString::from(text.to_owned())
@@ -281,7 +366,7 @@ impl SettingsPane {
         let language = crate::gpui_shell::config::ui_language(cx);
         let custom = keymap::build_bindings(&self.keymap_binds);
         let label: SharedString = if flat == keymap::QUICK_TERMINAL_ROW {
-            language.pick("快速终端", "Quick terminal").into()
+            language.text(crate::i18n::Message::SettingsKeymapQuickTerminal).into()
         } else {
             keymap::EDITABLE_ACTIONS
                 .get(flat - 1)
@@ -297,14 +382,14 @@ impl SettingsPane {
         } else {
             keymap::EDITABLE_ACTIONS
                 .get(flat - 1)
-                .and_then(|(action, ..)| keymap::effective_combo(action, &custom))
+                .and_then(|(action, ..)| keymap::GPUI.effective_combo(action, &custom))
                 .map(|(combo, custom)| (combo, custom))
                 .unwrap_or_else(|| (String::new(), false))
         };
         let capturing = self.keymap_capture == Some(flat);
         let cap_text = if capturing {
             if self.keymap_capture_preview.is_empty() {
-                language.pick("按新按键…", "Press a new key...").to_owned()
+                language.text(crate::i18n::Message::SettingsKeymapPressANewKey).to_owned()
             } else {
                 format!("{}…", self.keymap_capture_preview)
             }
@@ -374,7 +459,7 @@ impl SettingsPane {
             ));
         }
         let mut start = 0usize;
-        for (zh, en, count) in keymap::GROUPS {
+        for (group, (.., count)) in keymap::GROUPS.iter().enumerate() {
             let end = start + count;
             let rows: Vec<_> = visible
                 .iter()
@@ -388,7 +473,7 @@ impl SettingsPane {
                         .pb_1()
                         .text_size(px(self.font_size_px(cx) * 0.86))
                         .text_color(cx.theme().muted_foreground)
-                        .child(language.pick(zh, en)),
+                        .child(keymap::group_label(group, language)),
                 );
                 for row in rows {
                     groups_block = groups_block.child(row);
@@ -399,17 +484,18 @@ impl SettingsPane {
 
         // 只读键位和确认对话框快捷键（不可编辑），随搜索过滤。
         let query = self.keymap_query(cx);
-        let mut readonly: Vec<(&str, &str)> = keymap::READONLY_ROWS
+        let mut readonly: Vec<(&str, &str)> = keymap::GPUI
+            .readonly_rows()
             .iter()
-            .filter(|(zh, en, combo)| {
-                query
-                    .split_whitespace()
-                    .all(|word| format!("{zh} {en} {combo}").to_lowercase().contains(word))
+            .enumerate()
+            .filter(|(index, _)| {
+                let haystack = Self::keymap_readonly_haystack(*index, language);
+                query.split_whitespace().all(|word| haystack.contains(word))
             })
-            .map(|(zh, en, combo)| (language.pick(zh, en), *combo))
+            .map(|(index, (.., combo))| (keymap::readonly_label(index, language), *combo))
             .collect();
         let dialog_label = Self::confirmation_shortcuts_label(cx);
-        let dialog_shortcuts = Self::confirmation_shortcuts_search_text();
+        let dialog_shortcuts = Self::confirmation_shortcuts_search_text(language);
         if query.split_whitespace().all(|word| dialog_shortcuts.contains(word)) {
             readonly.push((dialog_label, "Enter / Esc"));
         }
@@ -420,11 +506,12 @@ impl SettingsPane {
                     .pb_1()
                     .text_size(px(self.font_size_px(cx) * 0.86))
                     .text_color(cx.theme().muted_foreground)
-                    .child(language.pick("只读", "Read-only")),
+                    .child(language.text(crate::i18n::Message::SettingsKeymapReadOnly)),
             );
             for (label, combo) in readonly {
                 groups_block = groups_block.child(
                     h_flex()
+                        .debug_selector(move || format!("settings-keymap-readonly-{label}"))
                         .w_full()
                         .h(px(SETTINGS_ROW_HEIGHT))
                         .flex_shrink_0()
@@ -487,5 +574,79 @@ impl SettingsPane {
                     .text_color(cx.theme().muted_foreground)
                     .child(language.tr("settings.keymap.help")),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bare_printable_key_needs_guard;
+
+    #[cfg(feature = "gpui-test-support")]
+    #[gpui::test]
+    fn localized_copy_search_preserves_aliases_and_custom_keys(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        use crate::display::{UiLanguage, keymap};
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            let mut settings = crate::gpui_shell::config::Settings::load(ThemeName::Nord);
+            settings.ui_language = UiLanguage::JaJp;
+            cx.set_global(settings);
+        });
+        let mut pane = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| SettingsPane::new(window, cx));
+            pane = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let pane = pane.unwrap();
+        let copy_row = keymap::EDITABLE_ACTIONS
+            .iter()
+            .position(|(action, ..)| *action == crate::config::Action::Copy)
+            .unwrap()
+            + 1;
+        cx.update(|window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.keymap_binds = vec![("ctrl+alt+y".into(), "Copy".into())];
+                let matching_combo =
+                    format!("コピー {}", keymap::display_stored_combo("ctrl+alt+y"));
+                for query in ["コピー", "COPY", "复制", &matching_combo] {
+                    pane.settings_search_input
+                        .update(cx, |input, cx| input.set_value(query, window, cx));
+                    assert_eq!(pane.keymap_visible(cx), vec![copy_row], "{query}");
+                    assert!(pane.matching_settings_sections(cx).contains(&7), "{query}");
+                }
+                let different_combo =
+                    format!("コピー {}", keymap::display_stored_combo("ctrl+alt+z"));
+                pane.settings_search_input
+                    .update(cx, |input, cx| input.set_value(different_combo, window, cx));
+                assert!(pane.keymap_visible(cx).is_empty());
+                assert!(!pane.matching_settings_sections(cx).contains(&7));
+
+                // The same pane uses the current language without a cached search index.
+                cx.global_mut::<crate::gpui_shell::config::Settings>().ui_language =
+                    UiLanguage::FrFr;
+                pane.settings_search_input
+                    .update(cx, |input, cx| input.set_value("Copier", window, cx));
+                assert_eq!(pane.keymap_visible(cx), vec![copy_row]);
+                assert!(pane.matching_settings_sections(cx).contains(&7));
+            });
+        });
+    }
+
+    #[test]
+    fn bare_printable_guard_catches_letters_enter_space_but_not_function_keys() {
+        for combo in ["enter", "space", "a", "f", "1", "backspace", "delete"] {
+            assert!(bare_printable_key_needs_guard(combo), "{combo} should need the guard");
+        }
+        for combo in [
+            "f1", "f12", "escape", "tab", "up", "down", "left", "right", "home", "end", "pageup",
+            "pagedown",
+        ] {
+            assert!(!bare_printable_key_needs_guard(combo), "{combo} must not raise the guard");
+        }
+        for combo in ["ctrl+enter", "alt+1", "win+space", "shift+f5"] {
+            assert!(!bare_printable_key_needs_guard(combo), "{combo} has modifiers");
+        }
     }
 }

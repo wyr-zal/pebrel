@@ -25,6 +25,8 @@ mod background_effects;
 pub use background_effects::{BackgroundEffectRequest, BackgroundEffects};
 mod terminal_effects;
 pub use terminal_effects::{EffectAnimation, TerminalEffects};
+mod tab_bar_material;
+pub use tab_bar_material::TabBarMaterial;
 mod cursor_motion;
 mod custom_theme;
 pub use cursor_motion::CursorMotion;
@@ -41,11 +43,13 @@ pub use notifications::{
     AutoContinueAttempts, AutoContinueInterval, DEFAULT_AUTO_CONTINUE_ERROR_PATTERNS,
     NotificationDuration,
 };
+mod prompt_suggestions;
 mod quick_terminal;
+pub use prompt_suggestions::PromptSuggestions;
 mod scrolling;
 pub use scrolling::{
     DEFAULT_SCROLL_SPEED, DEFAULT_SCROLLBACK_LINES, MAX_SCROLL_SPEED, MIN_SCROLL_SPEED,
-    SCROLL_SPEED_STEP, SCROLLBACK_VALUES, normalize_scroll_speed,
+    SCROLL_SPEED_STEP, SCROLLBACK_VALUES, ScrollbarVisibility, normalize_scroll_speed,
 };
 mod themes;
 pub use language::{LanguageInfo, LanguagePref};
@@ -1021,6 +1025,7 @@ pub struct RuntimeSettings {
     pub scrollback_lines: usize,
     /// Wheel multiplier; pixel-precise trackpad input is independent.
     pub scroll_speed: f32,
+    pub scrollbar_visibility: ScrollbarVisibility,
     /// GUI override for mouse.focus_follows_mouse in TOML; absent there too means false.
     pub focus_follows_mouse: Option<bool>,
     /// Preserve the existing dimming of inactive split panes unless explicitly disabled.
@@ -1044,6 +1049,7 @@ pub struct RuntimeSettings {
     pub ghost: bool,
     pub accept: AcceptKeyName,
     pub completion_style: CompletionStyleName,
+    pub prompt_suggestions: PromptSuggestions,
     /// 全宽字形（CJK 等）bold run 用 Regular 字形（粗体提亮不加粗）。
     pub cjk_bold_regular: bool,
     pub tabs_position: TabsPositionName,
@@ -1084,6 +1090,8 @@ pub struct RuntimeSettings {
     pub tray: bool,
     pub blur: BlurModeName,
     pub opacity: f32,
+    /// File-only overrides shared by sidebar and top tab layouts.
+    pub tab_bar_material: TabBarMaterial,
     /// Whether the corresponding material value was explicitly present in
     /// `nebula_settings.txt`. Theme defaults may fill an absent value, while
     /// an explicit user value (including `none` or `1.0`) remains authoritative.
@@ -1207,6 +1215,10 @@ impl RuntimeSettings {
             ui_font_family: raw.value("ui_font_family").map(str::to_owned),
             ui_font_size_px: raw.f32("ui_font_size").map(|size| size.clamp(10.0, 24.0)),
             font_size_px: raw.f32("font_size").map(|size| size.clamp(4.0, 96.0)),
+            scrollbar_visibility: raw
+                .value("scrollbar_visibility")
+                .and_then(ScrollbarVisibility::from_settings)
+                .unwrap_or_default(),
             ctrl_wheel_font_zoom: raw.bool_on("ctrl_wheel_font_zoom").unwrap_or(true),
             ligatures: raw
                 .value("ligatures")
@@ -1238,6 +1250,7 @@ impl RuntimeSettings {
                 .value("completion_style")
                 .and_then(CompletionStyleName::from_settings)
                 .unwrap_or_default(),
+            prompt_suggestions: PromptSuggestions::from_raw(raw),
             cjk_bold_regular: raw.bool_on("cjk_bold_regular").unwrap_or(true),
             tabs_position: raw
                 .value("tabs_position")
@@ -1294,6 +1307,7 @@ impl RuntimeSettings {
             tray: raw.bool_on("tray").unwrap_or(true),
             blur,
             opacity,
+            tab_bar_material: TabBarMaterial::from_raw(raw),
             opacity_explicit,
             blur_explicit,
             background: raw.value("background").and_then(parse_hex_rgb),

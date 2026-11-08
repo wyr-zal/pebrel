@@ -23,10 +23,8 @@ pub(super) const SECTION_IDS: [&str; 12] = [
     "mobile",
 ];
 
-/// Bilingual search aliases for the stable section routes. Search is a route
-/// finder, so a query such as "font", "opacity", or "更新" lands on the
-/// section that owns the control instead of merely filtering the current page.
-pub(super) const SECTION_SEARCH_TERMS: [&str; 12] = [
+/// Personal feature aliases supplement the localized catalog below.
+pub(super) const SECTION_SEARCH_ALIASES: [&str; 12] = [
     "application app 应用 update 更新 version 版本 github support 支持",
     "appearance ligatures 连字 外观 theme 主题 custom 自定义 template 模板 import 导入 export 导出 font 字体 opacity 透明度 background 背景 shader wgsl terminal effects effect 终端效果 着色器 video 视频 gif 动图 cursor 光标 smooth motion 平滑 动画 icon 图标 dim inactive panes 调暗非活动窗格 分屏变暗 scrollback scrolling speed history 回滚 滚动 速度 历史 滚轮 ctrl wheel zoom 缩放",
     "profiles 配置文件 shell terminal 终端 completion 补全 startup 启动 environment refresh path 环境变量 刷新 ai message notifications toast alerts bell 提醒 通知 弹窗 消息 右下角 ai消息通知 ai 消息通知 ai消息弹窗 ai 消息弹窗 铃声 duration timeout persistent auto-dismiss 时长 秒 常驻 自动关闭 自动续跑 auto continue retry ai_auto_continue 发送次数 重试次数 间隔 重试间隔 attempts interval 限速 中转站 ai_auto_continue_attempts ai_auto_continue_interval 错误短语 报错匹配 错误短语管理 添加短语 删除短语 error phrases patterns phrase list manage add remove ai_auto_continue_error_patterns",
@@ -41,8 +39,21 @@ pub(super) const SECTION_SEARCH_TERMS: [&str; 12] = [
     "mobile phone android ios remote pairing qr lan relay 手机 远程 配对 二维码 局域网 中转 网卡 只看 手机通知",
 ];
 
-// 暂时隐藏供应商入口，保留路由编号，避免其他设置入口发生偏移。
-pub(super) const HIDDEN_NAV_SECTIONS: &[usize] = &[3];
+/// Catalog terms keep official settings searchable in every supported locale.
+pub(super) const SECTION_SEARCH_TERMS: [crate::i18n::Message; 12] = [
+    crate::i18n::Message::SettingsSearchTermsApplication,
+    crate::i18n::Message::SettingsSearchTermsAppearance,
+    crate::i18n::Message::SettingsSearchTermsProfiles,
+    crate::i18n::Message::SettingsSearchTermsProviders,
+    crate::i18n::Message::SettingsSearchTermsSsh,
+    crate::i18n::Message::SettingsSearchTermsNetwork,
+    crate::i18n::Message::SettingsSearchTermsInteraction,
+    crate::i18n::Message::SettingsSearchTermsKeymap,
+    crate::i18n::Message::SettingsSearchTermsAdvanced,
+    crate::i18n::Message::SettingsSearchTermsBackup,
+    crate::i18n::Message::SettingsSearchTermsAgents,
+    crate::i18n::Message::SettingsSearchTermsMobile,
+];
 
 /// 保留原来的分组展开顺序，组名不再渲染；数组里仍保存稳定的 [`SECTION_IDS`]
 /// 下标，不复制设置状态或路由。
@@ -71,7 +82,7 @@ pub(super) fn section_label(index: usize, language: crate::display::UiLanguage) 
 }
 
 pub(super) fn is_nav_section_visible(index: usize) -> bool {
-    !HIDDEN_NAV_SECTIONS.contains(&index)
+    index < SECTION_IDS.len() && index != 3
 }
 
 pub(super) fn visible_nav_sections() -> impl Iterator<Item = usize> {

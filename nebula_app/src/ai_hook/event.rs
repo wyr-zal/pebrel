@@ -1,6 +1,7 @@
 //! Normalized provider facts. No terminal scanning, I/O or pane mutation.
 
 use super::payload::{MESSAGE_MAX_CHARS, truncate};
+use super::protocol::claude_style;
 
 /// What a lifecycle event means for the pane's turn state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -53,6 +54,13 @@ pub struct AiHookCapabilities {
     /// 依赖本地到达顺序。名字里是 bridge 而不是 provider，正是这个原因。
     pub bridge_sequence: bool,
     pub serialized_delivery: bool,
+}
+
+impl AiHookCapabilities {
+    /// Unsequenced, concurrent lifecycle callbacks need the local input boundary.
+    pub(crate) fn needs_input_fence(self) -> bool {
+        self.lifecycle && !self.bridge_sequence && !self.serialized_delivery
+    }
 }
 
 /// Versioned contract of the installed Codex command hooks. Legacy notify has
@@ -119,11 +127,20 @@ pub fn capabilities_for(source: &str) -> AiHookCapabilities {
             bridge_sequence: false,
             serialized_delivery: false,
         },
-        "cursor" => AiHookCapabilities {
+        // Claude Code's lifecycle and attention contract without its background-task payload.
+        source if claude_style(source) => AiHookCapabilities {
+            lifecycle: true,
+            attention_events: true,
+            attention_context: true,
+            background_tasks: false,
+            bridge_sequence: false,
+            serialized_delivery: false,
+        },
+        "cursor" | "antigravity" => AiHookCapabilities {
             lifecycle: true,
             attention_events: false,
             attention_context: false,
-            background_tasks: false,
+            background_tasks: source == "antigravity",
             bridge_sequence: false,
             serialized_delivery: false,
         },

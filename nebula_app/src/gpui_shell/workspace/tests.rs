@@ -635,6 +635,16 @@ fn copying_cwd_accepts_reported_guest_paths_without_host_filesystem_access() {
 
 /// 新建终端弹窗：默认 shell 必须占首行，因为「开弹窗 → 回车」是旧壳
 /// 点 "+" 后最常走的一条路，它必须等于「开一个默认终端」。
+fn palette_ssh_hosts(hosts: &[(&str, &str)]) -> crate::gpui_shell::ssh_hosts::SshHostLists {
+    let mut lists = crate::gpui_shell::ssh_hosts::SshHostLists::default();
+    for (host, label) in hosts {
+        let mut profile = lists.profiles.for_destination(host);
+        profile.label = Some((*label).to_owned());
+        lists.profiles.upsert(profile);
+    }
+    lists
+}
+
 #[test]
 fn shell_palette_puts_the_default_shell_first() {
     let shells = ["pwsh", "powershell", "cmd", "nu"]
@@ -652,7 +662,7 @@ fn shell_palette_puts_the_default_shell_first() {
     let rows = shell_palette_rows(
         shells.clone(),
         Vec::new(),
-        [("box.example".to_owned(), String::new())],
+        &palette_ssh_hosts(&[("box.example", "")]),
         "nu",
         language,
         1.0,
@@ -679,14 +689,8 @@ fn shell_palette_puts_the_default_shell_first() {
     assert_eq!(rows[4].group, "SSH 主机");
 
     // 默认 id 没在检测结果里（WSL 发行版被卸载等）：不置顶也不 panic。
-    let rows = shell_palette_rows(
-        shells,
-        Vec::new(),
-        None::<(String, String)>,
-        "wsl:Ghost",
-        language,
-        1.0,
-    );
+    let rows =
+        shell_palette_rows(shells, Vec::new(), &Default::default(), "wsl:Ghost", language, 1.0);
     assert!(matches!(
         &rows[0].action,
         WorkspacePaletteAction::LaunchShell(shell) if shell.id == "pwsh"
@@ -701,10 +705,7 @@ fn shell_palette_ssh_rows_show_the_configured_host_name() {
     let rows = shell_palette_rows(
         Vec::new(),
         Vec::new(),
-        [
-            ("root@box.example".to_owned(), "生产机".to_owned()),
-            ("plain.example".to_owned(), String::new()),
-        ],
+        &palette_ssh_hosts(&[("root@box.example", "生产机"), ("plain.example", "")]),
         "cmd",
         crate::display::UiLanguage::ZhCn,
         1.0,
@@ -747,7 +748,7 @@ fn shell_palette_falls_back_to_an_id_glyph_when_brand_art_is_absent() {
     let rows = shell_palette_rows(
         shells,
         Vec::new(),
-        None::<(String, String)>,
+        &Default::default(),
         "zsh",
         crate::display::UiLanguage::ZhCn,
         1.0,
@@ -788,7 +789,7 @@ fn shell_palette_includes_imported_terminal_profiles() {
     let rows = shell_palette_rows(
         Vec::new(),
         vec![profile],
-        None::<(String, String)>,
+        &Default::default(),
         &id,
         crate::display::UiLanguage::ZhCn,
         1.0,
@@ -879,8 +880,11 @@ fn ai_session_palette_exposes_verified_resume_and_fork_commands() {
             "Unsupported",
         ),
     ];
-    let rows = ai_session_palette_rows(sessions);
+    let rows = ai_session_palette_rows(sessions, crate::i18n::UiLanguage::EnUs);
     assert_eq!(rows.len(), 2, "Claude supports resume and fork; Aider supports neither");
+    assert_eq!(rows[0].label, "Fix resize");
+    assert!(rows[0].hint.starts_with("Resume · "));
+    assert_eq!(rows[1].label, "Fork · Fix resize");
     assert!(matches!(
         &rows[0].action,
         WorkspacePaletteAction::RunAiSession { command, .. }

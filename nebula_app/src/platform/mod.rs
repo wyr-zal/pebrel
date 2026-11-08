@@ -11,6 +11,7 @@
 
 #[cfg(feature = "gpui-shell")]
 pub(crate) mod acrylic;
+pub(crate) mod agent_launch;
 pub(crate) mod ai_session_identity;
 pub(crate) mod agent_process_identity;
 #[cfg(all(feature = "gpui-shell", feature = "video-background"))]
@@ -35,23 +36,32 @@ pub(crate) mod global_shortcut;
 pub(crate) mod hermes_session;
 #[cfg(all(windows, feature = "gpui-shell"))]
 pub(crate) mod keyboard;
+pub(crate) mod launch_directory;
 pub(crate) mod local_paths;
 pub mod notifications;
 pub(crate) mod pi_session;
+pub(crate) mod private_file;
 pub(crate) mod process;
 pub(crate) mod process_output;
 pub(crate) mod process_snapshot;
 #[cfg(all(windows, feature = "gpui-shell"))]
 pub(crate) mod quick_window;
+pub(crate) mod serial_port;
+#[cfg(feature = "gpui-shell")]
+pub(crate) mod session_end;
 pub mod shell;
 pub mod shell_integration;
 #[cfg(unix)]
 mod sound;
 pub(crate) mod ssh_agent;
+#[cfg(all(test, target_os = "macos"))]
+mod ssh_config_probe_tests;
 pub mod startup;
 #[cfg(unix)]
 pub(crate) mod tray_native;
 pub(crate) mod update_installation;
+#[cfg(feature = "gpui-shell")]
+pub(crate) mod video_underlay;
 #[cfg(feature = "gpui-shell")]
 pub(crate) mod window_capture;
 #[cfg(feature = "gpui-shell")]
@@ -60,6 +70,7 @@ pub(crate) mod window_chrome;
 pub(crate) mod window_material;
 #[cfg(all(unix, feature = "gpui-shell"))]
 pub(crate) mod window_visibility;
+pub(crate) mod wsl_guest_shell;
 pub(crate) mod wsl_hooks;
 #[cfg(windows)]
 pub(crate) mod wsl_location;

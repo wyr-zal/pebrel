@@ -3,10 +3,11 @@ use super::*;
 
 impl Render for NebulaWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.spinner_visible.set(false);
         let theme_transition = self.theme_transition.render(window, cx);
         crate::gpui_shell::theme::sync_component_focus_ring(window, cx);
         if window.is_window_active() {
-            windowing::mark_active(self.runtime_window_id, cx);
+            windowing::mark_active(self.runtime_window_id, window, cx);
         }
         if !cx.has_active_drag() {
             self.cross_window_dock = None;
@@ -58,6 +59,13 @@ impl Render for NebulaWorkspace {
             }
         };
         let settings_active = self.settings_open;
+        let settings_content = settings_active
+            || matches!(self.tabs.get(self.active), Some(WorkspaceTab::Settings { .. }));
+        let content_background = if settings_content {
+            crate::gpui_shell::theme::settings_content_bg(cx)
+        } else {
+            crate::gpui_shell::theme::card_content_bg(cx)
+        };
         let top_tabs = self.tabs_position == nebula_settings::TabsPositionName::Top;
         let reader_focus = self.reader_focus_active(cx);
         // dock 预览：被拖 tab 悬于终端区时高亮目标半区（松手即挂到那侧）。
@@ -77,6 +85,7 @@ impl Render for NebulaWorkspace {
             // 旧壳每个像素只画一次：整窗先透明清屏，再分别画标题栏、侧栏、
             // 卡外壳与卡底。根节点不能再铺一张半透明底。
             .bg(gpui::transparent_black())
+            .font(crate::gpui_shell::typography::ui_font(cx))
             .text_color(cx.theme().foreground)
             .can_drop({
                 let runtime_window_id = self.runtime_window_id;
@@ -116,9 +125,6 @@ impl Render for NebulaWorkspace {
                 this.update_details_panel_resize(event, window, cx);
                 this.update_left_sidebar_resize(event, window, cx);
                 this.continue_pending_tab_drag(event, window, cx);
-                // pane 拖拽的待命态同理：罩层只在激活后才存在，越阈值那一下
-                // 的 move 必须由根节点喂进去。
-                this.continue_pending_pane_drag(event, cx);
             }))
             // 旧壳在窗口级 mouse-up 无条件结束 tab drag。这里必须走 capture：
             // TerminalView 可能在 bubble phase 消费释放，导致 dock 永远不提交。
@@ -132,7 +138,7 @@ impl Render for NebulaWorkspace {
                 }
                 // pane 拖拽先结算：它和 tab 拖拽互斥（起手位置不同），但待命态
                 // 必须在这里清掉，否则下一次点标题条会带着上一次的按点。
-                let pane_dragged = this.release_pane_drag(window, cx);
+                let pane_dragged = this.release_pane_drag(event.position, window, cx);
                 if this.release_tab_drag_at(event.position, event.modifiers.alt, window, cx)
                     || pane_dragged
                 {
@@ -318,7 +324,7 @@ impl Render for NebulaWorkspace {
                             div()
                                 .size_full()
                                 .rounded(px(card_style.radius))
-                                .bg(crate::gpui_shell::theme::card_content_bg(cx))
+                                .bg(content_background)
                                 .when(card_style.shadow, |card| {
                                     // 投影落在有圆角的这一层，才会跟着卡的形状走。
                                     // 父容器没有 overflow_hidden，所以 blur 可以溢出
@@ -404,10 +410,11 @@ impl Render for NebulaWorkspace {
             .children(self.render_details_panel_resize_handle(window, cx))
             .children(self.render_details_panel_resize_overlay(cx))
             .children(self.tabs_scrollbar_drag_overlay(cx))
+            .child(self.pane_drag_capture(cx))
             .children(self.pane_drag_overlay(cx))
             .children(self.split_drag_visual(cx))
             .children(self.render_left_sidebar_resize_overlay(cx))
-            .when(self.tab_drag.is_some(), |root| {
+            .when(self.pointer_drag_active(), |root| {
                 // 拖拽期间挂窗口级裸监听（canvas 在 paint 期注册）：指针移出
                 // 本窗口后的事件坐标在 viewport 之外，hover 门控的监听器全部
                 // 不触发——跨窗合并与「拖出窗口外撕出」都在那里松手，靠它
@@ -441,7 +448,7 @@ impl Render for NebulaWorkspace {
                 },
             )
             .when(self.command_palette_open, |root| {
-                root.child(self.render_command_palette(cx))
+                root.child(self.render_command_palette(window, cx))
             })
             .when(self.command_manager_open, |root| {
                 root.child(self.render_command_manager(window, cx))

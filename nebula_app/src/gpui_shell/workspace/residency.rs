@@ -55,12 +55,40 @@ impl NebulaWorkspace {
         rx: std::sync::mpsc::Receiver<GpuiShellEvent>,
         cx: &mut Context<Self>,
     ) {
+        use futures::StreamExt as _;
+        use futures::future::{Either, select};
+
+        // Runtime 请求在这里排队等 UI 线程处理。只按固定节拍取件时，手机和 CLI
+        // 的每个串行请求都要等满一拍（约 120 ms）；转发线程收到事件就唤醒，
+        // 空闲时仍按原节拍 dispatch，运行时快照照旧周期发布。
+        let (forward, mut queued) = futures::channel::mpsc::unbounded();
+        std::thread::Builder::new()
+            .name("pebrel-shell-events".into())
+            .spawn(move || {
+                while let Ok(event) = rx.recv() {
+                    if forward.unbounded_send(event).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn shell event forwarder");
         let executor = cx.background_executor().clone();
         cx.spawn(async move |_this, cx| {
+            let mut open = true;
             loop {
-                executor.timer(Duration::from_millis(120)).await;
+                let tick = executor.timer(Duration::from_millis(120));
                 let mut events = Vec::new();
-                while let Ok(event) = rx.try_recv() {
+                if open {
+                    match select(tick, queued.next()).await {
+                        Either::Left(_) => {},
+                        Either::Right((Some(event), _)) => events.push(event),
+                        // 所有发送端都已释放：退回纯节拍，避免已关闭的通道空转。
+                        Either::Right((None, _)) => open = false,
+                    }
+                } else {
+                    tick.await;
+                }
+                while let Ok(event) = queued.try_recv() {
                     events.push(event);
                 }
 
@@ -100,6 +128,15 @@ impl NebulaWorkspace {
                 GpuiShellEvent::MuxAttach => self.reveal_session(cx),
                 GpuiShellEvent::RuntimeControl(dispatch) => {
                     self.queue_or_answer_runtime(dispatch.clone(), cx);
+                },
+                GpuiShellEvent::ElevatedLaunch(request) => {
+                    let request = request.clone();
+                    cx.defer(move |cx| {
+                        super::windowing::dispatch_shell_events(
+                            vec![GpuiShellEvent::ElevatedLaunch(request)],
+                            cx,
+                        )
+                    });
                 },
                 // 更新通知由进程级 windowing dispatcher 选择 MRU 窗口；这个
                 // 旧的 workspace-local 分发器没有 Window，不能在此打开 Dialog。
@@ -555,7 +592,14 @@ impl NebulaWorkspace {
                 serde_json::to_value(read)
                     .map_err(|error| ApiError::new("serialization_failed", error.to_string()))
             },
-            RuntimeCommand::ScrollPane { window_id, pane_id, lines, column, row } => {
+            RuntimeCommand::ScrollPane {
+                window_id,
+                pane_id,
+                lines,
+                column,
+                row,
+                application_only,
+            } => {
                 self.runtime_window_requested(*window_id)?;
                 let tab_ix = self.tab_of_pane(*pane_id).ok_or_else(|| {
                     ApiError::new("target_not_found", "scroll pane does not exist")
@@ -569,7 +613,9 @@ impl NebulaWorkspace {
                         .clone(),
                     _ => unreachable!("tab_of_pane only resolves terminal tabs"),
                 };
-                view.update(cx, |view, cx| view.runtime_scroll(*lines, *column, *row, window, cx))?;
+                view.update(cx, |view, cx| {
+                    view.runtime_scroll(*lines, *column, *row, *application_only, window, cx)
+                })?;
                 // 连续手势不改变窗口清单；不为每个滚轮回执重建整窗状态快照。
                 Ok(json!({"action": {"window_id": self.runtime_window_id,
                     "pane_id": pane_id, "lines": lines}}))
@@ -1070,6 +1116,7 @@ impl NebulaWorkspace {
             } else {
                 super::session_persistence::SaveReason::Checkpoint
             },
+            window,
             cx,
         ) {
             log::warn!("Could not checkpoint before hiding window: {error}");
@@ -1200,6 +1247,7 @@ mod tests {
                     lines: 1,
                     column: 0,
                     row: 0,
+                    application_only: false,
                 };
                 let reply = workspace.execute_runtime_command(&command, window, cx).unwrap();
                 assert!(reply.get("snapshot").is_none());

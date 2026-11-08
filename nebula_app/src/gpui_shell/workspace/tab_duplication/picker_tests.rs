@@ -102,7 +102,7 @@ fn check_picker(cx: &mut TestAppContext, profile: bool, explicit_directory: bool
                 workspace.palette_override = Some(shell_palette_rows(
                     if profile { vec![] } else { vec![shell.clone()] },
                     if profile { vec![target_profile.clone()] } else { vec![] },
-                    vec![],
+                    &Default::default(),
                     configured_shell.as_deref().unwrap(),
                     crate::display::UiLanguage::EnUs,
                     1.0,
@@ -198,7 +198,7 @@ fn picker_wsl_profile_keeps_its_explicit_cd(cx: &mut TestAppContext) {
             workspace.palette_override = Some(shell_palette_rows(
                 vec![],
                 vec![own_guest.clone()],
-                vec![],
+                &Default::default(),
                 configured_shell.as_deref().unwrap(),
                 crate::display::UiLanguage::EnUs,
                 1.0,

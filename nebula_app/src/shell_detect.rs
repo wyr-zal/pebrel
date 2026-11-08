@@ -3,7 +3,7 @@
 //! Third-party provenance for this module and its icon assets is recorded
 //! in THIRD-PARTY-NOTICES at the repository root. The menu lists what's
 //! actually installed, in a stable, familiar order:
-//! PowerShell 7 → Windows PowerShell → CMD → Git Bash → Nushell → WSL distros.
+//! PowerShell 7 → Windows PowerShell → CMD → Git Bash → Zsh → Nushell → WSL distros.
 //!
 //! Detection touches the filesystem and the registry, so callers run it ONCE
 //! per process (at first menu open) and cache the result — see
@@ -379,6 +379,15 @@ fn detect_windows() -> Vec<DetectedShell> {
         });
     }
 
+    // Prefer PATH, then the standard MSYS2 installs. Other locations can be
+    // imported explicitly; discovery never executes a shell to identify it.
+    let directories: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    shells.extend(find_windows_zsh(
+        directories.into_iter().chain([PathBuf::from(r"C:\msys64"), PathBuf::from(r"C:\msys32")]),
+    ));
+
     // Nushell — installed per-user; only ever listed via fragment files.
     if let Some(program) = find_nushell() {
         shells.push(DetectedShell {
@@ -394,6 +403,22 @@ fn detect_windows() -> Vec<DetectedShell> {
     shells.extend(find_wsl_distros());
 
     shells
+}
+
+/// Reuse directory import's executable validation, shell identity and arguments.
+fn find_windows_zsh(directories: impl IntoIterator<Item = PathBuf>) -> Option<DetectedShell> {
+    directories.into_iter().filter(|directory| directory.is_absolute()).find_map(|directory| {
+        let profile = crate::terminal_profiles::scan_directory(&directory)
+            .ok()?
+            .into_iter()
+            .find(|profile| profile.shell_id == "zsh")?;
+        Some(DetectedShell {
+            name: profile.name,
+            id: profile.shell_id,
+            program: profile.command.to_string_lossy().into_owned(),
+            args: profile.args,
+        })
+    })
 }
 
 #[cfg(windows)]
@@ -542,6 +567,7 @@ pub(crate) struct WslOptions<'a> {
     selects_distribution: bool,
     /// The launch picks its own start directory: a leading `~`, `--cd` or `--cd=`.
     pub(crate) chooses_directory: bool,
+    pub(crate) command: Option<&'a str>,
     invalid_scope: bool,
     unsupported_distribution_selector: bool,
 }
@@ -584,8 +610,7 @@ fn wsl_options(args: &[String]) -> WslOptions<'_> {
         index += 2;
         match arg.as_str() {
             "-d" | "--distribution" => {
-                if value.is_none()
-                    || options.distro.is_some_and(|previous| Some(previous) != value)
+                if value.is_none() || options.distro.is_some_and(|previous| Some(previous) != value)
                 {
                     options.invalid_scope = true;
                 }
@@ -604,7 +629,10 @@ fn wsl_options(args: &[String]) -> WslOptions<'_> {
             },
             "--cd" => options.chooses_directory = true,
             "--shell-type" => {},
-            "--" | "-e" | "--exec" => break,
+            "--" | "-e" | "--exec" => {
+                options.command = value;
+                break;
+            },
             option => {
                 index -= 1;
                 if option == "--system" || option.starts_with("--distribution-id=") {
@@ -626,6 +654,7 @@ fn wsl_options(args: &[String]) -> WslOptions<'_> {
                 } else if option.starts_with("--cd=") {
                     options.chooses_directory = true;
                 } else if !option.starts_with("--shell-type=") {
+                    options.command = Some(option);
                     break;
                 }
             },
@@ -678,6 +707,19 @@ pub fn wsl_guest_cwd(cwd: &str) -> Option<&str> {
 /// A path `wsl.exe` cannot receive as one argument (see [`wsl_raw_arg`]) is refused.
 pub fn wsl_args_at(program: &str, args: &[String], cwd: &str) -> Option<Vec<String>> {
     if !cwd.starts_with('/') || cwd.chars().any(char::is_control) {
+        return None;
+    }
+    wsl_args_with_directory(program, args, Some(&wsl_raw_arg(cwd)?))
+}
+
+/// An explicit startup directory may be a guest path, guest home or an already
+/// validated absolute host path. Keep WSL's raw argument quoting in one place.
+pub(crate) fn wsl_args_in_directory(
+    program: &str,
+    args: &[String],
+    cwd: &str,
+) -> Option<Vec<String>> {
+    if cwd.is_empty() || cwd.chars().any(char::is_control) {
         return None;
     }
     wsl_args_with_directory(program, args, Some(&wsl_raw_arg(cwd)?))
@@ -791,12 +833,17 @@ pub struct WslCwd {
     pub guest: String,
 }
 
-/// `wsl.exe -d <distro> --exec` for host-side guest helpers (git, find, cat):
-/// `--` would let the guest's login shell expand a reported cwd. Append arguments
-/// through `Command::arg`/`args`; never join them into shell text.
-pub(crate) fn wsl_exec_command(distro: &str) -> std::process::Command {
+/// `wsl.exe -d <distro> [-u <user>] --exec` for host-side guest helpers (git,
+/// find, cat, the shell probe): `--` would let the guest's login shell expand a
+/// reported cwd. Append arguments through `Command::arg`/`args`; never join them
+/// into shell text.
+pub(crate) fn wsl_exec_command(distro: &str, user: Option<&str>) -> std::process::Command {
     let mut command = std::process::Command::new("wsl.exe");
-    command.args(["-d", distro, "--exec"]);
+    command.args(["-d", distro]);
+    if let Some(user) = user {
+        command.args(["-u", user]);
+    }
+    command.arg("--exec");
     command
 }
 
@@ -852,8 +899,8 @@ pub fn wsl_unc_cwd(located: &WslCwd) -> Option<std::path::PathBuf> {
 /// 都只会让命令身份不上报，不影响 shell 正常启动。
 pub fn wsl_cwd_report_env(
     program: &str,
-    _args: &[String],
     current_wslenv: Option<&str>,
+    zsh_integration: Option<&str>,
 ) -> Vec<(String, String)> {
     if !is_wsl_launcher(program) {
         return Vec::new();
@@ -863,9 +910,22 @@ pub fn wsl_cwd_report_env(
     const REPORT: &str = r#"__nebula_status=$?
 if [ -z "${__pebrel_shell_token:-}" ]; then
     __pebrel_shell_token=$(printf '%s' "wsl|${WSL_DISTRO_NAME:-}|bash:${HOSTNAME:-wsl}:${BASHPID:-$$}:$RANDOM" | base64 | tr -d '\r\n')
+    if [ -n "${NEBULA_ZSH_INTEGRATION:-}" ]; then
+        [ "${ZDOTDIR-}" = "$NEBULA_ZSH_INTEGRATION" ] && unset ZDOTDIR
+        unset NEBULA_ZSH_INTEGRATION
+        __nebula_keep=
+        for __nebula_entry in ${WSLENV//:/ }; do
+            case ${__nebula_entry%%/*} in
+                ZDOTDIR|NEBULA_ZSH_INTEGRATION) ;;
+                *) __nebula_keep=${__nebula_keep:+$__nebula_keep:}$__nebula_entry ;;
+            esac
+        done
+        WSLENV=$__nebula_keep
+        unset __nebula_keep __nebula_entry
+    fi
     __PEBREL_CONNECTION_HOOK__
 fi
-IFS= read -r __pebrel_command_id < /proc/sys/kernel/random/uuid || __pebrel_command_id=
+IFS= read -r __pebrel_command_id 2>/dev/null < /proc/sys/kernel/random/uuid || __pebrel_command_id=
 __pebrel_command_id=${__pebrel_command_id//-/}
 if [[ ! $__pebrel_command_id =~ ^[[:xdigit:]]{32}$ ]]; then
     printf -v __pebrel_command_id '%08x%08x%08x%08x' "${BASHPID:-$$}" "$SECONDS" "$RANDOM" "$RANDOM"
@@ -895,19 +955,59 @@ if typeset -f __pebrel_editor_ready_report >/dev/null; then __pebrel_editor_read
 printf '\033]133;D;%s\007\033]7;file://%s%s\007\033]133;A\007' "$__nebula_status" "${HOSTNAME:-wsl}" "$PWD"
 __pebrel_at_prompt=1"#;
     // 宿主侧可能已经有 WSLENV（别的工具设的），必须追加而不是覆盖。
-    let mut wslenv = current_wslenv
-        .map(str::to_owned)
-        .or_else(|| std::env::var("WSLENV").ok())
-        .unwrap_or_default();
-    if !wslenv.is_empty() && !wslenv.split(':').any(|entry| entry == "PROMPT_COMMAND") {
-        wslenv.push(':');
-    }
-    if !wslenv.split(':').any(|entry| entry == "PROMPT_COMMAND") {
-        wslenv.push_str("PROMPT_COMMAND");
-    }
+    let mut wslenv = effective_wslenv(current_wslenv);
     let report =
         REPORT.replace("__PEBREL_CONNECTION_HOOK__", nebula_terminal::tty::connection_shell());
-    vec![("PROMPT_COMMAND".to_owned(), report), ("WSLENV".to_owned(), wslenv)]
+    let mut additions = vec![("PROMPT_COMMAND".to_owned(), report)];
+    append_wslenv(&mut wslenv, "PROMPT_COMMAND");
+    if let Some(directory) = zsh_integration {
+        // `/u` keeps them from Windows programs; the guest scripts drop them for nested guests.
+        for name in WSL_ZSH_TAKEOVER {
+            additions.push((name.to_owned(), directory.to_owned()));
+            append_wslenv(&mut wslenv, &format!("{name}/pu"));
+        }
+    }
+    additions.push(("WSLENV".to_owned(), wslenv));
+    additions
+}
+
+/// The variables of [`wsl_cwd_report_env`]'s zsh takeover.
+const WSL_ZSH_TAKEOVER: [&str; 2] = ["ZDOTDIR", "NEBULA_ZSH_INTEGRATION"];
+
+/// Remove the zsh takeover from a pane environment for a `wsl.exe --exec`
+/// helper (`pane.exec`, Runtime git): it never runs the bootstrap `.zshenv`
+/// that undoes it, so an installer would overwrite the bootstrap and a nested
+/// `wsl.exe` would carry it into another guest.
+pub(crate) fn strip_wsl_zsh_takeover(env: &mut std::collections::HashMap<String, String>) {
+    let Some(bootstrap) = env.remove("NEBULA_ZSH_INTEGRATION") else { return };
+    if env.get("ZDOTDIR") == Some(&bootstrap) {
+        env.remove("ZDOTDIR");
+    }
+    if let Some(wslenv) = env.get_mut("WSLENV") {
+        *wslenv = wslenv
+            .split(':')
+            .filter(|entry| !WSL_ZSH_TAKEOVER.contains(&wslenv_name(entry)))
+            .collect::<Vec<_>>()
+            .join(":");
+    }
+}
+
+/// Whether a guest program is zsh (`zsh`, `/usr/bin/zsh`, `zsh-5.9`); an empty
+/// or unknown name is not.
+pub(crate) fn is_zsh_program(command: &str) -> bool {
+    let name = command.rsplit('/').next().unwrap_or(command);
+    name == "zsh" || name.starts_with("zsh-")
+}
+
+/// The `WSLENV` a spawn starts from: the pane environment's value if it has one,
+/// otherwise this process's.
+pub(crate) fn effective_wslenv(current: Option<&str>) -> String {
+    current.map(str::to_owned).or_else(|| std::env::var("WSLENV").ok()).unwrap_or_default()
+}
+
+/// Whether `WSLENV` already forwards `name`, with or without flags.
+pub(crate) fn wslenv_forwards(wslenv: &str, name: &str) -> bool {
+    wslenv.split(':').any(|entry| wslenv_name(entry) == name)
 }
 
 /// The shell a local pane spawns from the configured launch (`effective`) and
@@ -925,6 +1025,23 @@ pub(crate) fn spawn_shell(
         Some(args) => Some(nebula_terminal::tty::Shell::new(shell.program().to_owned(), args)),
         None => Some(shell),
     }
+}
+
+/// Append a `WSLENV` entry, deduplicated by variable name: an existing entry for
+/// the same name (whatever its flags) is kept as is.
+pub(crate) fn append_wslenv(wslenv: &mut String, entry: &str) {
+    if wslenv_forwards(wslenv, wslenv_name(entry)) {
+        return;
+    }
+    if !wslenv.is_empty() {
+        wslenv.push(':');
+    }
+    wslenv.push_str(entry);
+}
+
+/// The variable name of a `WSLENV` entry (`NEBULA_CLI/p` → `NEBULA_CLI`).
+pub(crate) fn wslenv_name(entry: &str) -> &str {
+    entry.split('/').next().unwrap_or(entry)
 }
 
 /// WSL automount 路径（仅 `/mnt/<盘>`）→ 宿主可见且已确认存在的目录。
@@ -1026,6 +1143,50 @@ fn find_wsl_distros() -> Vec<DetectedShell> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn windows_zsh_discovery_preserves_path_precedence_and_launch_arguments() {
+        let temp = tempfile::tempdir().unwrap();
+        let path_directory = temp.path().join("shells with spaces");
+        let msys = temp.path().join("msys64");
+        let msys_bin = msys.join("usr").join("bin");
+        let missing = temp.path().join("missing");
+        assert!(super::find_windows_zsh([missing.clone(), temp.path().to_path_buf()]).is_none());
+
+        // A minimal x86 PE header is accepted on all supported Windows hosts.
+        let mut executable = vec![0_u8; 0x86];
+        executable[..2].copy_from_slice(b"MZ");
+        executable[0x3c..0x40].copy_from_slice(&0x80_u32.to_le_bytes());
+        executable[0x80..0x84].copy_from_slice(b"PE\0\0");
+        executable[0x84..0x86].copy_from_slice(&0x014c_u16.to_le_bytes());
+        for directory in [&path_directory, &msys_bin] {
+            std::fs::create_dir_all(directory).unwrap();
+            for name in ["bash.exe", "zsh.exe"] {
+                std::fs::write(directory.join(name), &executable).unwrap();
+            }
+        }
+
+        for (directories, expected) in [
+            (
+                vec![
+                    missing.clone(),
+                    path_directory.join("zsh.exe"),
+                    path_directory.clone(),
+                    msys.clone(),
+                ],
+                path_directory,
+            ),
+            (vec![missing, msys], msys_bin),
+        ] {
+            let detected = super::find_windows_zsh(directories).expect("installed Zsh");
+            let command = expected.join("zsh.exe").canonicalize().unwrap();
+            assert_eq!(detected.id, "zsh");
+            assert_eq!(detected.name, "Zsh");
+            assert_eq!(detected.integration(), super::ShellIntegration::Unsupported);
+            assert_eq!(detected.shell().program(), command.to_str().unwrap());
+            assert_eq!(detected.shell().args(), ["--login", "-i"]);
+        }
+    }
+
+    #[test]
     fn zellij_discovery_requires_an_installed_program_and_preserves_argv() {
         let directory = tempfile::tempdir().unwrap();
         assert!(super::find_zellij([directory.path().to_path_buf()]).is_none());
@@ -1053,12 +1214,19 @@ mod tests {
     #[test]
     fn observed_wsl_scope_requires_one_explicit_supported_distribution() {
         let scope = |args: &[&str]| {
-            super::wsl_explicit_scope("wsl.exe", &args.iter().map(|arg| (*arg).into()).collect::<Vec<_>>())
+            super::wsl_explicit_scope(
+                "wsl.exe",
+                &args.iter().map(|arg| (*arg).into()).collect::<Vec<_>>(),
+            )
         };
-        assert_eq!(scope(&["-d", "Ubuntu-22.04", "--cd", "/mnt/f/ProjectLearn", "-e", "sh"]),
-            Some(("Ubuntu-22.04".into(), None)));
-        assert_eq!(scope(&["--distribution=Ubuntu", "--user", "wyr", "--exec", "sh"]),
-            Some(("Ubuntu".into(), Some("wyr".into()))));
+        assert_eq!(
+            scope(&["-d", "Ubuntu-22.04", "--cd", "/mnt/f/ProjectLearn", "-e", "sh"]),
+            Some(("Ubuntu-22.04".into(), None))
+        );
+        assert_eq!(
+            scope(&["--distribution=Ubuntu", "--user", "wyr", "--exec", "sh"]),
+            Some(("Ubuntu".into(), Some("wyr".into())))
+        );
         for args in [
             vec!["--exec", "sh"],
             vec!["--system", "--exec", "sh"],
@@ -1240,30 +1408,37 @@ mod tests {
     }
 
     /// Identity comes from WSL's own option region only, in every accepted spelling:
-    /// (arguments, distribution, user, chooses a directory); which distribution
-    /// each selector enters is `spawn_snapshot_pins_bare_wsl_launches_only`.
+    /// (arguments, distribution, user, chooses a directory, guest command); which
+    /// distribution each selector enters is `spawn_snapshot_pins_bare_wsl_launches_only`.
     #[test]
     fn wsl_identity_reads_only_the_option_region() {
-        type Case<'a> = (&'a [&'a str], Option<&'a str>, Option<&'a str>, bool);
-        let cases: [Case; 11] = [
-            (&[], None, None, false),
-            (&["--distribution=Debian"], Some("Debian"), None, false),
-            (&["~", "-u", "dev", "-d", "Debian"], Some("Debian"), Some("dev"), true),
-            (&["--cd", "/x", "--shell-type=login", "--user=dev"], None, Some("dev"), true),
-            (&["--system"], None, None, false),
-            (&["--distribution-id={0000}"], None, None, false),
-            (&["-d", ""], None, None, false),
-            (&["--", "tool", "-d", "x", "-u", "root", "--cd", "/y"], None, None, false),
-            (&["-e", "tool", "-d", "x"], None, None, false),
-            (&["-d", "Ubuntu", "htop", "-d", "1", "--cd", "/y"], Some("Ubuntu"), None, false),
-            (&["--user"], None, None, false),
+        type Case<'a> = (&'a [&'a str], Option<&'a str>, Option<&'a str>, bool, Option<&'a str>);
+        let cases: [Case; 12] = [
+            (&[], None, None, false, None),
+            (&["--distribution=Debian"], Some("Debian"), None, false, None),
+            (&["~", "-u", "dev", "-d", "Debian"], Some("Debian"), Some("dev"), true, None),
+            (&["--cd", "/x", "--shell-type=login", "--user=dev"], None, Some("dev"), true, None),
+            (&["--system"], None, None, false, None),
+            (&["--distribution-id={0000}"], None, None, false, None),
+            (&["-d", ""], None, None, false, None),
+            (&["-e", "zsh", "-l"], None, None, false, Some("zsh")),
+            (
+                &["--", "tool", "-d", "x", "-u", "root", "--cd", "/y"],
+                None,
+                None,
+                false,
+                Some("tool"),
+            ),
+            (&["--exec", "fish"], None, None, false, Some("fish")),
+            (&["-d", "Ubuntu", "htop", "-d", "1"], Some("Ubuntu"), None, false, Some("htop")),
+            (&["--user"], None, None, false, None),
         ];
-        for (args, distro, user, directory) in cases {
+        for (args, distro, user, directory, command) in cases {
             let args = owned(args);
             let options = super::wsl_launch("wsl", &args).unwrap();
             assert_eq!(
-                (options.distro, options.user, options.chooses_directory),
-                (distro, user, directory),
+                (options.distro, options.user, options.chooses_directory, options.command),
+                (distro, user, directory, command),
                 "{args:?}"
             );
         }
@@ -1273,9 +1448,11 @@ mod tests {
             super::wsl_spawn_distro(spaced, &owned(&["-d", "Debian"])).as_deref(),
             Some("Debian")
         );
-        assert!(!wsl_cwd_report_env(spaced, &[], None).is_empty());
+        assert!(!wsl_cwd_report_env(spaced, None, None).is_empty());
         assert!(super::wsl_launch("pwsh.exe", &owned(&["-d", "Debian"])).is_none());
-        assert!(wsl_cwd_report_env("pwsh.exe", &[], None).is_empty());
+        assert!(wsl_cwd_report_env("pwsh.exe", None, Some(r"C:\x")).is_empty());
+        assert!(is_zsh_program("/usr/bin/zsh") && is_zsh_program("zsh-5.9"));
+        assert!(!is_zsh_program("") && !is_zsh_program("/usr/bin/fish"));
     }
 
     #[test]
@@ -1381,11 +1558,7 @@ mod tests {
 
     #[test]
     fn wsl_cwd_report_preserves_the_refreshed_wslenv() {
-        let additions = wsl_cwd_report_env(
-            "wsl.exe",
-            &["-d".to_owned(), "Ubuntu".to_owned()],
-            Some("FRESH_REGISTRY_VALUE/u"),
-        );
+        let additions = wsl_cwd_report_env("wsl.exe", Some("FRESH_REGISTRY_VALUE/u"), None);
         let additions: std::collections::HashMap<_, _> = additions.into_iter().collect();
 
         assert_eq!(
@@ -1401,6 +1574,33 @@ mod tests {
         assert!(prompt_command.contains("pebrel_command=%s"));
         assert!(prompt_command.contains("trap '__pebrel_preexec \"$BASH_COMMAND\"' DEBUG"));
         assert!(!prompt_command.contains('\r'));
+        assert!(!additions.contains_key("ZDOTDIR"), "zsh takeover is opt-in per spawn");
+    }
+
+    #[test]
+    fn wsl_zsh_takeover_travels_through_wslenv_and_never_reaches_guest_helpers() {
+        let dir = r"C:\Users\guest\AppData\Roaming\Pebrel\shell-integration\wsl-zsh";
+        let additions: std::collections::HashMap<_, _> =
+            wsl_cwd_report_env("wsl.exe", Some("KEEP/u"), Some(dir)).into_iter().collect();
+        assert_eq!(additions.get("ZDOTDIR").map(String::as_str), Some(dir));
+        assert_eq!(additions.get("NEBULA_ZSH_INTEGRATION").map(String::as_str), Some(dir));
+        assert_eq!(
+            additions.get("WSLENV").map(String::as_str),
+            Some("KEEP/u:PROMPT_COMMAND:ZDOTDIR/pu:NEBULA_ZSH_INTEGRATION/pu")
+        );
+        // `wsl.exe --exec` helpers never run the bootstrap that undoes the takeover.
+        let mut helper = additions.clone();
+        strip_wsl_zsh_takeover(&mut helper);
+        assert!(!helper.contains_key("ZDOTDIR") && !helper.contains_key("NEBULA_ZSH_INTEGRATION"));
+        assert_eq!(helper.get("WSLENV").map(String::as_str), Some("KEEP/u:PROMPT_COMMAND"));
+        // A ZDOTDIR the takeover did not set, and the user's forwarded one, stay.
+        let mut own = std::collections::HashMap::from([
+            ("ZDOTDIR".to_owned(), "/home/me/.config/zsh".to_owned()),
+            ("WSLENV".to_owned(), "ZDOTDIR/p".to_owned()),
+        ]);
+        let untouched = own.clone();
+        strip_wsl_zsh_takeover(&mut own);
+        assert_eq!(own, untouched);
     }
 
     #[test]
@@ -1408,7 +1608,7 @@ mod tests {
         use std::io::Write;
         use std::process::{Command, Stdio};
 
-        let environment = wsl_cwd_report_env("wsl.exe", &[], Some("PROMPT_COMMAND:KEEP/u"));
+        let environment = wsl_cwd_report_env("wsl.exe", Some("PROMPT_COMMAND:KEEP/u"), None);
         assert_eq!(environment[1].1, "PROMPT_COMMAND:KEEP/u");
         let prompt = &environment[0].1;
         let bash = std::env::var_os("NEBULA_BASH").unwrap_or_else(|| {
@@ -1426,6 +1626,10 @@ mod tests {
                 .env("BASH_ENV", "/dev/null")
                 .env("PROMPT_COMMAND", prompt)
                 .env_remove("__pebrel_shell_token")
+                // A bash guest must drop the zsh-only bootstrap variables.
+                .env("ZDOTDIR", "/mnt/c/pebrel/wsl-zsh")
+                .env("NEBULA_ZSH_INTEGRATION", "/mnt/c/pebrel/wsl-zsh")
+                .env("WSLENV", "KEEP/u:ZDOTDIR/pu:NEBULA_ZSH_INTEGRATION/pu")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -1435,6 +1639,7 @@ mod tests {
                 r#"{user_function}
 (exit 7); eval "$PROMPT_COMMAND" || exit 91
 typeset -f __pebrel_connection >/dev/null || exit 92
+test -z "${{ZDOTDIR+x}}${{NEBULA_ZSH_INTEGRATION+x}}" && test "$WSLENV" = KEEP/u || exit 98
 typeset -f ssh >/dev/null || exit 93
 token=$__pebrel_shell_token
 test -n "$token" || exit 94

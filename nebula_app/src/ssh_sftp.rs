@@ -2,6 +2,8 @@
 pub(crate) mod document;
 #[path = "ssh_sftp/export.rs"]
 pub(crate) mod export;
+#[path = "ssh_sftp/intake.rs"]
+pub(crate) mod intake;
 #[path = "ssh_sftp/limits.rs"]
 pub(crate) mod limits;
 #[path = "ssh_sftp/remote_cwd.rs"]
@@ -292,22 +294,25 @@ impl SftpController {
     }
 
     pub fn download(&self, entry: SftpEntry, local_directory: PathBuf) {
-        self.download_with_options(entry, local_directory, SftpTransferOptions::default());
+        self.download_with_options(vec![entry], local_directory, SftpTransferOptions::default());
     }
 
     pub(crate) fn download_with_options(
         &self,
-        entry: SftpEntry,
+        entries: Vec<SftpEntry>,
         local_directory: PathBuf,
         options: SftpTransferOptions,
     ) {
+        if entries.is_empty() {
+            return;
+        }
         let snapshot = self.snapshot();
         let destination = snapshot.destination;
         let path = snapshot.path;
-        let progress = TransferProgress::new(entry.name.clone(), entry.size);
+        let progress = TransferProgress::new(entries_label(&entries), 0);
         self.start_job(SftpPhase::Working, Some(progress), move |context| async move {
             let sftp = crate::ssh_session::open_sftp(&destination).await?;
-            download_remote_entry(&sftp, entry, local_directory, options, &context).await?;
+            download_remote_entries(&sftp, entries, local_directory, options, &context).await?;
             let entries = read_remote_dir(&sftp, &path).await?;
             Ok((path, entries))
         });
@@ -316,18 +321,20 @@ impl SftpController {
     pub(crate) fn copy_from(
         &self,
         source_destination: String,
-        entry: SftpEntry,
+        entries: Vec<SftpEntry>,
         options: SftpTransferOptions,
     ) {
+        if entries.is_empty() {
+            return;
+        }
         let snapshot = self.snapshot();
         let destination = snapshot.destination;
         let path = snapshot.path;
-        let progress =
-            TransferProgress::new(format!("复制 {}", entry.name), entry.size.saturating_mul(2));
+        let progress = TransferProgress::new(entries_label(&entries), 0);
         self.start_job(SftpPhase::Working, Some(progress), move |context| async move {
             let source = crate::ssh_session::open_sftp(&source_destination).await?;
             let target = crate::ssh_session::open_sftp(&destination).await?;
-            copy_remote_entry(&source, &target, entry, &path, options, &context).await?;
+            copy_remote_entries(&source, &target, entries, &path, options, &context).await?;
             let entries = read_remote_dir(&target, &path).await?;
             Ok((path, entries))
         });
@@ -440,6 +447,14 @@ impl SftpController {
 }
 
 impl SftpBrowseSession {
+    #[cfg(all(test, feature = "gpui-test-support"))]
+    pub(crate) fn from_test_session(destination: String, session: SftpSession) -> Self {
+        Self {
+            destination: Arc::from(destination),
+            session: Arc::new(tokio::sync::Mutex::new(Some(session))),
+        }
+    }
+
     pub(crate) fn new(destination: impl Into<String>) -> Self {
         Self {
             destination: Arc::from(destination.into()),
@@ -458,23 +473,20 @@ impl SftpBrowseSession {
     pub(crate) async fn list_dir(&self, path: &str) -> Result<Vec<SftpEntry>, String> {
         let path = normalize_remote_path("/", path);
         let mut slot = self.session.lock().await;
-        if slot.is_none() {
-            *slot = Some(
-                crate::ssh_session::open_sftp(&self.destination)
-                    .await
-                    .map_err(|err| format!("无法连接 {}：{err}", self.destination))?,
-            );
-        }
-
-        let result =
-            read_remote_dir(slot.as_ref().expect("SFTP browser session initialized"), &path)
+        // russh-sftp 的 read_dir 只在正常结束时关闭目录句柄。将会话暂时移出
+        // 缓存，使导航取消也能关闭子通道；否则句柄和未完成请求会留在复用会话里。
+        let session = match slot.take() {
+            Some(session) => session,
+            None => crate::ssh_session::open_sftp(&self.destination)
                 .await
-                .map_err(|err| format!("无法读取目录 {path}：{err}"));
-        if result.is_err() {
-            // A dead subsystem must not poison every later click. Permission
-            // and missing-path errors also clear the channel; the next user
-            // action reopens it through the already pooled SSH transport.
-            *slot = None;
+                .map_err(|err| format!("无法连接 {}：{err}", self.destination))?,
+        };
+        let result = read_remote_dir(&session, &path)
+            .await
+            .map_err(|err| format!("无法读取目录 {path}：{err}"));
+        if result.is_ok() {
+            // 正常读取仍复用 SFTP 子通道；取消或失败仅回收它，不关闭共享 SSH 连接。
+            *slot = Some(session);
         }
         result
     }
@@ -1004,6 +1016,27 @@ pub(crate) fn upload_clipboard_image_result(
     png: Vec<u8>,
     on_finished: impl FnOnce(Result<String, String>) + Send + 'static,
 ) {
+    upload_clipboard_image_using(
+        async move { crate::ssh_session::open_sftp(&destination).await },
+        png,
+        on_finished,
+    );
+}
+
+/// Clipboard bytes belong to the authenticated pane, never a newly resolved alias.
+pub(crate) fn upload_clipboard_image_on_pane(
+    connection: crate::ssh_session::PaneConnection,
+    png: Vec<u8>,
+    on_finished: impl FnOnce(Result<String, String>) + Send + 'static,
+) {
+    upload_clipboard_image_using(async move { connection.open_sftp().await }, png, on_finished);
+}
+
+fn upload_clipboard_image_using(
+    open: impl std::future::Future<Output = Result<SftpSession, SftpError>> + Send + 'static,
+    png: Vec<u8>,
+    on_finished: impl FnOnce(Result<String, String>) + Send + 'static,
+) {
     let runtime = match crate::ssh_session::runtime() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -1021,7 +1054,7 @@ pub(crate) fn upload_clipboard_image_result(
         let nonce = TRANSFER_NONCE.fetch_add(1, Ordering::Relaxed);
         let remote = format!("/tmp/pebrel-paste-{stamp}-{}-{nonce}.png", std::process::id());
         let upload = async {
-            let sftp = crate::ssh_session::open_sftp(&destination).await?;
+            let sftp = open.await?;
             let attributes = russh_sftp::protocol::FileAttributes {
                 permissions: Some(0o600),
                 ..russh_sftp::protocol::FileAttributes::empty()
@@ -1052,6 +1085,14 @@ pub(crate) fn upload_clipboard_image_result(
     });
 }
 
+fn entries_label(entries: &[SftpEntry]) -> String {
+    match entries {
+        [] => String::new(),
+        [entry] => entry.name.clone(),
+        [entry, rest @ ..] => format!("{} (+{})", entry.name, rest.len()),
+    }
+}
+
 #[derive(Debug)]
 struct DownloadPlan {
     directories: Vec<PathBuf>,
@@ -1069,16 +1110,18 @@ struct DownloadFile {
 
 async fn build_download_plan(
     sftp: &SftpSession,
-    entry: SftpEntry,
+    entries: Vec<SftpEntry>,
     local_directory: PathBuf,
     context: &TaskContext,
 ) -> SftpResult<DownloadPlan> {
-    validate_name(&entry.name)
-        .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
     let mut directories = Vec::new();
     let mut files = Vec::new();
     let mut total = 0u64;
-    let mut pending = vec![(entry, local_directory)];
+    let mut pending: Vec<_> = entries
+        .into_iter()
+        .enumerate()
+        .map(|(root, entry)| (entry, local_directory.clone(), root))
+        .collect();
     let mut visited_directories = HashSet::new();
 
     // 按层推进而不是深度优先逐个问：SFTP 没有递归 LIST，一棵树的规模全靠一层
@@ -1095,7 +1138,10 @@ async fn build_download_plan(
         // 检测都在这里串行做完：环路判定依赖已访问集合，并发写它会让"这个
         // 目录是不是第一次见"的答案取决于调度顺序。
         let mut to_list = Vec::new();
-        for (entry, parent) in std::mem::take(&mut pending) {
+        for (entry, parent, root) in std::mem::take(&mut pending) {
+            if files.len() + directories.len() >= MAX_RECURSIVE_ENTRIES {
+                return Err(io::Error::other("下载目录超过 100000 项，已停止").into());
+            }
             validate_name(&entry.name)
                 .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
             let local = parent.join(&entry.name);
@@ -1112,13 +1158,13 @@ async fn build_download_plan(
             };
 
             if kind == SftpEntryKind::Directory {
-                if !visited_directories.insert(remote.clone()) {
+                if !visited_directories.insert((root, remote.clone())) {
                     return Err(
                         io::Error::other(format!("检测到远端符号链接目录循环: {remote}")).into()
                     );
                 }
                 directories.push(local.clone());
-                to_list.push((remote, local));
+                to_list.push((remote, local, root));
             } else {
                 total = total.saturating_add(size);
                 files.push(DownloadFile { remote, local, size, modified });
@@ -1130,12 +1176,12 @@ async fn build_download_plan(
         let listings = transfer::map_bounded(
             &to_list,
             limits::DIRECTORY_LISTING_CONCURRENCY,
-            |(remote, _)| async move { read_remote_dir(sftp, remote).await },
+            |(remote, _, _)| async move { read_remote_dir(sftp, remote).await },
         )
         .await?;
-        for ((_, local), children) in to_list.iter().zip(listings) {
+        for ((_, local, root), children) in to_list.iter().zip(listings) {
             for child in children {
-                pending.push((child, local.clone()));
+                pending.push((child, local.clone(), *root));
             }
         }
     }
@@ -1143,76 +1189,83 @@ async fn build_download_plan(
     Ok(DownloadPlan { directories, files, total })
 }
 
-async fn download_remote_entry(
+async fn download_remote_entries(
     sftp: &SftpSession,
-    mut entry: SftpEntry,
+    entries: Vec<SftpEntry>,
     local_directory: PathBuf,
     options: SftpTransferOptions,
     context: &TaskContext,
 ) -> SftpResult<()> {
-    let mut root_is_directory = entry.kind == SftpEntryKind::Directory;
-    let mut root_size = entry.size;
-    let mut root_modified = entry.modified;
-    if entry.kind == SftpEntryKind::Symlink {
-        let target = sftp.read_link(entry.path.clone()).await?;
-        let parent = entry.path.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("/");
-        let metadata = sftp.metadata(normalize_remote_path(parent, &target)).await?;
-        root_is_directory = metadata.is_dir();
-        root_size = metadata.len();
-        root_modified = u64::from(metadata.mtime.unwrap_or(0));
-    }
-    let desired = local_directory.join(&entry.name);
-    let existing = match tokio::fs::symlink_metadata(&desired).await {
-        Ok(metadata) => Some(metadata),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    if existing.is_some() {
-        if options.skip_unchanged
-            && !root_is_directory
-            && transaction::local_unchanged(&desired, root_size, root_modified).await?
-        {
-            context.set_total(root_size);
-            context.advance(root_size);
-            return Ok(());
+    // Reserve every incoming root before naming duplicates, including files that
+    // have not reached disk yet. A batch must never overwrite one of its own items.
+    let mut reserved: HashSet<_> =
+        entries.iter().map(|entry| local_directory.join(&entry.name)).collect();
+    let mut resolved = Vec::with_capacity(entries.len());
+    for mut entry in entries {
+        context.check_cancelled()?;
+        validate_name(&entry.name)
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
+        let mut root_is_directory = entry.kind == SftpEntryKind::Directory;
+        let mut root_size = entry.size;
+        let mut root_modified = entry.modified;
+        if entry.kind == SftpEntryKind::Symlink {
+            let target = sftp.read_link(entry.path.clone()).await?;
+            let parent = entry.path.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("/");
+            let metadata = sftp.metadata(normalize_remote_path(parent, &target)).await?;
+            root_is_directory = metadata.is_dir();
+            root_size = metadata.len();
+            root_modified = u64::from(metadata.mtime.unwrap_or(0));
         }
-        match options.conflict {
-            SftpConflictPolicy::Skip => {
-                context.set_total(root_size);
-                context.advance(root_size);
-                return Ok(());
-            },
-            SftpConflictPolicy::KeepBoth => {
-                let duplicate =
-                    transaction::duplicate_local_path(&desired, root_is_directory).await?;
-                entry.name = duplicate
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .ok_or_else(|| io::Error::other("重命名后的本地目标缺少有效文件名"))?
-                    .to_owned();
-            },
-            SftpConflictPolicy::Overwrite => {
-                let target_is_directory =
-                    existing.as_ref().is_some_and(|metadata| metadata.is_dir());
-                let target_is_file = existing.as_ref().is_some_and(|metadata| {
-                    metadata.is_file() || metadata.file_type().is_symlink()
-                });
-                if (root_is_directory && !target_is_directory)
-                    || (!root_is_directory && !target_is_file)
-                {
-                    return Err(io::Error::other(format!(
-                        "本地同名目标类型不同，不能直接覆盖: {}",
-                        desired.display()
-                    ))
-                    .into());
-                }
-            },
+        let desired = local_directory.join(&entry.name);
+        let existing = match tokio::fs::symlink_metadata(&desired).await {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        if existing.is_some() {
+            if options.skip_unchanged
+                && !root_is_directory
+                && transaction::local_unchanged(&desired, root_size, root_modified).await?
+            {
+                continue;
+            }
+            match options.conflict {
+                SftpConflictPolicy::Skip => {
+                    continue;
+                },
+                SftpConflictPolicy::KeepBoth => {
+                    let duplicate =
+                        transaction::duplicate_local_path(&desired, root_is_directory, &reserved)
+                            .await?;
+                    entry.name = duplicate
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .ok_or_else(|| io::Error::other("重命名后的本地目标缺少有效文件名"))?
+                        .to_owned();
+                },
+                SftpConflictPolicy::Overwrite => {
+                    let target_is_directory =
+                        existing.as_ref().is_some_and(|metadata| metadata.is_dir());
+                    let target_is_file = existing.as_ref().is_some_and(|metadata| {
+                        metadata.is_file() || metadata.file_type().is_symlink()
+                    });
+                    if (root_is_directory && !target_is_directory)
+                        || (!root_is_directory && !target_is_file)
+                    {
+                        return Err(io::Error::other(format!(
+                            "本地同名目标类型不同，不能直接覆盖: {}",
+                            desired.display()
+                        ))
+                        .into());
+                    }
+                },
+            }
         }
+        reserved.insert(local_directory.join(&entry.name));
+        resolved.push(entry);
     }
-
-    let plan = build_download_plan(sftp, entry, local_directory, context).await?;
+    let plan = build_download_plan(sftp, resolved, local_directory, context).await?;
     context.set_total(plan.total);
-
     execute_download_plan(sftp, plan, options.skip_unchanged, context).await
 }
 
@@ -1270,48 +1323,53 @@ fn transfer_staging_root() -> SftpResult<PathBuf> {
     Ok(base.join(format!("nebula-sftp-copy-{nonce:016x}")))
 }
 
-async fn copy_remote_entry(
+async fn copy_remote_entries(
     source: &SftpSession,
     target: &SftpSession,
-    entry: SftpEntry,
+    entries: Vec<SftpEntry>,
     target_directory: &str,
     options: SftpTransferOptions,
     context: &TaskContext,
 ) -> SftpResult<()> {
-    if options.skip_unchanged {
-        let source_metadata = if entry.kind == SftpEntryKind::Symlink {
-            source.metadata(entry.path.clone()).await?
-        } else {
-            source.symlink_metadata(entry.path.clone()).await?
-        };
-        if source_metadata.is_regular() {
-            let target_path = normalize_remote_path(target_directory, &entry.name);
-            if transaction::remote_metadata_optional(target, &target_path).await?.is_some_and(
-                |target_metadata| {
-                    target_metadata.is_regular()
-                        && target_metadata.len() == source_metadata.len()
-                        && source_metadata.mtime.is_some()
-                        && target_metadata.mtime == source_metadata.mtime
-                },
-            ) {
-                context.set_total(source_metadata.len());
-                context.advance(source_metadata.len());
-                return Ok(());
+    let mut copied = Vec::with_capacity(entries.len());
+    for entry in entries {
+        context.check_cancelled()?;
+        if options.skip_unchanged {
+            let source_metadata = if entry.kind == SftpEntryKind::Symlink {
+                source.metadata(entry.path.clone()).await?
+            } else {
+                source.symlink_metadata(entry.path.clone()).await?
+            };
+            if source_metadata.is_regular() {
+                let target_path = normalize_remote_path(target_directory, &entry.name);
+                if transaction::remote_metadata_optional(target, &target_path).await?.is_some_and(
+                    |target_metadata| {
+                        target_metadata.is_regular()
+                            && target_metadata.len() == source_metadata.len()
+                            && source_metadata.mtime.is_some()
+                            && target_metadata.mtime == source_metadata.mtime
+                    },
+                ) {
+                    continue;
+                }
             }
         }
+        copied.push(entry);
+    }
+    if copied.is_empty() {
+        return Ok(());
     }
 
     let staging_root = transfer_staging_root()?;
     tokio::fs::create_dir_all(&staging_root).await?;
-    let staged_entry = staging_root.join(&entry.name);
+    let staged_entries = copied.iter().map(|entry| staging_root.join(&entry.name)).collect();
     let result = async {
-        let download = build_download_plan(source, entry, staging_root.clone(), context).await?;
+        let download = build_download_plan(source, copied, staging_root.clone(), context).await?;
         let source_bytes = download.total;
         context.set_total(source_bytes.saturating_mul(2));
         execute_download_plan(source, download, false, context).await?;
 
-        let roots =
-            resolve_upload_roots(target, vec![staged_entry], target_directory, options).await?;
+        let roots = resolve_upload_roots(target, staged_entries, target_directory, options).await?;
         let upload = tokio::task::spawn_blocking(move || build_upload_plan(roots))
             .await
             .map_err(|error| format!("扫描跨主机复制 staging 失败: {error}"))??;
@@ -1411,6 +1469,91 @@ mod tests {
         SftpEntry, SftpEntryKind, TransferProgress, normalize_remote_path, sort_entries,
         temporary_upload_path, validate_name,
     };
+
+    #[test]
+    fn cancelled_browser_listing_retires_the_subsystem() {
+        use super::SftpBrowseSession;
+        use russh_sftp::protocol::{Handle, Name, Status, StatusCode};
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::oneshot;
+
+        struct Peer {
+            entered: Option<oneshot::Sender<()>>,
+            release: Option<oneshot::Receiver<()>>,
+            closed: Option<oneshot::Sender<()>>,
+        }
+
+        impl Drop for Peer {
+            fn drop(&mut self) {
+                let _ = self.closed.take().unwrap().send(());
+            }
+        }
+
+        impl russh_sftp::server::Handler for Peer {
+            type Error = StatusCode;
+
+            fn unimplemented(&self) -> Self::Error {
+                StatusCode::OpUnsupported
+            }
+
+            async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, StatusCode> {
+                Ok(Handle { id, handle: path })
+            }
+
+            async fn readdir(&mut self, _: u32, handle: String) -> Result<Name, StatusCode> {
+                if handle == "/blocked" {
+                    self.entered.take().unwrap().send(()).unwrap();
+                    let _ = self.release.take().unwrap().await;
+                }
+                Err(StatusCode::Eof)
+            }
+
+            async fn close(&mut self, id: u32, _: String) -> Result<Status, StatusCode> {
+                Ok(Status {
+                    id,
+                    status_code: StatusCode::Ok,
+                    error_message: String::new(),
+                    language_tag: String::new(),
+                })
+            }
+        }
+
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(
+            async {
+                let (client, server) = tokio::io::duplex(16 * 1024);
+                let (entered, waiting) = oneshot::channel();
+                let (release, gate) = oneshot::channel();
+                let (closed, released) = oneshot::channel();
+                russh_sftp::server::run(
+                    server,
+                    Peer { entered: Some(entered), release: Some(gate), closed: Some(closed) },
+                )
+                .await;
+                let session = russh_sftp::client::SftpSession::new(client).await.unwrap();
+                let browser = SftpBrowseSession {
+                    destination: Arc::from("fixture@unused.invalid"),
+                    session: Arc::new(tokio::sync::Mutex::new(Some(session))),
+                };
+                browser.list_dir("/ready").await.unwrap();
+                assert!(
+                    browser.session.lock().await.is_some(),
+                    "successful reads reuse the channel"
+                );
+                let reader = browser.clone();
+                let listing = tokio::spawn(async move { reader.list_dir("/blocked").await });
+                tokio::time::timeout(Duration::from_secs(2), waiting).await.unwrap().unwrap();
+                listing.abort();
+                assert!(listing.await.unwrap_err().is_cancelled());
+                let retired = browser.session.lock().await.is_none();
+                // 先释放协议夹具，再断言负例，避免失败测试留下仍在等待的服务端任务。
+                release.send(()).unwrap();
+                drop(browser);
+                tokio::time::timeout(Duration::from_secs(2), released).await.unwrap().unwrap();
+                assert!(retired, "cancelled readdir must not retain its open remote handle");
+            },
+        );
+    }
 
     #[test]
     fn remote_paths_are_posix_and_cannot_escape_root() {

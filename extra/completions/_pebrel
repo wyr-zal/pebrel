@@ -19,7 +19,7 @@ _pebrel() {
 '--config-file=[Specify an alternative configuration file.]:CONFIG_FILE:_files' \
 '--socket=[Path for IPC socket creation]:SOCKET:_files' \
 '--working-directory=[Start the shell in the specified working directory]:WORKING_DIRECTORY:_files' \
-'(-e --command)--shell=[Start this shell instead of the configured default one, by the same id the \`shell\` setting uses (\`pwsh\`, \`cmd\`, \`wsl\:Ubuntu\`, or a profile'\''s settings id)]:ID:_default' \
+'(-e --command)--shell=[Start a detected shell or an imported terminal profile by its settings id]:ID:_default' \
 '*-e+[Command and args to execute (must be last argument)]:COMMAND:_default' \
 '*--command=[Command and args to execute (must be last argument)]:COMMAND:_default' \
 '-T+[Defines the window title \[default\: Pebrel\]]:TITLE:_default' \
@@ -30,6 +30,7 @@ _pebrel() {
 '--print-events[Print all events to STDOUT]' \
 '(--daemon)--ref-test[Generates ref test]' \
 '--gpui[Launch the GPUI UI shell as the main window]' \
+'--launched-at-login[Identify a launch from the per-user login item]' \
 '(-v)*-q[Reduces the level of verbosity (the min level is -qq)]' \
 '(-q)*-v[Increases the level of verbosity (the max level is -vvv)]' \
 '--daemon[Do not spawn an initial window]' \
@@ -48,7 +49,26 @@ _pebrel() {
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:pebrel-command-$line[2]:"
         case $line[2] in
-            (ctl)
+            (predict)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':agent:(claude pi opencode)' \
+'*::args -- Arguments forwarded unchanged to the native agent:_default' \
+&& ret=0
+;;
+(view)
+_arguments "${_arguments_options[@]}" : \
+'--type=[Native renderer\: Markdown, JSON/NDJSON table, or Git progress]:KIND:(markdown table git)' \
+'(--plain)--native[Force native output, for a compatible remote terminal]' \
+'--plain[Print original text instead of the native view protocol]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'::input -- UTF-8 input file; omit to read standard input:_files' \
+'*::command -- Run Git with separately captured stdout/stderr; e.g. -- git fetch --progress:_default' \
+&& ret=0
+;;
+(ctl)
 _arguments "${_arguments_options[@]}" : \
 '--timeout-ms=[Maximum time to wait for a command response]:TIMEOUT_MS:_default' \
 '--pretty[Pretty-print one-shot JSON responses. Streaming subscriptions stay JSON Lines]' \
@@ -1298,7 +1318,15 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:pebrel-help-command-$line[1]:"
         case $line[1] in
-            (ctl)
+            (predict)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(view)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(ctl)
 _arguments "${_arguments_options[@]}" : \
 ":: :_pebrel__help__ctl_commands" \
 "*::: :->ctl" \
@@ -1686,6 +1714,8 @@ esac
 (( $+functions[_pebrel_commands] )) ||
 _pebrel_commands() {
     local commands; commands=(
+'predict:Start a native AI agent with process-local Pebrel prompt predictions' \
+'view:Render Markdown, JSON tables, or Git progress in the current terminal' \
 'ctl:Agent-oriented terminal control\: split panes, run commands, start Codex/Claude, send prompts, wait for state changes, and read verified terminal output' \
 'env:Report this pane'\''s terminal identity, the control-plane path, and every command available to it. Answers even with no runtime reachable, so an agent can always discover what it has instead of guessing' \
 'window:Control terminal windows' \
@@ -2234,6 +2264,8 @@ _pebrel__env_commands() {
 (( $+functions[_pebrel__help_commands] )) ||
 _pebrel__help_commands() {
     local commands; commands=(
+'predict:Start a native AI agent with process-local Pebrel prompt predictions' \
+'view:Render Markdown, JSON tables, or Git progress in the current terminal' \
 'ctl:Agent-oriented terminal control\: split panes, run commands, start Codex/Claude, send prompts, wait for state changes, and read verified terminal output' \
 'env:Report this pane'\''s terminal identity, the control-plane path, and every command available to it. Answers even with no runtime reachable, so an agent can always discover what it has instead of guessing' \
 'window:Control terminal windows' \
@@ -2594,6 +2626,11 @@ _pebrel__help__plugin__run_commands() {
     local commands; commands=()
     _describe -t commands 'pebrel help plugin run commands' commands "$@"
 }
+(( $+functions[_pebrel__help__predict_commands] )) ||
+_pebrel__help__predict_commands() {
+    local commands; commands=()
+    _describe -t commands 'pebrel help predict commands' commands "$@"
+}
 (( $+functions[_pebrel__help__setup-ai_commands] )) ||
 _pebrel__help__setup-ai_commands() {
     local commands; commands=()
@@ -2652,6 +2689,11 @@ _pebrel__help__theme__limits_commands() {
 _pebrel__help__theme__pack_commands() {
     local commands; commands=()
     _describe -t commands 'pebrel help theme pack commands' commands "$@"
+}
+(( $+functions[_pebrel__help__view_commands] )) ||
+_pebrel__help__view_commands() {
+    local commands; commands=()
+    _describe -t commands 'pebrel help view commands' commands "$@"
 }
 (( $+functions[_pebrel__help__window_commands] )) ||
 _pebrel__help__window_commands() {
@@ -2840,6 +2882,11 @@ _pebrel__plugin__run_commands() {
     local commands; commands=()
     _describe -t commands 'pebrel plugin run commands' commands "$@"
 }
+(( $+functions[_pebrel__predict_commands] )) ||
+_pebrel__predict_commands() {
+    local commands; commands=()
+    _describe -t commands 'pebrel predict commands' commands "$@"
+}
 (( $+functions[_pebrel__setup-ai_commands] )) ||
 _pebrel__setup-ai_commands() {
     local commands; commands=()
@@ -2966,6 +3013,11 @@ _pebrel__theme__limits_commands() {
 _pebrel__theme__pack_commands() {
     local commands; commands=()
     _describe -t commands 'pebrel theme pack commands' commands "$@"
+}
+(( $+functions[_pebrel__view_commands] )) ||
+_pebrel__view_commands() {
+    local commands; commands=()
+    _describe -t commands 'pebrel view commands' commands "$@"
 }
 (( $+functions[_pebrel__window_commands] )) ||
 _pebrel__window_commands() {

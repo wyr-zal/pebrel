@@ -14,17 +14,13 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Rust-2024_edition-CE412B?style=for-the-badge&logo=rust&logoColor=white" alt="Rust" />
-  <img src="https://img.shields.io/badge/OpenGL-ES_2.0%2B-5586A4?style=for-the-badge&logo=opengl&logoColor=white" alt="OpenGL ES 2.0+" />
-  <img src="https://img.shields.io/badge/Windows-10_%2F_11-0078D6?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 10 和 11" />
-  <img src="https://img.shields.io/badge/macOS-14%2B-000000?style=for-the-badge&logo=apple&logoColor=white" alt="macOS 14+" />
-  <img src="https://img.shields.io/badge/Linux-glibc_2.35%2B-FCC624?style=for-the-badge&logo=linux&logoColor=black" alt="Linux glibc 2.35+" />
-  <img src="https://img.shields.io/badge/PowerShell-Pebrel_prompt-5391FE?style=for-the-badge&logo=powershell&logoColor=white" alt="PowerShell" />
-  <img src="https://img.shields.io/badge/License-GPL--3.0-1f6feb?style=for-the-badge" alt="GPL-3.0 许可证" />
+  <a href="https://trendshift.io/repositories/127463?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-127463" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/127463/daily?language=Rust" alt="Kuddev/pebrel | Trendshift" width="250" height="55" /></a>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/github/stars/Kuddev/pebrel?style=flat-square&color=ffd33d&logo=github" alt="Stars" />
+  <a href="https://atomgit.com/kettys/pebrel"><img src="https://atomgit.com/kettys/pebrel/star/badge.svg" alt="AtomGitStars" /></a>
+  <a href="https://hub.xerj.org/contributors/Kuddev"><img src="https://hub.xerj.org/contributors/Kuddev/badge.svg" alt="XERJ Corpus Hub contributor" /></a>
   <img src="https://img.shields.io/github/forks/Kuddev/pebrel?style=flat-square&color=8957e5&logo=github" alt="Forks" />
   <img src="https://img.shields.io/github/last-commit/Kuddev/pebrel?style=flat-square&color=3fb950" alt="最近提交" />
   <a href="https://discord.gg/VFn4rcxmhn"><img src="https://img.shields.io/badge/Discord-join-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Discord" /></a>
@@ -32,7 +28,7 @@
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> · <strong>简体中文</strong>
+  <a href="README.md">English</a> · <strong>简体中文</strong> · <a href="README.ja.md">日本語</a>
 </p>
 
 ---
@@ -54,16 +50,41 @@
 <table>
   <tr>
     <td align="center" width="240">
-      <a href="https://fluxionai.space/register?source=github&campaign=pebrel&promo=pebrel"><img src="extra/logo/sponsor_fluxionai.png" alt="Fluxion AI" width="200" /></a><br />
-      <a href="https://fluxionai.space/register?source=github&campaign=pebrel&promo=pebrel"><strong>Fluxion AI</strong></a>
+      <a href="https://cn.aiapi.bot/invite?code=MCYLZ5H6FR"><img src="extra/logo/sponsor_aiapi.png" alt="AIAPI" width="200" /></a><br />
+      <a href="https://cn.aiapi.bot/invite?code=MCYLZ5H6FR"><strong>AIAPI</strong></a>
     </td>
     <td>
-      感谢 Fluxion AI 赞助本项目！Fluxion AI 是一个入口，接入并管理全球主流 AI 模型：面向个人开发者、技术团队与企业，通过统一 API 接入并管理全球主流 AI 模型；通过多线路动态调度提升可用性，模型表现、响应时间与费用透明可查。根据不同模型与线路，API 调用成本较官方或基准价格可降低 40%—98%。<a href="https://fluxionai.space/register?source=github&campaign=pebrel&promo=pebrel">立即访问并注册</a>，即可获得 $3 API 额度。
+      <p><strong>感谢 AIAPI 对本项目的强力支持！</strong></p>
+      <p>AIAPI 致力于打造全网最稳定的 AI 模型中转站，面向个人开发者、技术团队与企业提供一站式统一接口。我们主打满血 Claude、满血 GPT 等顶尖模型，坚持原汁原味、绝不降智、不掺一滴水。依托动态多路调度保障高可用，性能、响应耗时与账单全程透明；配备顶级售后团队，问题极速响应、全程保驾护航。根据模型与路由策略，调用成本比官方基准价直降 40%–98%。</p>
+      <p><a href="https://cn.aiapi.bot/invite?code=MCYLZ5H6FR">访问 AIAPI</a></p>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="240">
+      <a href="https://sidrune.ai/register?source=github&campaign=pebrel&promo=pebrel"><img src="extra/logo/sponsor_sidrune.png" alt="Sidrune AI" width="200" /></a><br />
+      <a href="https://sidrune.ai/register?source=github&campaign=pebrel&promo=pebrel"><strong>Sidrune AI</strong></a>
+    </td>
+    <td>
+      <p><strong>一个入口，接入并管理全球主流 AI 模型</strong></p>
+      <p>感谢 Sidrune AI 赞助本项目！Sidrune AI 面向个人开发者、技术团队与企业，通过统一 API 接入并管理全球主流 AI 模型；通过多线路动态调度提升可用性，模型表现、响应时间与费用透明可查。根据不同模型与线路，API 调用成本较官方或基准价格可降低 40%—98%。</p>
+      <p><a href="https://sidrune.ai/register?source=github&campaign=pebrel&promo=pebrel">立即访问并注册</a>，即可获得 $3 API 额度。</p>
     </td>
   </tr>
 </table>
 
 商业合作或赞助，请联系：[fickleheartedkeys@163.com](mailto:fickleheartedkeys@163.com)
+
+<p align="center">
+  <strong>Pebrel 微信交流群</strong>
+</p>
+
+<p align="center">
+  <a href="extra/community/wechat-group-2026-11-11.jpg"><img src="extra/community/wechat-group-2026-11-11.jpg" alt="Pebrel 微信交流群二维码，2026 年 11 月 11 日前有效" width="300" /></a>
+</p>
+
+<p align="center">
+  微信扫码加入，2026 年 11 月 11 日前有效。点击图片可查看原图。
+</p>
 
 ## 一个工作区
 
@@ -75,9 +96,26 @@ Pebrel（原名 Nebula）把本地 Shell、远程主机、文件和 AI 命令行
 - 侧栏或顶部标签、可拖拽分屏，以及各窗格独立的工作目录。
 - 保存工作区布局，可选恢复 AI 对话。在 WSL 与 Linux 中，Codex 的 hook 未上报 ID 时，
   可从当前会话元数据补全身份。
+- Windows 原生 Codex 身份刷新复用后台辅助进程，并禁用启动光标提示。每次仍读取当前
+  元数据并限制等待时间；辅助进程卡住时先终止，后续刷新再创建替代进程。
 - Windows 下可选择后台驻留，让关窗后的会话继续运行。进程退出后重新接续已保存的对话
   是另一项功能，需要 CLI 支持恢复，并且有可用的会话身份。
 - 智能补齐与历史补齐、自定义快捷键，以及集成的 Shell 提示符。
+- 命令列表支持复选框多选和一次确认批量删除，无需再逐条确认。多选模式下不会执行
+  命令，切换搜索或文件夹会清空选择。“选择当前列表”包含当前筛选下滚动区外的命令。
+  “管理 → 删除全部命令”不受当前搜索或文件夹限制，会清除全部自定义命令及所有平台
+  当前提供的内置命令，保留文件夹。清空内置命令也包含已移到其他文件夹的内置命令；
+  空的内置文件夹会隐藏，可通过“管理 → 恢复内置命令”恢复到默认分组。自定义命令
+  删除后无法在此撤销；删除自定义文件夹需确认，其中的命令会保留并移到“未分组”。
+  批量操作复用原有加锁、重新读盘、原子写入事务，文件格式不变，陈旧选择不会覆盖
+  其他窗口对无关命令的修改。
+- 终端快捷键的改绑或清空会保留名称、命令等输入框自身的粘贴键；恢复默认立即作用于
+  当前应用窗口，无需重启。运行时改为替换旧覆盖规则，避免追加方式留下禁用记录，
+  配置文件格式保持兼容。详见[快捷键归属说明](architecture/notes/nebula_app/gpui_shell/workspace/2026-10-07-keyboard-override-sources.md)。
+- Windows 本地 PowerShell 提示符支持将多行剪贴板粘贴保留在 PSReadLine 中检查，
+  按 Enter 才提交，一次撤销可移除整次粘贴。需要 Shell 集成生效且托管粘贴键没有被用户占用。
+  PSReadLine 会统一 CRLF 换行并将 Tab 展开为四个空格；其他编辑器沿用已协商的粘贴协议
+  或现有确认行为。详见[剪贴板粘贴边界](architecture/notes/nebula_app/gpui_shell/terminal/view/2026-10-23-powershell-clipboard-paste.md)。
 
 ### 智能补齐
 
@@ -109,6 +147,8 @@ WSL 发行版，以及 `cat` 读取带空格的文件名。使用内置 Powerlin
 
 ### SSH 与文件
 
+- 主机页、启动器、命令面板和 Quick Jump 均可按名称、地址、分组、标签和备注搜索 SSH 主机。
+  空格分隔的关键词需同时匹配，搜索不区分大小写；启动入口现与主机页使用相同的搜索字段。
 - 保存主机、读取 SSH 配置别名、设置代理与跳板，支持私钥和交互式认证，并验证主机密钥。
 - SFTP 文件浏览、上传下载、文件夹传输、进度显示与取消。
 - 在终端旁浏览本地文件并执行 Git 操作。
@@ -123,6 +163,7 @@ WSL 发行版，以及 `cat` 读取带空格的文件名。使用内置 Powerlin
 - Claude Code、Codex 等可识别的 CLI 显示各自图标与活动状态；受支持的 hook 事件提供更准确的进度和待处理信号。
 - 通知跟随来源窗格，点击即可返回对应终端。
 - 已捕获的 Claude Code 与 Codex 回答可在阅读器中打开，支持 Markdown、公式、原文和本地图片预览。
+  阅读器控件与提示随所选语言显示；复制原文保留完整回答。详见[阅读器语言说明](docs/answer-reader-language.md)。
 - 剪贴板图片会保存为 PNG，并把路径插入本地、WSL 或 SSH 会话。终端内直接显示图片需要 CLI
   输出受支持的 OSC 1337 协议；附件缩略图取决于 CLI 自身。
 
@@ -134,6 +175,8 @@ WSL 发行版，以及 `cat` 读取带空格的文件名。使用内置 Powerlin
 
 - GPU 加速的 GPUI 界面、浅色与深色主题、背景及不透明度设置。
 - 应用图标配色与十一种界面语言，未翻译内容回退英文。
+- 工作区对话框、命令操作反馈、Git/SVN 控件与默认通知随所选语言显示；切换语言保留
+  命令搜索内容与选区。详见[多语言说明](docs/internationalization.md)。
 - 可搜索的设置、命令面板，以及支持检查和热重载的 Lua 配置；已有 TOML 配置仍可使用。
 - Markdown 文档标签与原生数学公式排版，不依赖 WebView。
 
@@ -223,6 +266,11 @@ Discord：[discord.gg/VFn4rcxmhn](https://discord.gg/VFn4rcxmhn)
 
 Pebrel 使用了第三方终端、界面和字体组件。组件来源、版权与许可证声明统一保留在
 [THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES) 和 [licenses/](licenses/) 中。
+
+<p>感谢 <a href="https://molchuan.com/"><picture>
+  <source media="(prefers-color-scheme: dark)" srcset="extra/logo/acknowledgement_1molchuan_dark.png">
+  <img alt="1molchuan" src="extra/logo/acknowledgement_1molchuan_light.png" width="120">
+</picture></a> 为 Pebrel 的开发提供额外支持。</p>
 
 ## 友情链接
 

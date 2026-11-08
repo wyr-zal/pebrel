@@ -81,6 +81,7 @@ pub struct Settings {
     pub copy_on_select: bool,
     pub scrollback_lines: usize,
     pub scroll_speed: f32,
+    pub scrollbar_visibility: nebula_settings::ScrollbarVisibility,
     /// Pointer handlers and split rendering only read these cached preferences.
     pub focus_follows_mouse: bool,
     pub dim_inactive_panes: bool,
@@ -99,6 +100,7 @@ pub struct Settings {
     /// 命令补全设置（settings.txt 的 `ghost`/`completion_style`/`accept`），
     /// 类型直接用旧壳 display 的语义枚举：接受键判定与样式分支两壳同源。
     pub ghost: bool,
+    pub prompt_suggestions_enabled: bool,
     pub completion_style: crate::display::CompletionStyle,
     pub accept: crate::display::AcceptKey,
     /// 单元格宽度取整方式；同一窗口宽度下必须与旧壳得到相同列数。
@@ -302,6 +304,7 @@ impl Settings {
             copy_on_select: runtime.copy_on_select,
             scrollback_lines: runtime.scrollback_lines,
             scroll_speed: runtime.scroll_speed,
+            scrollbar_visibility: runtime.scrollbar_visibility,
             focus_follows_mouse: runtime
                 .focus_follows_mouse
                 .unwrap_or(raw.mouse.focus_follows_mouse),
@@ -317,17 +320,15 @@ impl Settings {
             tab_close_visible: runtime.tab_close_visible,
             tab_reveal: runtime.tab_reveal,
             ghost: runtime.ghost,
+            prompt_suggestions_enabled: runtime.prompt_suggestions.enabled,
             completion_style: runtime.completion_style,
             accept: runtime.accept,
             cell_width_mode: runtime.cell_width_mode,
             cjk_bold_regular: runtime.cjk_bold_regular,
             shell_id: runtime.shell.clone(),
             font_family: normal_family,
-            font_cjk: Some({
-                let family = runtime
-                    .font_family_cjk
-                    .as_deref()
-                    .unwrap_or(crate::font_install::REQUIRED_FONT_FAMILY);
+            // 未指定中文字体时沿用主字体及平台缺字回退，不隐式指定完整 Maple。
+            font_cjk: runtime.font_family_cjk.as_deref().map(|family| {
                 use gpui::{FontStyle, FontWeight};
                 [
                     (FontWeight::NORMAL, FontStyle::Normal),
@@ -375,14 +376,12 @@ impl Settings {
 }
 
 fn default_font_offset() -> RawDelta {
-    #[cfg(windows)]
-    {
-        RawDelta { x: 0, y: 4 }
-    }
-    #[cfg(not(windows))]
-    {
-        RawDelta { x: 0, y: 0 }
-    }
+    // 恢复 2.2.2 的默认留白，不再为字符画比例压缩普通正文。
+    let y = match crate::platform::Platform::current() {
+        crate::platform::Platform::Windows => 4,
+        _ => 0,
+    };
+    RawDelta { x: 0, y }
 }
 
 fn runtime_background(
@@ -482,7 +481,7 @@ fn default_font_family() -> &'static str {
     crate::font_install::REQUIRED_FONT_FAMILY
 }
 
-/// `config.window.dimensions`：启动窗口的网格行列。
+/// 显式窗口网格、物理坐标与首个普通窗口的冷启动恢复值。
 ///
 /// 单独驻留而不是并入 [`Settings`]，因为生命周期不同：`Settings` 随设置页写入
 /// 反复重载，启动网格按定义只在开窗时生效一次，而 Lua 配置求值不该出现在每次
@@ -491,6 +490,8 @@ fn default_font_family() -> &'static str {
 #[derive(Default)]
 pub(crate) struct StartupWindow {
     pub dimensions: Option<crate::config::window::Dimensions>,
+    pub position: Option<crate::config::ui_config::Delta<i32>>,
+    pub(crate) restored: Option<crate::session::WindowState>,
 }
 
 impl Global for StartupWindow {}
@@ -521,7 +522,11 @@ impl StartupWindow {
 
     /// `dimensions()` 自带「行列必须同时非零」的旧壳合同。
     fn from_config(config: &crate::config::UiConfig) -> Self {
-        Self { dimensions: config.window.dimensions() }
+        Self {
+            dimensions: config.window.dimensions(),
+            position: config.window.position,
+            restored: None,
+        }
     }
 }
 
@@ -877,6 +882,23 @@ mod tests {
     }
 
     #[test]
+    fn font_offset_restores_2_2_2_padding_and_preserves_explicit_values() {
+        let default_y = match crate::platform::Platform::current() {
+            crate::platform::Platform::Windows => 4,
+            _ => 0,
+        };
+        for (input, expected) in [
+            ("", (0, default_y)),
+            ("[font.offset]\nx = 2\ny = 4", (2, 4)),
+            ("[font.offset]\ny = -2", (0, -2)),
+        ] {
+            let raw: super::RawConfig = toml::from_str(input).unwrap();
+            let offset = raw.font.offset.unwrap_or_else(super::default_font_offset);
+            assert_eq!((offset.x, offset.y), expected);
+        }
+    }
+
+    #[test]
     fn explicit_runtime_languages_resolve_without_reading_system_locale() {
         assert_eq!(resolve_ui_language(LanguagePref::ZhCn), UiLanguage::ZhCn);
         assert_eq!(resolve_ui_language(LanguagePref::EnUs), UiLanguage::EnUs);
@@ -892,7 +914,7 @@ mod tests {
             &path,
             "local pebrel = require 'pebrel'\n\
              local config = pebrel.config_builder()\n\
-             config.window = { dimensions = { columns = 123, lines = 37 } }\n\
+             config.window = { dimensions = { columns = 123, lines = 37 }, position = { x = 197, y = 102 } }\n\
              return config\n",
         )
         .unwrap();
@@ -903,10 +925,9 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(
-            StartupWindow::load(options.config_file).dimensions,
-            Some(Dimensions { columns: 123, lines: 37 })
-        );
+        let startup = StartupWindow::load(options.config_file);
+        assert_eq!(startup.dimensions, Some(Dimensions { columns: 123, lines: 37 }));
+        assert_eq!(startup.position, Some(crate::config::ui_config::Delta { x: 197, y: 102 }));
     }
 
     /// 用户写在 `pebrel.lua` 里的 `config.window.dimensions` 必须真的决定启动
@@ -944,6 +965,7 @@ mod tests {
         );
         let configured = |columns: usize, lines: usize| StartupWindow {
             dimensions: Some(Dimensions { columns, lines }),
+            ..Default::default()
         };
         cx.update(|cx| {
             assert_eq!(startup_grid(cx), builtin);

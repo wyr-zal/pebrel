@@ -84,6 +84,7 @@ fn pasted_proxy_scheme_updates_the_visible_protocol_and_saved_url(cx: &mut gpui:
     for (text, expected, host) in [
         ("http://127.0.0.1:8080", ManualProxyProtocol::Http, "127.0.0.1:8080"),
         ("socks5://127.0.0.1:1080", ManualProxyProtocol::Socks5, "127.0.0.1:1080"),
+        ("socks5h://127.0.0.1:1080", ManualProxyProtocol::Socks5h, "127.0.0.1:1080"),
     ] {
         cx.update(|window, cx| {
             let _ = window.draw(cx);
@@ -147,8 +148,17 @@ fn provider_key_dialog_blocks_clipboard_export_and_cancel_does_not_store(
 #[cfg(feature = "gpui-test-support")]
 #[gpui::test]
 fn rename_keymap_row_is_searchable_and_enters_capture(cx: &mut gpui::TestAppContext) {
+    use crate::display::keymap;
+    use crate::gpui_shell::settings_fixture::{
+        SettingsBytesGuard, SettingsPaneHost, lock_theme_studio,
+    };
+
+    let _fixture_guard = lock_theme_studio();
+    let _settings_guard = SettingsBytesGuard::capture();
+    nebula_settings::persist_keybinds(&[]).unwrap();
     cx.update(|cx| {
         gpui_component::init(cx);
+        cx.set_reduce_motion(true);
         cx.set_global(crate::gpui_shell::config::Settings::load(ThemeName::Nord));
     });
     let mut pane_out = None;
@@ -160,7 +170,8 @@ fn rename_keymap_row_is_searchable_and_enters_capture(cx: &mut gpui::TestAppCont
                 .update(cx, |input, cx| input.replace_all("Rename tab", window, cx));
         });
         pane_out = Some(pane.clone());
-        gpui_component::Root::new(pane, window, cx)
+        let host = cx.new(|_| SettingsPaneHost { pane });
+        gpui_component::Root::new(host, window, cx)
     });
     let pane = pane_out.unwrap();
     cx.simulate_resize(gpui::size(px(1280.0), px(900.0)));
@@ -173,9 +184,8 @@ fn rename_keymap_row_is_searchable_and_enters_capture(cx: &mut gpui::TestAppCont
         .position(|(action, ..)| *action == crate::config::Action::RenameTab)
         .unwrap()
         + 1;
-    let bounds = cx
-        .debug_bounds(Box::leak(format!("settings-keymap-row-{row}").into_boxed_str()))
-        .expect("rename row is rendered");
+    let row_id: &'static str = Box::leak(format!("settings-keymap-row-{row}").into_boxed_str());
+    let bounds = cx.debug_bounds(row_id).expect("rename row is rendered");
     assert!(bounds.size.width > px(0.0) && bounds.size.height > px(0.0));
     cx.simulate_click(bounds.center(), gpui::Modifiers::default());
     assert_eq!(pane.read_with(cx, |pane, _| pane.keymap_capture), Some(row));
@@ -186,6 +196,59 @@ fn rename_keymap_row_is_searchable_and_enters_capture(cx: &mut gpui::TestAppCont
     });
     cx.run_until_parked();
     assert_eq!(pane.read_with(cx, |pane, _| pane.keymap_capture), None);
+
+    let before = std::fs::read(nebula_settings::settings_path()).unwrap();
+    // 走窗口拦截器和真实弹窗命中，避免仅测谓词却漏掉 Enter 打开后立即误确认。
+    for dismissal in ["cancel", "escape", "confirm"] {
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        let row_bounds = cx.debug_bounds(row_id).unwrap();
+        cx.simulate_click(row_bounds.center(), gpui::Modifiers::default());
+        assert_eq!(pane.read_with(cx, |pane, _| pane.keymap_capture), Some(row));
+        cx.simulate_event(gpui::KeyDownEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.debug_bounds("confirm-dialog-ok").is_some());
+        assert!(cx.debug_bounds("confirm-dialog-cancel").is_some());
+        assert_eq!(pane.read_with(cx, |pane, _| pane.keymap_capture), None);
+        assert_eq!(std::fs::read(nebula_settings::settings_path()).unwrap(), before);
+
+        if dismissal == "escape" {
+            cx.simulate_keystrokes("escape");
+        } else {
+            let button =
+                if dismissal == "confirm" { "confirm-dialog-ok" } else { "confirm-dialog-cancel" };
+            let bounds = cx.debug_bounds(button).unwrap();
+            cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        }
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.debug_bounds("confirm-dialog-ok").is_none());
+        let saved = nebula_settings::keybind_pairs();
+        assert_eq!(pane.read_with(cx, |pane, _| pane.keymap_binds.clone()), saved);
+        if dismissal == "confirm" {
+            let (combo, custom) = keymap::GPUI
+                .effective_combo(&crate::config::Action::RenameTab, &keymap::build_bindings(&saved))
+                .unwrap();
+            assert!(custom);
+            assert_eq!(keymap::parse_combo(&combo), keymap::parse_combo("enter"));
+        } else {
+            assert!(saved.is_empty());
+            assert_eq!(std::fs::read(nebula_settings::settings_path()).unwrap(), before);
+        }
+    }
 }
 
 #[cfg(feature = "gpui-test-support")]
@@ -227,6 +290,79 @@ fn settings_search_replaces_keymap_search_and_keeps_section_queries(cx: &mut gpu
         }
     }
     assert_eq!(pane.read_with(cx, |pane, _| pane.active_section), origin);
+}
+
+#[cfg(feature = "gpui-test-support")]
+#[gpui::test]
+fn localized_search_routes_and_filters_shortcut_rows(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        cx.set_reduce_motion(true);
+        let mut settings = crate::gpui_shell::config::Settings::load(ThemeName::Nord);
+        settings.ui_language = crate::display::UiLanguage::JaJp;
+        cx.set_global(settings);
+    });
+    let mut pane = None;
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|cx| SettingsPane::new(window, cx));
+        pane = Some(view.clone());
+        gpui_component::Root::new(view, window, cx)
+    });
+    let pane = pane.unwrap();
+    cx.simulate_resize(gpui::size(px(1280.0), px(1600.0)));
+    let origin = pane.read_with(cx, |pane, _| pane.active_section);
+    for (query, section, row) in [
+        ("コマンドパレット", 7, Some("settings-keymap-row-1")),
+        ("N 番目のタブを選択", 7, Some("settings-keymap-readonly-N 番目のタブを選択")),
+        ("確認ダイアログ", 7, Some("settings-keymap-readonly-確認ダイアログ: 確定／キャンセル")),
+        ("フォント", 1, None),
+        ("プロキシ", 5, None),
+        ("ショートカット", 7, Some("settings-keymap-row-4")),
+        ("", origin, None),
+    ] {
+        cx.update(|window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.settings_search_input
+                    .update(cx, |input, cx| input.replace_all(query, window, cx));
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(pane.read_with(cx, |pane, _| pane.active_section), section, "{query}");
+        if let Some(row) = row {
+            assert!(cx.debug_bounds(row).is_some(), "{query}: {row} must be rendered");
+            if query != "ショートカット" {
+                assert!(cx.debug_bounds("settings-keymap-row-4").is_none());
+            }
+        }
+    }
+
+    // Searching from Keymap must keep matching actions visible even when the
+    // same word also names an Interaction setting. Other settings still route.
+    cx.update(|_, cx| pane.update(cx, |pane, _| pane.active_section = 7));
+    for (query, section) in
+        [("コピー", 7), ("COPY", 7), ("复制", 7), ("プロキシ", 5), ("コピー", 7), ("", 7)]
+    {
+        cx.update(|window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.settings_search_input
+                    .update(cx, |input, cx| input.replace_all(query, window, cx));
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(pane.read_with(cx, |pane, _| pane.active_section), section, "{query}");
+        if section == 7 && !query.is_empty() {
+            assert!(cx.debug_bounds("settings-keymap-row-24").is_some());
+            assert!(cx.debug_bounds("settings-keymap-row-4").is_none());
+        }
+    }
 }
 
 #[cfg(feature = "gpui-test-support")]
@@ -444,9 +580,7 @@ fn shared_auto_continue_error_phrase_manager_saves_entries_and_cancel_discards(
     cx.update(|window, cx| {
         first.update(cx, |input, cx| input.replace_all("CUSTOM PROBLEM", window, cx));
     });
-    let add = cx
-        .debug_bounds("add-auto-continue-pattern")
-        .expect("添加短语按钮已渲染");
+    let add = cx.debug_bounds("add-auto-continue-pattern").expect("添加短语按钮已渲染");
     cx.simulate_click(add.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     let added = pane.read_with(cx, |pane, _| {
@@ -458,18 +592,10 @@ fn shared_auto_continue_error_phrase_manager_saves_entries_and_cancel_discards(
     cx.update(|window, cx| {
         let _ = window.draw(cx);
     });
-    let remove = cx
-        .debug_bounds("auto-continue-pattern-remove-1")
-        .expect("单条删除按钮已渲染");
-    let input = cx
-        .debug_bounds("auto-continue-pattern-input-1")
-        .expect("第二条短语输入框已渲染");
-    let dialog = cx
-        .debug_bounds("auto-continue-patterns-dialog")
-        .expect("短语弹窗已渲染");
-    let save_area = cx
-        .debug_bounds("save-auto-continue-patterns")
-        .expect("短语保存按钮已渲染");
+    let remove = cx.debug_bounds("auto-continue-pattern-remove-1").expect("单条删除按钮已渲染");
+    let input = cx.debug_bounds("auto-continue-pattern-input-1").expect("第二条短语输入框已渲染");
+    let dialog = cx.debug_bounds("auto-continue-patterns-dialog").expect("短语弹窗已渲染");
+    let save_area = cx.debug_bounds("save-auto-continue-patterns").expect("短语保存按钮已渲染");
     assert!(
         !input.contains(&remove.center()),
         "remove button {remove:?} overlaps input {input:?} in dialog {dialog:?}"
@@ -478,29 +604,31 @@ fn shared_auto_continue_error_phrase_manager_saves_entries_and_cancel_discards(
         !save_area.contains(&remove.center()),
         "remove button {remove:?} overlaps save button {save_area:?}"
     );
-    cx.simulate_mouse_move(
-        remove.center(),
-        None::<gpui::MouseButton>,
-        gpui::Modifiers::default(),
-    );
+    cx.simulate_mouse_move(remove.center(), None::<gpui::MouseButton>, gpui::Modifiers::default());
     cx.run_until_parked();
     cx.simulate_click(remove.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     assert_eq!(
-        pane.read_with(cx, |pane, _| pane.auto_continue_patterns_editor.as_ref().unwrap().rows.len()),
+        pane.read_with(cx, |pane, _| pane
+            .auto_continue_patterns_editor
+            .as_ref()
+            .unwrap()
+            .rows
+            .len()),
         2,
         "remove action must delete exactly one entry; button={remove:?}, input={input:?}, dialog={dialog:?}",
     );
     cx.update(|window, cx| {
         let _ = window.draw(cx);
     });
-    let save = cx
-        .debug_bounds("save-auto-continue-patterns")
-        .expect("短语保存按钮已渲染");
+    let save = cx.debug_bounds("save-auto-continue-patterns").expect("短语保存按钮已渲染");
     cx.simulate_click(save.center(), gpui::Modifiers::default());
     cx.run_until_parked();
 
-    assert_eq!(RuntimeSettings::load().ai_auto_continue_error_patterns, "CUSTOM PROBLEM;another failure");
+    assert_eq!(
+        RuntimeSettings::load().ai_auto_continue_error_patterns,
+        "CUSTOM PROBLEM;another failure"
+    );
     cx.update(|_, cx| {
         assert_eq!(
             cx.global::<crate::gpui_shell::config::Settings>().ai_auto_continue_error_patterns,
@@ -525,12 +653,13 @@ fn shared_auto_continue_error_phrase_manager_saves_entries_and_cancel_discards(
     cx.update(|window, cx| {
         let _ = window.draw(cx);
     });
-    let cancel = cx
-        .debug_bounds("cancel-auto-continue-patterns")
-        .expect("短语取消按钮已渲染");
+    let cancel = cx.debug_bounds("cancel-auto-continue-patterns").expect("短语取消按钮已渲染");
     cx.simulate_click(cancel.center(), gpui::Modifiers::default());
     cx.run_until_parked();
-    assert_eq!(RuntimeSettings::load().ai_auto_continue_error_patterns, "CUSTOM PROBLEM;another failure");
+    assert_eq!(
+        RuntimeSettings::load().ai_auto_continue_error_patterns,
+        "CUSTOM PROBLEM;another failure"
+    );
 
     cx.update(|window, cx| {
         let _ = window.draw(cx);
@@ -544,9 +673,8 @@ fn shared_auto_continue_error_phrase_manager_saves_entries_and_cancel_discards(
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
-        let remove = cx
-            .debug_bounds("auto-continue-pattern-remove-0")
-            .expect("首条短语删除按钮已渲染");
+        let remove =
+            cx.debug_bounds("auto-continue-pattern-remove-0").expect("首条短语删除按钮已渲染");
         cx.simulate_mouse_move(
             remove.center(),
             None::<gpui::MouseButton>,
@@ -560,14 +688,16 @@ fn shared_auto_continue_error_phrase_manager_saves_entries_and_cancel_discards(
         let _ = window.draw(cx);
     });
     assert!(cx.debug_bounds("auto-continue-patterns-empty").is_some());
-    let save = cx
-        .debug_bounds("save-auto-continue-patterns")
-        .expect("空列表保存按钮已渲染");
+    let save = cx.debug_bounds("save-auto-continue-patterns").expect("空列表保存按钮已渲染");
     cx.simulate_click(save.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     assert_eq!(RuntimeSettings::load().ai_auto_continue_error_patterns, "");
     cx.update(|_, cx| {
-        assert!(cx.global::<crate::gpui_shell::config::Settings>().ai_auto_continue_error_patterns.is_empty());
+        assert!(
+            cx.global::<crate::gpui_shell::config::Settings>()
+                .ai_auto_continue_error_patterns
+                .is_empty()
+        );
     });
 }
 
@@ -596,6 +726,7 @@ fn shared_auto_continue_error_phrase_manager_rejects_delimiters_without_saving(
         gpui_component::Root::new(view, window, cx)
     });
     let pane = pane_out.unwrap();
+    cx.simulate_resize(gpui::size(px(1280.0), px(1200.0)));
     pane.update(cx, |pane, _| pane.active_section = 2);
     cx.update(|window, cx| {
         let _ = window.draw(cx);
@@ -614,9 +745,7 @@ fn shared_auto_continue_error_phrase_manager_rejects_delimiters_without_saving(
     cx.update(|window, cx| {
         let _ = window.draw(cx);
     });
-    let save = cx
-        .debug_bounds("save-auto-continue-patterns")
-        .expect("短语保存按钮已渲染");
+    let save = cx.debug_bounds("save-auto-continue-patterns").expect("短语保存按钮已渲染");
     cx.simulate_click(save.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     cx.update(|window, cx| {
@@ -627,12 +756,14 @@ fn shared_auto_continue_error_phrase_manager_rejects_delimiters_without_saving(
 }
 
 #[test]
-fn settings_nav_visibility_hides_providers_and_keeps_stable_routes() {
+fn settings_nav_hides_providers_without_changing_stable_routes() {
     let visibility: Vec<_> = (0..SECTION_IDS.len()).map(is_nav_section_visible).collect();
     assert_eq!(
         visibility,
         vec![true, true, true, false, true, true, true, true, true, true, true, true]
     );
+    assert!(!is_nav_section_visible(SECTION_IDS.len()));
+    assert!(!is_nav_section_visible(usize::MAX));
     assert_eq!(
         SECTION_IDS,
         [
@@ -650,6 +781,45 @@ fn settings_nav_visibility_hides_providers_and_keeps_stable_routes() {
             "mobile",
         ]
     );
+}
+
+#[cfg(feature = "gpui-test-support")]
+#[gpui::test]
+fn hidden_provider_navigation_keeps_prediction_search_reachable(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        cx.set_global(crate::gpui_shell::config::Settings::load(ThemeName::Nord));
+    });
+    let mut pane = None;
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|cx| SettingsPane::new(window, cx));
+        pane = Some(view.clone());
+        gpui_component::Root::new(view, window, cx)
+    });
+    let pane = pane.unwrap();
+    cx.simulate_resize(gpui::size(px(1200.0), px(900.0)));
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    assert!(cx.debug_bounds("settings-nav-3").is_none());
+    let origin = pane.read_with(cx, |pane, _| pane.active_section);
+    for (query, visible) in [("prediction", true), ("", false)] {
+        cx.update(|window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.settings_search_input
+                    .update(cx, |input, cx| input.replace_all(query, window, cx));
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert_eq!(cx.debug_bounds("settings-nav-3").is_some(), visible);
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.active_section),
+            if visible { 3 } else { origin }
+        );
+    }
 }
 
 #[test]

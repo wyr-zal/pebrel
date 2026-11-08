@@ -8,6 +8,7 @@ mod connection;
 pub(crate) mod duplication;
 #[path = "ssh_profiles/exchange.rs"]
 pub(crate) mod exchange;
+pub(crate) mod host_lists;
 #[path = "ssh_profiles/organization.rs"]
 mod organization;
 pub(crate) use connection::validate_ssh_destination;
@@ -300,10 +301,7 @@ fn destination_username(destination: &str) -> Option<&str> {
 }
 
 fn valid_username_history_entry(username: &str) -> bool {
-    !username.is_empty()
-        && !username
-            .chars()
-            .any(|ch| ch.is_whitespace() || ch.is_control() || "@;&|<>\"'`".contains(ch))
+    connection::valid_ssh_username(username)
 }
 
 fn push_unique_username(usernames: &mut Vec<String>, username: &str) {
@@ -336,7 +334,7 @@ fn deduplicate_key_paths(paths: &mut Vec<PathBuf>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{SshAuthMode, SshProfileAuth, SshProfiles};
+    use super::{SshAuthMode, SshProfileAuth, SshProfiles, valid_username_history_entry};
     use std::path::PathBuf;
 
     #[test]
@@ -637,5 +635,27 @@ mod tests {
         )
         .expect("旧文件缺少 usernames 时仍应可读");
         assert_eq!(legacy.usernames(), vec!["admin"]);
+    }
+
+    #[test]
+    fn jumpserver_username_history_roundtrips_and_rejects_invalid_components() {
+        let mut profiles = SshProfiles::default();
+        profiles.remember_username("jumpserverUser@root");
+        for invalid in
+            ["", "@root", "user@@root", "user@", "user:password", "bad user", "ssh://root"]
+        {
+            assert!(!valid_username_history_entry(invalid));
+            profiles.remember_username(invalid);
+        }
+        assert!(!valid_username_history_entry(" root"));
+        // The public history entry point retains its existing whitespace normalization.
+        profiles.remember_username(" jumpserverUser@root ");
+        let destination = "ssh://jumpserverUser@root@[::1]:2222";
+        profiles.upsert(profiles.for_destination(destination));
+        assert_eq!(profiles.usernames(), ["jumpserverUser@root"]);
+        let json = serde_json::to_string(&profiles).unwrap();
+        let restored: SshProfiles = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.usernames(), ["jumpserverUser@root"]);
+        assert_eq!(restored.for_destination(destination).destination, destination);
     }
 }

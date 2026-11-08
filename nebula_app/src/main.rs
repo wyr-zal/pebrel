@@ -50,6 +50,7 @@ mod chemistry;
 mod cli;
 mod clipboard;
 mod codex_config;
+mod command_lenses;
 mod completion;
 mod completion_context;
 mod config;
@@ -91,6 +92,8 @@ mod mobile_connection;
 mod mobile_web;
 mod motion;
 mod mux;
+mod native_result_model;
+mod native_view_cli;
 mod nebula_history;
 mod notify;
 #[cfg(windows)]
@@ -100,6 +103,7 @@ mod plugins;
 #[cfg(all(unix, feature = "legacy-shell"))]
 mod polling;
 mod process_tree;
+mod prompt_suggestions;
 mod provider_test;
 mod proxy_test;
 mod remote_dirs;
@@ -116,6 +120,8 @@ mod saved_commands;
 mod scheduler;
 #[cfg(test)]
 mod scientific_corpus;
+mod scrollbar;
+mod serial_session;
 mod session;
 mod shell_detect;
 mod ssh;
@@ -224,13 +230,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     #[cfg(feature = "gpui-shell")]
     if wants_gpui_shell(&options) {
         let terminal_options = &options.window_options.terminal_options;
-        let initial_cwd = terminal_options
-            .resolved_working_directory()
-            .filter(|path| path.is_dir())
-            .and_then(|path| std::path::absolute(path).ok());
         // `--shell <id>`（右键菜单「在 Pebrel 中打开（Ubuntu）」用它）一路带到
         // 首个标签；缺省仍然用设置里的默认 shell。
         let shell_id = terminal_options.shell_id();
+        let requested_shell = terminal_options.command().map(Into::into).or_else(|| {
+            crate::gpui_shell::workspace::shell_launch::startup_shell(shell_id.clone())
+        });
+        let initial_cwd = terminal_options.resolved_working_directory().and_then(|path| {
+            platform::launch_directory::validate(
+                path,
+                platform::launch_directory::is_wsl(requested_shell.as_ref()),
+            )
+        });
         platform::startup::prepare_gui();
         let _log_file = logging::initialize(&options).expect("Unable to initialize logger");
         let requested_dir = terminal_options.resolved_working_directory();
@@ -258,16 +269,29 @@ fn main() -> Result<(), Box<dyn Error>> {
         if try_hand_over_to_resident(&options) {
             return Ok(());
         }
+        // The first WSL pane spawns before any guest could answer; ask its guest
+        // now, off this thread, so a running distribution has answered by then
+        // (see `platform::wsl_guest_shell`). An explicit command opens no shell.
+        if terminal_options.command().is_none() {
+            let shell_id = shell_id.clone();
+            platform::wsl_guest_shell::warm_up(move || {
+                crate::gpui_shell::workspace::shell_launch::startup_shell(shell_id)
+            });
+        }
         gpui_shell::run_shell(
             initial_cwd,
             terminal_options.command(),
             shell_id,
             options.config_file.clone(),
+            options.launched_at_login,
         );
         return Ok(());
     }
 
     match options.subcommands {
+        Some(Subcommands::Predict(options)) => {
+            std::process::exit(prompt_suggestions::launcher::run(options))
+        },
         Some(Subcommands::Ctl(options)) => runtime_api::run_cli(options)?,
         // Resource-verb commands are thin aliases over `ctl`, speaking the same
         // serialized protocol (see `runtime_api::shortcuts`).
@@ -281,9 +305,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(Subcommands::Migrate(options)) => migrate::migrate(options),
         Some(Subcommands::Config(options)) => std::process::exit(config_cli::run(options)),
         Some(Subcommands::Plugin(options)) => std::process::exit(plugins::cli::run(options)),
+        #[cfg(feature = "gpui-shell")]
         Some(Subcommands::Theme(options)) => {
             std::process::exit(theme_library::package::cli::run(options))
         },
+        Some(Subcommands::View(options)) => std::process::exit(native_view_cli::run(options)),
         #[cfg(windows)]
         Some(Subcommands::NotifyTest) => std::process::exit(crate::notify::notify_test()),
         Some(Subcommands::SetupAi(options)) => {
@@ -617,13 +643,19 @@ fn resident_launch_directory(
     options: &cli::TerminalOptions,
     settings: &nebula_settings::RuntimeSettings,
 ) -> Option<std::path::PathBuf> {
-    // 进程 cwd 只是缺省值，不能在交接前把它提升成覆盖用户设置的显式目录。
-    options
-        .resolved_working_directory()
-        .or_else(|| settings.startup_directory_path())
-        .or_else(|| env::current_dir().ok())
-        .filter(|path| path.is_dir())
-        .and_then(|path| std::path::absolute(path).ok())
+    #[cfg(feature = "gpui-shell")]
+    let shell = options.command().map(Into::into).or_else(|| {
+        crate::gpui_shell::workspace::shell_launch::startup_shell(
+            options.shell_id().or_else(|| settings.shell.clone()),
+        )
+    });
+    #[cfg(not(feature = "gpui-shell"))]
+    let shell = options.command().map(Into::into);
+    platform::startup::resident_launch_directory(
+        options.resolved_working_directory(),
+        settings,
+        platform::launch_directory::is_wsl(shell.as_ref()),
+    )
 }
 
 #[cfg(test)]

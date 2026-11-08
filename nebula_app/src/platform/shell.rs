@@ -22,6 +22,37 @@ pub(crate) fn wsl_executable() -> Option<String> {
     }
 }
 
+/// Query running distributions without selecting or launching a guest.
+pub(crate) fn running_wsl_distros(
+    timeout: std::time::Duration,
+    cancelled: &dyn Fn() -> bool,
+) -> std::io::Result<Vec<String>> {
+    let program = wsl_executable().ok_or(std::io::ErrorKind::Unsupported)?;
+    let mut command = std::process::Command::new(program);
+    // WSL 管理命令默认输出 UTF-16；覆盖继承的 WSL_UTF8，旧 inbox 版本也沿用默认编码。
+    command.args(["--list", "--running", "--quiet"]).env("WSL_UTF8", "0");
+    let output = super::process_output::read_cancellable(command, timeout, 64 * 1024, cancelled)?;
+    wsl_running_names(&output)
+}
+
+fn wsl_running_names(bytes: &[u8]) -> std::io::Result<Vec<String>> {
+    let invalid =
+        || std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid WSL distribution list");
+    if bytes.len() % 2 != 0 {
+        return Err(invalid());
+    }
+    let units: Vec<_> = bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+    let text = String::from_utf16(&units).map_err(|_| invalid())?;
+    let mut names = Vec::new();
+    for name in text.trim_start_matches('\u{feff}').lines().filter(|line| !line.is_empty()) {
+        if names.len() >= 256 || name.len() > 256 || name.chars().any(char::is_control) {
+            return Err(invalid());
+        }
+        names.push(name.to_owned());
+    }
+    Ok(names)
+}
+
 /// Stable id for the shell the PTY backend starts when no override is set.
 pub fn default_shell_id() -> String {
     #[cfg(windows)]
@@ -74,6 +105,37 @@ pub(crate) fn snapshot_shell(
     }
     #[cfg(not(windows))]
     configured
+}
+
+#[cfg(windows)]
+pub(super) fn prepare_startup_directory(options: &mut nebula_terminal::tty::Options) {
+    use std::path::{Component, Prefix};
+
+    let Some(Component::Prefix(prefix)) =
+        options.working_directory.as_ref().and_then(|path| path.components().next())
+    else {
+        return;
+    };
+    let server = match prefix.kind() {
+        Prefix::UNC(server, _) | Prefix::VerbatimUNC(server, _) => server,
+        _ => return,
+    };
+    if !server.to_str().is_some_and(|server| {
+        server.eq_ignore_ascii_case("wsl.localhost") || server.eq_ignore_ascii_case("wsl$")
+    }) {
+        return;
+    }
+    let shell = options.shell.clone().unwrap_or_else(nebula_terminal::tty::resolved_default_shell);
+    let name = shell.program().rsplit(['/', '\\']).next().unwrap_or_default();
+    if matches!(
+        name.to_ascii_lowercase().as_str(),
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe"
+    ) {
+        // CMD launchers cannot inherit a WSL UNC cwd and otherwise fall back to Windows.
+        if let Some(home) = super::dirs::home_dir() {
+            options.working_directory = Some(home);
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -244,9 +306,152 @@ pub(crate) fn completion_qa_shell(_output: &std::path::Path) -> nebula_terminal:
     }
 }
 
+/// Windows bootstrap for the clipboard acceptance fixture; UI checks remain in the view.
+#[cfg(test)]
+pub(crate) fn native_clipboard_qa_shell(
+    program: String,
+    output: &std::path::Path,
+) -> nebula_terminal::tty::Shell {
+    #[cfg(windows)]
+    {
+        let shell = nebula_terminal::tty::powershell_with_nebula_integration(
+            program,
+            vec!["-NoLogo".into(), "-NoProfile".into()],
+        );
+        let mut args = shell.args().to_vec();
+        let result_file = output.join("execution.txt").to_string_lossy().replace('\'', "''");
+        args.last_mut().unwrap().push_str(&format!(r#";
+Set-PSReadLineOption -HistorySaveStyle SaveNothing
+if ((Get-Command Set-PSReadLineOption).Parameters.ContainsKey('PredictionSource')) {{ Set-PSReadLineOption -PredictionSource None }}
+function global:PasteFixture {{ param($value); [IO.File]::AppendAllText('{result_file}', "$value`n") }}
+@{{ powershell=$PSVersionTable.PSVersion.ToString(); psreadline=(Get-Module PSReadLine).Version.ToString(); editor=$global:PebrelCompletionInputReady; clipboard=(Get-PebrelClipboardCapability) }} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:PEBREL_NATIVE_CLIPBOARD_QA_DIR 'shell.json')
+"#));
+        // PTY arguments are Windows command-line text. A BOM-marked file keeps
+        // quoting and Unicode intact for both Windows PowerShell and PowerShell 7.
+        let startup = args.pop().unwrap();
+        let startup_path = output.join("clipboard-startup.ps1");
+        std::fs::write(&startup_path, format!("\u{feff}{startup}\n")).unwrap();
+        *args.last_mut().unwrap() = "-File".into();
+        args.push(format!("\"{}\"", startup_path.display()));
+        nebula_terminal::tty::Shell::new(shell.program().into(), args)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (program, output);
+        panic!("native clipboard acceptance requires Windows");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn running_wsl_list_preserves_unicode_and_rejects_malformed_output() {
+        let encode =
+            |text: &str| text.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>();
+        assert_eq!(
+            wsl_running_names(&encode("\u{feff}Debian\r\n中文 测试\r\n")).unwrap(),
+            ["Debian", "中文 测试"]
+        );
+        assert!(wsl_running_names(&[]).unwrap().is_empty());
+        assert!(wsl_running_names(&[1]).is_err());
+        assert!(wsl_running_names(&[0, 0xd8]).is_err());
+        assert!(wsl_running_names(&encode("Debian\0\r\n")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_wsl_unc_startup_uses_home_without_changing_the_launch() {
+        use nebula_terminal::tty::{Options, Shell};
+
+        let home = super::super::dirs::home_dir().unwrap();
+        for program in ["powershell.exe", "C:/Program Files/PowerShell/7/pwsh.exe"] {
+            for cwd in [
+                r"\\wsl.localhost\Ubuntu\home\user",
+                r"\\wsl$\Ubuntu\home\user",
+                r"\\?\UNC\WSL.LOCALHOST\Ubuntu\home\user",
+            ] {
+                let shell = Shell::new(program.into(), vec!["-NoLogo".into()]);
+                let mut options = Options {
+                    shell: Some(shell.clone()),
+                    working_directory: Some(cwd.into()),
+                    ..Default::default()
+                };
+                prepare_startup_directory(&mut options);
+                assert_eq!(options.working_directory, Some(home.clone()));
+                assert_eq!(options.shell, Some(shell));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_network_directories_and_wsl_launches_keep_their_startup_cwd() {
+        use nebula_terminal::tty::{Options, Shell};
+
+        for (program, cwd) in [
+            ("pwsh.exe", r"C:\work"),
+            ("powershell.exe", r"\\server\share\work"),
+            ("wsl.exe", r"\\wsl.localhost\Ubuntu\home\user"),
+            ("bash.exe", r"\\wsl$\Ubuntu\home\user"),
+        ] {
+            let mut options = Options {
+                shell: Some(Shell::new(program.into(), vec![])),
+                working_directory: Some(cwd.into()),
+                ..Default::default()
+            };
+            let original = options.clone();
+            prepare_startup_directory(&mut options);
+            assert_eq!(options, original);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_cmd_launchers_inherit_the_prepared_windows_directory() {
+        use nebula_terminal::tty::{Options, Shell};
+
+        let root = tempfile::tempdir().unwrap();
+        let shim = root.path().join("cwd-probe.cmd");
+        let result = root.path().join("cwd-result.txt");
+        std::fs::write(&shim, b"@echo off\r\ncd\r\n").unwrap();
+        let home = super::super::dirs::home_dir().unwrap();
+        let system = std::env::var_os("SystemRoot").unwrap();
+        let powershell =
+            std::path::Path::new(&system).join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        for program in [powershell.to_string_lossy().into_owned(), "pwsh.exe".into()] {
+            std::fs::write(&result, b"").unwrap();
+            let mut options = Options {
+                shell: Some(Shell::new(program.clone(), vec![])),
+                working_directory: Some(r"\\wsl.localhost\Ubuntu\home\user".into()),
+                ..Default::default()
+            };
+            super::super::environment::prepare_local_pty(&mut options);
+            assert_eq!(options.working_directory.as_ref(), Some(&home));
+            let output = std::process::Command::new(&program)
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "$paths = @($PWD.ProviderPath; & $env:ComSpec /d /c cd; & $env:PEBREL_CWD_SHIM); [IO.File]::WriteAllLines($env:PEBREL_CWD_RESULT, [string[]]$paths, [Text.Encoding]::UTF8)",
+                ])
+                .current_dir(options.working_directory.unwrap())
+                .env("PEBREL_CWD_SHIM", &shim)
+                .env("PEBREL_CWD_RESULT", &result)
+                .env_remove("PSModulePath")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{program}: {:?}", output);
+            assert!(output.stderr.is_empty(), "{program}: {:?}", output);
+            let paths = std::fs::read_to_string(&result).unwrap();
+            assert_eq!(
+                paths.trim_start_matches('\u{feff}').lines().collect::<Vec<_>>(),
+                vec![home.to_str().unwrap(); 3],
+                "{program}: {paths}"
+            );
+        }
+    }
 
     #[cfg(windows)]
     #[test]

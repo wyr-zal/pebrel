@@ -26,7 +26,14 @@ pub(crate) fn code_block_background(cx: &App) -> Hsla {
     let base =
         cx.try_global::<DocumentColors>().map_or(cx.theme().background, |colors| colors.background);
     // Code keeps the document palette, with a distinct surface in either mode.
-    base.blend(cx.theme().foreground.opacity(if cx.theme().is_dark() { 0.08 } else { 0.045 }))
+    base.blend(cx.theme().foreground.opacity(if cx.theme().is_dark() { 0.075 } else { 0.055 }))
+}
+
+pub(crate) fn inline_code_background(cx: &App) -> Hsla {
+    let base =
+        cx.try_global::<DocumentColors>().map_or(cx.theme().background, |colors| colors.background);
+    // 行内标记比大代码块略实，但继续使用文档色系，避免白纸上的生硬方块。
+    base.blend(cx.theme().foreground.opacity(if cx.theme().is_dark() { 0.12 } else { 0.075 }))
 }
 
 pub(crate) fn code_block_foreground(cx: &App) -> Hsla {
@@ -137,10 +144,8 @@ pub(crate) fn faint_ink(cx: &App) -> Hsla {
     ink(resolved_skin(cx).ink_faint)
 }
 
-/// 侧栏运行 spinner 的两端颜色，逐字复用旧壳 `draw_chrome` 的底色裁定：
-/// hairline / ink_dim 先与该 Tab 行的真实不透明底色合成。环由大量相交小圆
-/// 铺成；若直接交给 GPUI 用半透明 hairline 叠画，交叠处会变深，看起来像
-/// 一圈模糊珠子而不是连续圆环。
+/// 运行态圆环的轨道和旋转弧共用语义色；先与 Tab 行底色合成，
+/// 轨道与弧重叠时不会重复积累透明度，深浅主题都保持中性对比。
 pub(crate) fn sidebar_spinner_colors(cx: &App, active: bool) -> (GpuiRgba, GpuiRgba) {
     let palette = resolved_palette(cx);
     let sk = resolved_skin(cx);
@@ -320,15 +325,14 @@ pub fn card_shadow(cx: &App) -> gpui::BoxShadow {
     }
 }
 
-/// 卡内容层底色 = 当前生效的终端背景。终端 tab 之外的卡内容（设置页）
-/// 也用它，让每个 tab 都读作同一张浮在壳上的圆角卡。带窗口透明度
-/// （与终端元素的默认背景同 alpha，透明窗口下整卡一致）。
+/// 终端卡底色使用当前生效的终端背景，并应用窗口背景不透明度。
+/// 设置页通过 `settings_content_bg` 保留主题面板色，复用同一份 alpha。
 pub fn card_content_bg(cx: &App) -> Hsla {
     let mut bg: Hsla = cx
         .try_global::<crate::gpui_shell::config::Settings>()
         .map(|s| s.palette.background.into())
         .unwrap_or_else(|| cx.theme().background);
-    bg.a *= crate::gpui_shell::wallpaper::chrome_surface_opacity(cx);
+    bg.a *= crate::gpui_shell::wallpaper::card_surface_opacity(cx);
     bg
 }
 
@@ -406,7 +410,14 @@ pub fn paint_shell_around_card(
     }
 }
 
-/// 旧壳设置页使用不透明 `Skin.panel`，不让终端壁纸穿透设置内容。
+/// 设置页正文与终端卡共用背景不透明度；背景只由 workspace 卡容器绘制。
+pub(crate) fn settings_content_bg(cx: &App) -> Hsla {
+    let mut bg = settings_panel_bg(cx);
+    bg.a *= crate::gpui_shell::wallpaper::card_surface_opacity(cx);
+    bg
+}
+
+/// 弹窗和控件的实色底，独立于正文不透明度以保持可读性。
 pub fn settings_panel_bg(cx: &App) -> Hsla {
     solid(resolved_skin(cx).panel)
 }
@@ -506,7 +517,15 @@ pub fn settings_hairline(cx: &App) -> Hsla {
 /// a dark outline makes the control look stuck. Keyboard navigation keeps the
 /// accent ring; pointer interaction folds the ring into the normal input line.
 pub fn sync_component_focus_ring(window: &Window, cx: &mut App) {
-    let ring = if window.last_input_was_keyboard() { cx.theme().link } else { cx.theme().input };
+    sync_component_focus_ring_for_input(window.last_input_was_keyboard(), cx);
+}
+
+fn sync_component_focus_ring_for_input(last_input_was_keyboard: bool, cx: &mut App) {
+    let ring = if last_input_was_keyboard { cx.theme().link } else { cx.theme().input };
+    // GPUI 的 global_mut 即使写回相同颜色也会通知观察者；动画帧不应重复广播主题变化。
+    if cx.theme().ring == ring {
+        return;
+    }
     Theme::global_mut(cx).ring = ring;
 }
 
@@ -522,6 +541,7 @@ pub fn settings_hover_bg(cx: &App, strong: bool) -> Hsla {
 /// 所有主题（含 Nord / Nord Light / Warm Sand）共用同一条 token 应用路径。启动、设置变更、系统外观变化
 /// 都走这里；主题名先经 [`effective_theme_name`] 折算 follow_system。
 pub fn apply_chrome_theme(cx: &mut App) {
+    super::font_loading::ensure_selected(cx);
     // 视效（模糊/透明度/壁纸）与主题同一时机刷新：设置热应用、系统外观
     // 变化都会走到这里，窗口级效果与 token 保持同帧一致。
     crate::gpui_shell::wallpaper::refresh(cx);
@@ -589,6 +609,15 @@ fn apply_shell_opacity(chrome: &ResolvedTheme, cx: &mut App) {
     theme.tokens.sidebar_border = shell.into();
     theme.tokens.title_bar = shell.into();
     theme.tokens.title_bar_border = shell.into();
+}
+
+/// Shared tab surface for sidebar and top layouts. Text/icons keep their alpha.
+pub(super) fn tab_bar_background(cx: &App) -> Hsla {
+    // The prepared shell token already contains the resolved theme color.
+    // Replace its alpha, avoiding both a second multiplication and render-time I/O.
+    let mut color = cx.theme().background;
+    color.a = crate::gpui_shell::wallpaper::tab_bar_surface_opacity(cx);
+    color
 }
 
 /// 旧壳 [`Skin`] → gpui-component 全局 token。改全局而不是逐组件覆样式：
@@ -783,16 +812,9 @@ fn apply_skin_tokens(chrome: &ResolvedTheme, cx: &mut App) {
     // 我们是终端，所以等宽在这里是**语义标记**而不是全局字体：路径、键帽、
     // 命令、数值这类"机器读、要逐字符对齐、要能整段复制"的东西显式走 mono；
     // 标题和说明是给人读的，走 sans。
-    let default_ui_font =
-        if crate::platform::Platform::current() == crate::platform::Platform::Windows {
-            // UI 中的等宽语义也必须稳定。终端字体由 TerminalView 单独读取；
-            // 若把用户字体组写进全局 theme，tab、标题和代码字面量的字宽都会
-            // 随终端主字体变化，进而破坏 chrome 的既定间距。
-            theme.mono_font_family = crate::font_install::REQUIRED_FONT_FAMILY.into();
-            "Microsoft YaHei UI"
-        } else {
-            ".SystemUIFont"
-        };
+    // 元数据用系统等宽字体，不能因界面显示路径而隐式加载完整中文字体。
+    theme.mono_font_family = crate::font_install::SYSTEM_MONO_FONT_FAMILY.into();
+    let default_ui_font = super::typography::UI_FONT_FAMILY;
     theme.font_family = ui_font_family.unwrap_or_else(|| default_ui_font.to_owned()).into();
     theme.radius = px(6.0);
     theme.radius_lg = px(12.0);
@@ -808,6 +830,50 @@ fn apply_skin_tokens(chrome: &ResolvedTheme, cx: &mut App) {
 mod tests {
     use super::{PaneCardStyle, resolve_theme_name, theme_card_persist_updates};
     use nebula_settings::{RawSettings, RuntimeSettings, ThemeName};
+
+    #[cfg(feature = "gpui-test-support")]
+    #[gpui::test]
+    fn repeated_focus_ring_sync_does_not_notify_theme_observers(cx: &mut gpui::TestAppContext) {
+        use gpui_component::Theme;
+        use std::{cell::Cell, rc::Rc};
+
+        cx.update(|cx| {
+            let mut theme = Theme::default();
+            theme.input = gpui::rgb(0x303744).into();
+            theme.link = gpui::rgb(0x88c0d0).into();
+            theme.ring = theme.input;
+            cx.set_global(theme);
+        });
+        let notifications = Rc::new(Cell::new(0));
+        let observed = notifications.clone();
+        let _subscription =
+            cx.update(|cx| cx.observe_global::<Theme>(move |_| observed.set(observed.get() + 1)));
+
+        for _ in 0..24 {
+            cx.update(|cx| super::sync_component_focus_ring_for_input(false, cx));
+        }
+        cx.run_until_parked();
+        assert_eq!(notifications.get(), 0, "unchanged animation frames must not rebroadcast Theme");
+
+        cx.update(|cx| {
+            super::sync_component_focus_ring_for_input(true, cx);
+            assert_eq!(Theme::global(cx).ring, Theme::global(cx).link);
+        });
+        cx.run_until_parked();
+        assert_eq!(notifications.get(), 1, "keyboard focus still updates the visible ring");
+        for _ in 0..24 {
+            cx.update(|cx| super::sync_component_focus_ring_for_input(true, cx));
+        }
+        cx.run_until_parked();
+        assert_eq!(notifications.get(), 1);
+
+        cx.update(|cx| {
+            super::sync_component_focus_ring_for_input(false, cx);
+            assert_eq!(Theme::global(cx).ring, Theme::global(cx).input);
+        });
+        cx.run_until_parked();
+        assert_eq!(notifications.get(), 2, "pointer input restores the neutral ring once");
+    }
 
     #[test]
     fn square_panes_fill_the_column_despite_saved_card_spacing_and_shadow() {

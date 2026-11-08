@@ -5,16 +5,12 @@ use nebula_terminal::grid::Dimensions as _;
 use nebula_terminal::index::{Column, Line, Point};
 
 use crate::ai_agents::{AgentStatus, AgentStatusSource};
-use crate::ai_hook::lifecycle::ShellOwnerStatus;
 #[cfg(windows)]
 use crate::ai_hook::lifecycle::CodexTerminalEvidence;
+use crate::ai_hook::lifecycle::ShellOwnerStatus;
 use crate::ai_hook::{AiHookEvent, AiHookKind};
 
-use super::{
-    TerminalView, TerminalViewEvent,
-    startup_command::RecoveryHookGate,
-    notifications,
-};
+use super::{TerminalView, TerminalViewEvent, notifications, startup_command::RecoveryHookGate};
 
 const MAX_PENDING_RECOVERY_HOOKS: usize = 32;
 const MAX_SHELL_BOUNDARY_PROBES: u8 = 5;
@@ -30,9 +26,7 @@ fn shell_boundary_retry_delay(attempts: u8) -> Option<std::time::Duration> {
     if attempts == 0 || attempts >= MAX_SHELL_BOUNDARY_PROBES {
         return None;
     }
-    Some(std::time::Duration::from_millis(
-        250u64.saturating_mul(1u64 << (attempts - 1).min(3)),
-    ))
+    Some(std::time::Duration::from_millis(250u64.saturating_mul(1u64 << (attempts - 1).min(3))))
 }
 
 impl TerminalView {
@@ -205,6 +199,7 @@ impl TerminalView {
                 });
             }
         }
+        self.sync_program_progress(cx);
         let status = self.agent_activity.status();
         self.confirmation.observe_waiting(status == AgentStatus::Blocked);
         if event.kind == AiHookKind::NeedsAttention {
@@ -268,8 +263,7 @@ impl TerminalView {
             return false;
         }
         let pid_matches = event.agent_pid.is_none_or(|pid| {
-            pid == receipt.process.pid
-                && event.agent_start_time == Some(receipt.process.start_time)
+            pid == receipt.process.pid && event.agent_start_time == Some(receipt.process.start_time)
         });
         let remote_matches = event.remote_process.as_deref().is_none_or(|process| {
             process.split_once(':').is_some_and(|(pid, start)| {
@@ -308,19 +302,12 @@ impl TerminalView {
         let Some(pending) = self.shell_boundary_probe.clone() else {
             return;
         };
-        let Some(probe) = self
-            .session
-            .as_ref()
-            .and_then(|session| session.wsl_hook.as_ref())
-            .and_then(|channel| {
-                channel.owner_probe(&pending.owner.source, &pending.owner.process)
-            })
+        let Some(probe) =
+            self.session.as_ref().and_then(|session| session.wsl_hook.as_ref()).and_then(
+                |channel| channel.owner_probe(&pending.owner.source, &pending.owner.process),
+            )
         else {
-            self.resolve_probed_shell_boundary(
-                &pending.owner,
-                ShellOwnerStatus::Unavailable,
-                cx,
-            );
+            self.resolve_probed_shell_boundary(&pending.owner, ShellOwnerStatus::Unavailable, cx);
             return;
         };
         self.shell_boundary_generation = self.shell_boundary_generation.wrapping_add(1);
@@ -332,11 +319,7 @@ impl TerminalView {
                 if view.shell_boundary_generation != generation {
                     return;
                 }
-                view.resolve_probed_shell_boundary(
-                    &pending.owner,
-                    status,
-                    cx,
-                );
+                view.resolve_probed_shell_boundary(&pending.owner, status, cx);
             });
         })
         .detach();
@@ -517,7 +500,8 @@ impl TerminalView {
     }
 
     /// Check shell boundaries first; only an integration lacking lifecycle
-    /// authority may then consume a screen observation. Silence has no meaning.
+    /// authority may then consume a screen observation. Missing matches cannot
+    /// establish completion.
     pub fn refresh_agent_screen_state(&mut self, cx: &mut Context<Self>) {
         if self.exited.is_some()
             || matches!(self.ssh_stage, Some(crate::ssh_session::SshStage::Failed(_)))
@@ -537,6 +521,8 @@ impl TerminalView {
             .map(str::to_owned);
         let screen_observation_enabled = retry_source.is_some();
         let allows_screen = self.agent_activity.allows_screen();
+        let reconcile_remote =
+            !self.suggest.suggest_env.is_this_machine() && self.agent_activity.hook_seen();
         let Some(session) = &self.session else {
             self.set_screen_error_indicator(false, cx);
             return;
@@ -557,27 +543,29 @@ impl TerminalView {
                             &self.suggest.suggest_env,
                         )
                     });
-                let screen = (allows_screen || screen_observation_enabled).then(|| {
-                    let start = Point::new(Line((lines - lines.min(24)) as i32), Column(0));
-                    let end = Point::new(Line(lines as i32 - 1), Column(columns.saturating_sub(1)));
-                    if self.agent_activity.awaiting_cancel() {
-                        // Copy text joins soft wraps. Cancellation needs the
-                        // visual composer rows after a full-width TUI redraw.
-                        let mut screen = String::new();
-                        for row in start.line.0..=end.line.0 {
-                            if row > start.line.0 {
-                                screen.push('\n');
+                let screen = (allows_screen || screen_observation_enabled || reconcile_remote)
+                    .then(|| {
+                        let start = Point::new(Line((lines - lines.min(24)) as i32), Column(0));
+                        let end =
+                            Point::new(Line(lines as i32 - 1), Column(columns.saturating_sub(1)));
+                        if self.agent_activity.awaiting_cancel() {
+                            // Copy text joins soft wraps. Cancellation needs the
+                            // visual composer rows after a full-width TUI redraw.
+                            let mut screen = String::new();
+                            for row in start.line.0..=end.line.0 {
+                                if row > start.line.0 {
+                                    screen.push('\n');
+                                }
+                                screen.push_str(&term.bounds_to_string(
+                                    Point::new(Line(row), Column(0)),
+                                    Point::new(Line(row), end.column),
+                                ));
                             }
-                            screen.push_str(&term.bounds_to_string(
-                                Point::new(Line(row), Column(0)),
-                                Point::new(Line(row), end.column),
-                            ));
+                            screen
+                        } else {
+                            term.bounds_to_string(start, end)
                         }
-                        screen
-                    } else {
-                        term.bounds_to_string(start, end)
-                    }
-                });
+                    });
                 (prompt_restored, screen, term.grid().display_offset())
             }
         };
@@ -602,19 +590,28 @@ impl TerminalView {
         let Some(screen) = screen else {
             return;
         };
-        if self.running_program.as_deref().is_some_and(|program| {
-            crate::ai_agents::screen_is_history_viewport(program, &screen)
-        }) {
+        if self
+            .running_program
+            .as_deref()
+            .is_some_and(|program| crate::ai_agents::screen_is_history_viewport(program, &screen))
+        {
             return;
         }
-        if retry_source.as_deref().is_some_and(|program| {
-            !crate::ai_agents::screen_has_current_composer(program, &screen)
-        }) {
-            if retry_source.as_deref().is_some_and(|program| {
-                crate::ai_agents::detect(program, &screen)
-                    .is_some_and(|detected| detected.status == AgentStatus::Blocked)
-            }) {
+        if retry_source
+            .as_deref()
+            .is_some_and(|program| !crate::ai_agents::screen_has_current_composer(program, &screen))
+        {
+            if let Some(detection) = retry_source
+                .as_deref()
+                .and_then(|program| crate::ai_agents::detect(program, &screen))
+                .filter(|detected| detected.status == AgentStatus::Blocked)
+            {
                 self.cancel_auto_continue(cx, "waiting_for_input");
+                if self.agent_activity.observe_screen(Some(detection)) {
+                    self.confirmation.observe_waiting(true);
+                    cx.emit(TerminalViewEvent::TitleChanged);
+                    cx.notify();
+                }
             }
             return;
         }
@@ -650,6 +647,24 @@ impl TerminalView {
                 cx.emit(TerminalViewEvent::TitleChanged);
                 cx.notify();
             }
+            if reconcile_remote && self.effective_program_status().is_none() {
+                let previous = self.agent_activity.status();
+                if self.agent_activity.reconcile_stalled_turn(
+                    self.running_program
+                        .as_deref()
+                        .and_then(|program| crate::ai_agents::detect(program, &screen))
+                        .as_ref(),
+                    self.agent_activity.turn_quiet_for(super::REMOTE_TURN_STALL),
+                ) {
+                    log::info!(
+                        "agent remote work observed: pane={} {previous:?} -> {:?}",
+                        self.pane_id,
+                        self.agent_activity.status()
+                    );
+                    cx.emit(TerminalViewEvent::TitleChanged);
+                    cx.notify();
+                }
+            }
             return;
         }
         let detected = notifications::screen_identity_allowed(self.running_program.as_deref())
@@ -658,7 +673,7 @@ impl TerminalView {
         let Some(program) =
             notifications::screen_program(self.running_program.as_deref(), detected)
         else {
-            self.agent_activity.observe_screen(None);
+            self.agent_activity.reset_screen_samples();
             return;
         };
         if self.running_program.as_deref() != Some(program.as_str()) {
@@ -707,14 +722,8 @@ mod shell_boundary_tests {
 
     #[test]
     fn unavailable_owner_probe_retries_are_bounded() {
-        assert_eq!(
-            shell_boundary_retry_delay(1),
-            Some(std::time::Duration::from_millis(250))
-        );
-        assert_eq!(
-            shell_boundary_retry_delay(4),
-            Some(std::time::Duration::from_secs(2))
-        );
+        assert_eq!(shell_boundary_retry_delay(1), Some(std::time::Duration::from_millis(250)));
+        assert_eq!(shell_boundary_retry_delay(4), Some(std::time::Duration::from_secs(2)));
         assert_eq!(shell_boundary_retry_delay(0), None);
         assert_eq!(shell_boundary_retry_delay(5), None);
     }

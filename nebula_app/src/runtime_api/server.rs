@@ -9,15 +9,45 @@ pub(super) struct Endpoint {
 }
 
 pub(crate) const ENDPOINT_ENV: &str = "PEBREL_RUNTIME_ENDPOINT";
-static CHILD_ENDPOINT: Mutex<Option<Endpoint>> = Mutex::new(None);
+const RESIDENT_ENDPOINT: &str = "resident";
 
-/// Private instances publish discovery only to their own local PTY children.
+struct HostedEndpoint {
+    endpoint: Endpoint,
+    shared_discovery: bool,
+    prediction_token: String,
+}
+
+static CHILD_ENDPOINT: Mutex<Option<HostedEndpoint>> = Mutex::new(None);
+
+/// Shared residents export discovery mode; private instances export only their
+/// own address. An explicit mode also replaces a nested launch's inherited pin.
 pub(crate) fn apply_child_endpoint(env: &mut std::collections::HashMap<String, String>) {
-    env.retain(|key, _| !key.eq_ignore_ascii_case(ENDPOINT_ENV));
-    if let Some(endpoint) =
-        CHILD_ENDPOINT.lock().unwrap_or_else(|error| error.into_inner()).as_ref()
+    env.retain(|key, _| {
+        ![ENDPOINT_ENV, "PEBREL_PREDICTION_ENDPOINT", "PEBREL_PREDICTION_TOKEN"]
+            .iter()
+            .any(|name| key.eq_ignore_ascii_case(name))
+    });
+    if let Some(hosted) = CHILD_ENDPOINT.lock().unwrap_or_else(|error| error.into_inner()).as_ref()
     {
-        env.insert(ENDPOINT_ENV.to_owned(), format!("{} {}", endpoint.port, endpoint.token));
+        if !hosted.prediction_token.is_empty() {
+            env.insert(
+                "PEBREL_PREDICTION_ENDPOINT".into(),
+                format!("http://127.0.0.1:{}", hosted.endpoint.port),
+            );
+            env.insert("PEBREL_PREDICTION_TOKEN".into(), hosted.prediction_token.clone());
+        }
+        env.insert(
+            ENDPOINT_ENV.to_owned(),
+            child_endpoint_value(&hosted.endpoint, hosted.shared_discovery),
+        );
+    }
+}
+
+fn child_endpoint_value(endpoint: &Endpoint, shared_discovery: bool) -> String {
+    if shared_discovery {
+        RESIDENT_ENDPOINT.to_owned()
+    } else {
+        format!("{} {}", endpoint.port, endpoint.token)
     }
 }
 
@@ -42,15 +72,25 @@ fn legacy_port_file() -> PathBuf {
 pub(super) fn read_endpoint() -> Option<Endpoint> {
     // A hosted instance owns its endpoint even when launched from another
     // Pebrel terminal. Child CLI processes have no server and use the env below.
-    if let Some(endpoint) = CHILD_ENDPOINT.lock().unwrap_or_else(|error| error.into_inner()).clone()
+    if let Some(hosted) = CHILD_ENDPOINT.lock().unwrap_or_else(|error| error.into_inner()).as_ref()
     {
-        return Some(endpoint);
+        return Some(hosted.endpoint.clone());
     }
-    if let Some(value) = std::env::var_os(ENDPOINT_ENV) {
-        // An invalid explicit endpoint must not silently select another instance.
-        return value.to_str().and_then(parse_endpoint);
+    read_inherited_endpoint(std::env::var_os(ENDPOINT_ENV).as_deref(), port_file)
+}
+
+fn read_inherited_endpoint(
+    value: Option<&std::ffi::OsStr>,
+    path: impl FnOnce() -> PathBuf,
+) -> Option<Endpoint> {
+    if let Some(value) = value {
+        let value = value.to_str()?;
+        if value != RESIDENT_ENDPOINT {
+            // An invalid explicit endpoint must not silently select another instance.
+            return parse_endpoint(value);
+        }
     }
-    read_endpoint_from(port_file())
+    read_endpoint_from(path())
 }
 
 fn read_endpoint_from(path: PathBuf) -> Option<Endpoint> {
@@ -108,9 +148,6 @@ pub fn try_open_directory_existing(dir: &std::path::Path, shell: Option<&str>) -
 /// 仍先发送 ATTACH，保证隐藏驻留进程被唤醒；真正的窗口由同一 GPUI App
 /// 创建，避免第二个进程争抢 runtime.port 和托盘所有权。
 pub fn try_open_window_existing(dir: Option<&std::path::Path>, shell: Option<&str>) -> bool {
-    if legacy_request("ATTACH").is_none() {
-        return false;
-    }
     request_handover("window.create", handover_params(dir, shell))
 }
 
@@ -130,71 +167,35 @@ fn handover_params(dir: Option<&std::path::Path>, shell: Option<&str>) -> serde_
 }
 
 fn try_open_tab_existing(dir: Option<&std::path::Path>, shell: Option<&str>) -> bool {
-    if legacy_request("ATTACH").is_none() {
-        return false;
-    }
-    // ATTACH 与 tab.new 落到同一事件队列，窗口先恢复，新标签随后创建。
     request_handover("tab.new", handover_params(dir, shell))
 }
 
 fn request_handover(method: &str, params: serde_json::Value) -> bool {
     let cwd = params.get("cwd").and_then(serde_json::Value::as_str).map(str::to_owned);
     let shell_override = params.get("shell").is_some();
-    match cli::request_once(method, params, IO_TIMEOUT) {
-        Ok(response) if response.ok => {
-            crate::logging::startup_diagnostic(format!(
-                "event=handover_request method={method} result=accepted cwd={cwd:?} shell_override_present={shell_override}"
-            ));
-            true
-        },
-        Ok(response) => {
-            let error_code = response.error.as_ref().map_or("missing", |error| error.code.as_str());
-            crate::logging::startup_diagnostic(format!(
-                "event=handover_request method={method} result=rejected error_code={error_code} cwd={cwd:?} shell_override_present={shell_override}"
-            ));
-            false
-        },
-        Err(error) => {
-            crate::logging::startup_diagnostic(format!(
-                "event=handover_request method={method} result=transport_error error={error} cwd={cwd:?} shell_override_present={shell_override}"
-            ));
-            false
-        },
-    }
+    let consumed = super::handover::open(method, params);
+    crate::logging::startup_diagnostic(format!(
+        "event=handover_request method={method} launch_consumed={consumed} cwd={cwd:?} shell_override_present={shell_override}"
+    ));
+    consumed
 }
 
-fn legacy_request(verb: &str) -> Option<()> {
-    let local = CHILD_ENDPOINT.lock().unwrap_or_else(|error| error.into_inner()).clone();
-    let (endpoint, source) = if local.is_some() {
-        (local, "inherited")
-    } else if std::env::var_os(ENDPOINT_ENV).is_some() {
-        (read_endpoint(), "environment")
-    } else if let Some(endpoint) = read_endpoint() {
-        (Some(endpoint), "runtime_port")
-    } else {
-        // 已运行的 pre-v1 版本只发布 mux.port；升级期间仍允许普通启动交接。
-        (read_endpoint_from(legacy_port_file()), "legacy_port")
-    };
-    let Some(endpoint) = endpoint else {
-        crate::logging::startup_diagnostic(format!(
-            "event=handover_attach verb={verb} result=failed stage=endpoint source={source}"
-        ));
-        return None;
-    };
-    match legacy_request_result(verb, &endpoint) {
-        Ok(()) => {
-            crate::logging::startup_diagnostic(format!(
-                "event=handover_attach verb={verb} result=accepted source={source}"
-            ));
-            Some(())
-        },
-        Err(error) => {
-            crate::logging::startup_diagnostic(format!(
-                "event=handover_attach verb={verb} result=failed source={source} {error}"
-            ));
-            None
-        },
+pub(super) fn attach_endpoint() -> Option<Endpoint> {
+    let attach = |endpoint: Endpoint| legacy_request_to("ATTACH", &endpoint).map(|_| endpoint);
+    let local = CHILD_ENDPOINT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .map(|hosted| hosted.endpoint.clone());
+    if let Some(endpoint) = local {
+        return attach(endpoint);
     }
+    if std::env::var_os(ENDPOINT_ENV).is_some() {
+        return read_endpoint().and_then(attach);
+    }
+    read_endpoint()
+        .and_then(attach)
+        .or_else(|| read_endpoint_from(legacy_port_file()).and_then(attach))
 }
 
 fn legacy_request_to(verb: &str, endpoint: &Endpoint) -> Option<()> {
@@ -288,6 +289,7 @@ impl RuntimeServer {
             return None;
         }
 
+        let prediction_token = hub.predictions.token.clone();
         let server_token = endpoint.token.clone();
         let spawned = std::thread::Builder::new()
             .name("nebula-runtime-api".into())
@@ -295,7 +297,11 @@ impl RuntimeServer {
             .is_ok();
         if spawned {
             *CHILD_ENDPOINT.lock().unwrap_or_else(|error| error.into_inner()) =
-                Some(endpoint.clone());
+                Some(HostedEndpoint {
+                    endpoint: endpoint.clone(),
+                    shared_discovery: path.is_some(),
+                    prediction_token,
+                });
             Some(Self { endpoint, port_file: path, _owner_lock: owner_lock })
         } else {
             if let Some(path) = path {
@@ -315,7 +321,7 @@ impl Drop for RuntimeServer {
             let _ = std::fs::remove_file(path);
         }
         let mut child = CHILD_ENDPOINT.lock().unwrap_or_else(|error| error.into_inner());
-        if child.as_ref() == Some(&self.endpoint) {
+        if child.as_ref().is_some_and(|hosted| hosted.endpoint == self.endpoint) {
             *child = None;
         }
     }
@@ -344,7 +350,84 @@ mod tests {
     }
 
     #[test]
-    fn private_server_keeps_discovery_off_disk_and_supplies_its_children() {
+    fn resident_child_follows_discovery_after_endpoint_rotation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.port");
+        let first = Endpoint { port: 12345, token: "11111111111111111111111111111111".into() };
+        let second = Endpoint { port: 23456, token: "22222222222222222222222222222222".into() };
+        let reused_port =
+            Endpoint { port: second.port, token: "33333333333333333333333333333333".into() };
+        let inherited = child_endpoint_value(&first, true);
+
+        for current in [&first, &second, &reused_port] {
+            crate::atomic_file::write(
+                &path,
+                format!("{} {} 1\n", current.port, current.token).as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(
+                read_inherited_endpoint(Some(inherited.as_ref()), || path.clone()).as_ref(),
+                Some(current),
+            );
+        }
+    }
+
+    #[test]
+    fn resident_child_does_not_reuse_a_removed_or_invalid_discovery_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.port");
+        let endpoint = Endpoint { port: 12345, token: "11111111111111111111111111111111".into() };
+        let inherited = child_endpoint_value(&endpoint, true);
+        assert!(read_inherited_endpoint(Some(inherited.as_ref()), || path.clone()).is_none());
+        crate::atomic_file::write(&path, b"invalid discovery\n").unwrap();
+        assert!(read_inherited_endpoint(Some(inherited.as_ref()), || path).is_none());
+    }
+
+    #[test]
+    fn explicit_private_endpoint_never_falls_back_to_shared_discovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.port");
+        let private = Endpoint { port: 12345, token: "11111111111111111111111111111111".into() };
+        crate::atomic_file::write(&path, b"23456 22222222222222222222222222222222 1\n").unwrap();
+        let inherited = child_endpoint_value(&private, false);
+        assert_eq!(
+            read_inherited_endpoint(Some(inherited.as_ref()), || {
+                panic!("private endpoints must not inspect shared discovery")
+            })
+            .as_ref(),
+            Some(&private),
+        );
+        for invalid in ["", "invalid", "0 11111111111111111111111111111111"] {
+            assert!(
+                read_inherited_endpoint(Some(invalid.as_ref()), || {
+                    panic!("invalid explicit endpoints must not inspect shared discovery")
+                })
+                .is_none()
+            );
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            read_inherited_endpoint(Some(inherited.as_ref()), || path).as_ref(),
+            Some(&private),
+        );
+    }
+
+    #[test]
+    fn explicit_legacy_endpoint_and_unset_environment_keep_their_discovery_contracts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.port");
+        let endpoint = Endpoint { port: 12345, token: "11111111111111111111111111111111".into() };
+        let legacy = format!("{} {} 1", endpoint.port, endpoint.token);
+        crate::atomic_file::write(&path, b"23456 22222222222222222222222222222222 1\n").unwrap();
+        assert_eq!(
+            read_inherited_endpoint(Some(legacy.as_ref()), || path.clone()).as_ref(),
+            Some(&endpoint),
+        );
+        assert_eq!(read_inherited_endpoint(None, || path).unwrap().port, 23456);
+    }
+
+    #[test]
+    fn hosted_servers_supply_children_with_their_own_discovery_scope() {
         let server =
             RuntimeServer::spawn_at(EventSink::Callback(Arc::new(|_| {})), RuntimeHub::new(), None)
                 .unwrap();
@@ -360,6 +443,31 @@ mod tests {
         wrong.token = "00000000000000000000000000000000".into();
         assert!(legacy_request_to("PING", &wrong).is_none());
         drop(server);
+        apply_child_endpoint(&mut env);
+        assert!(!env.contains_key(ENDPOINT_ENV));
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.port");
+        let resident = RuntimeServer::spawn_at(
+            EventSink::Callback(Arc::new(|_| {})),
+            RuntimeHub::new(),
+            Some(path.clone()),
+        )
+        .unwrap();
+        // A resident launched from a private terminal must replace that pin,
+        // including differently cased Windows environment keys.
+        env.insert(ENDPOINT_ENV.to_ascii_lowercase(), "old private endpoint".into());
+        apply_child_endpoint(&mut env);
+        assert_eq!(env.len(), 3);
+        assert_eq!(env[ENDPOINT_ENV], RESIDENT_ENDPOINT);
+        let discovered =
+            read_inherited_endpoint(Some(env[ENDPOINT_ENV].as_ref()), || path.clone()).unwrap();
+        assert_eq!(discovered, resident.endpoint);
+        assert!(legacy_request_to("PING", &discovered).is_some());
+        // In-process callers keep their hosted instance even if discovery vanishes.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(read_endpoint().as_ref(), Some(&resident.endpoint));
+        drop(resident);
         apply_child_endpoint(&mut env);
         assert!(!env.contains_key(ENDPOINT_ENV));
     }
