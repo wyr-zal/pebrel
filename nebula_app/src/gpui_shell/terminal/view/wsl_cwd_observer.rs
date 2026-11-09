@@ -22,6 +22,7 @@ pub(super) struct WslCwdObserver {
     command_candidate: bool,
     agent_expected: bool,
     command_started: bool,
+    pending_submission: bool,
     identity_suppressed: bool,
     active: bool,
     epoch: u64,
@@ -40,6 +41,14 @@ pub(super) struct WslCwdObserver {
 }
 
 pub(super) use crate::platform::ai_session_identity::ObservedWslSessionScope as WslIdentityScope;
+
+pub(super) struct PendingWslSubmission {
+    boundary: Option<NativeLaunchBoundary>,
+    command_id: Option<String>,
+    literal_invocation: Option<(Option<String>, Vec<String>)>,
+    command_candidate: bool,
+    agent_expected: bool,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct ProbeCompletion {
@@ -63,6 +72,7 @@ impl Default for WslCwdObserver {
             command_candidate: false,
             agent_expected: false,
             command_started: false,
+            pending_submission: false,
             identity_suppressed: false,
             active: false,
             epoch: 0,
@@ -85,6 +95,7 @@ impl Default for WslCwdObserver {
 impl WslCwdObserver {
     pub(super) fn prepare_submission(&mut self, boundary: Option<NativeLaunchBoundary>) {
         self.invalidate();
+        self.pending_submission = true;
         self.boundary = boundary;
         self.command_id = None;
         self.literal_invocation = None;
@@ -96,6 +107,28 @@ impl WslCwdObserver {
         self.active = false;
         self.reset_probe_state();
         self.pending_title_changed |= self.clear_observed();
+    }
+
+    /// Preserve only pre-input submission data while the preceding command is retired.
+    pub(super) fn take_pending_submission(&mut self) -> Option<PendingWslSubmission> {
+        std::mem::take(&mut self.pending_submission).then(|| PendingWslSubmission {
+            boundary: self.boundary.take(),
+            command_id: self.command_id.take(),
+            literal_invocation: self.literal_invocation.take(),
+            command_candidate: self.command_candidate,
+            agent_expected: self.agent_expected,
+        })
+    }
+
+    pub(super) fn restore_submission(&mut self, submission: PendingWslSubmission) {
+        self.prepare_submission(submission.boundary);
+        // Cancelled work retains its old epoch and must not block the new probe.
+        self.pending = None;
+        self.command_id = submission.command_id;
+        self.literal_invocation = submission.literal_invocation;
+        self.command_candidate = submission.command_candidate;
+        self.agent_expected = submission.agent_expected;
+        self.pending_submission = false;
     }
 
     pub(super) fn accept_command_id(&mut self, command_id: &str) {
@@ -210,6 +243,7 @@ impl WslCwdObserver {
 
     pub(super) fn finish_command(&mut self) -> bool {
         self.invalidate();
+        self.pending_submission = false;
         self.active = false;
         self.boundary = None;
         self.command_id = None;
@@ -666,6 +700,64 @@ mod tests {
             shell: ProcessStamp { pid: 10, start_time: 90 },
             existing_branches: Default::default(),
         }
+    }
+
+    #[test]
+    fn pending_submission_preserves_only_new_metadata_across_cleanup() {
+        for pasted in [false, true] {
+            let mut observer = WslCwdObserver::default();
+            observer.prepare_submission(Some(boundary()));
+            if pasted {
+                observer.accept_pasted_command("wsl.exe -e claude");
+            }
+            observer.accept_command_id("0123456789abcdef0123456789abcdef");
+            observer.accept_command_line("pwsh:fixture\nwsl.exe -e claude");
+            observer.accept_connection_argv("pwsh:fixture\nwsl.exe\0-e\0claude");
+            let submission = observer.take_pending_submission().unwrap();
+            assert!(observer.take_pending_submission().is_none());
+            observer.finish_command();
+            observer.restore_submission(submission);
+            observer.mark_command_start();
+            assert!(observer.expects_agent());
+            let ticket = observer.begin_probe(Instant::now()).unwrap();
+            assert_eq!(ticket.boundary, boundary());
+            assert_eq!(ticket.command_id, "0123456789abcdef0123456789abcdef");
+            assert!(observer.literal_invocation.is_some());
+            assert!(observer.observed().is_none());
+            assert!(observer.saved_agent().is_none());
+            assert!(observer.take_pending_submission().is_none());
+            observer.finish_command();
+            assert!(!observer.expects_agent());
+        }
+    }
+
+    #[test]
+    fn restoring_submission_cancels_early_probes_without_reusing_their_receipts() {
+        let mut observer = recovery_observer();
+        let now = Instant::now();
+        let old = observer.begin_probe(now).unwrap();
+        let submission = observer.take_pending_submission().unwrap();
+        observer.restore_submission(submission);
+        observer.mark_command_start();
+        let next = observer.begin_probe(now).unwrap();
+        assert!(old.cancelled.load(Ordering::Acquire));
+        assert_ne!(old.epoch, next.epoch);
+        assert!(
+            !observer
+                .complete_probe(&old, WslLocationProbe::Found(location(20, 30, "/old")), true, now,)
+                .accepted
+        );
+        assert!(
+            observer
+                .complete_probe(
+                    &next,
+                    WslLocationProbe::Found(location(20, 31, "/next")),
+                    true,
+                    now,
+                )
+                .accepted
+        );
+        assert_eq!(observer.observed().unwrap().cwd, "/next");
     }
 
     #[test]

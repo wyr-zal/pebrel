@@ -55,6 +55,8 @@ impl TerminalView {
         #[cfg(windows)]
         let launch_boundary = self.native_command_boundary.clone();
         #[cfg(windows)]
+        let wsl_submission = self.wsl_cwd_observer.take_pending_submission();
+        #[cfg(windows)]
         let early_hooks =
             launch_boundary.as_ref().map(|_| std::mem::take(&mut self.pending_recovery_hooks));
         self.pending_recovery_hooks.clear();
@@ -65,6 +67,9 @@ impl TerminalView {
             // one, fail closed for processes already running when C is read.
             self.revoke_wsl_agent_identity(true);
             self.native_command_boundary = launch_boundary;
+            if let Some(submission) = wsl_submission {
+                self.wsl_cwd_observer.restore_submission(submission);
+            }
             if let Some(early_hooks) = early_hooks {
                 self.pending_recovery_hooks = early_hooks;
             }

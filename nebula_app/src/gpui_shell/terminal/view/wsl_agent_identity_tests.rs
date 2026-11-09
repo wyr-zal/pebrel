@@ -9,6 +9,7 @@ use gpui::TestAppContext;
 use nebula_terminal::event::Event;
 use std::time::Instant;
 
+mod command_boundary_tests;
 mod recovery_tests;
 
 fn recovery_location(kind: AgentKind, id: &str, cwd: &str) -> ObservedWslLocation {
