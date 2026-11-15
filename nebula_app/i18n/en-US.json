@@ -1602,6 +1602,7 @@
   },
   "notification.command_finished": "Command finished in {seconds}s",
   "notification.command_failed": "Command failed (exit {code}) after {seconds}s",
+  "notification.network_unavailable": "Network unavailable. Automatic continue stopped; check your connection and continue manually.",
   "files.path_edit": "Edit directory path",
   "files.path_ancestors": "Parent directories",
   "files.path_placeholder": "Absolute or relative directory path",

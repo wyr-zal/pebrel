@@ -599,6 +599,12 @@ impl TerminalView {
         }
         if retry_source
             .as_deref()
+            .is_some_and(|program| self.stop_auto_continue_for_network(program, &screen, cx))
+        {
+            return;
+        }
+        if retry_source
+            .as_deref()
             .is_some_and(|program| !crate::ai_agents::screen_has_current_composer(program, &screen))
         {
             if let Some(detection) = retry_source

@@ -1602,6 +1602,7 @@
   },
   "notification.command_finished": "命令结束，用时 {seconds} 秒",
   "notification.command_failed": "命令失败（退出码 {code}），用时 {seconds} 秒",
+  "notification.network_unavailable": "网络连接异常，已停止自动续跑。请检查网络，恢复后手动继续。",
   "files.path_edit": "编辑目录路径",
   "files.path_ancestors": "上级目录",
   "files.path_placeholder": "输入绝对路径或相对路径",

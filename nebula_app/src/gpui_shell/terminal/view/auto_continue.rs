@@ -75,6 +75,13 @@ impl TerminalView {
             self.auto_continue_task = None;
         }
         let Some(delay) = delay else { return };
+        if self
+            .auto_continue_screen_snapshot()
+            .as_deref()
+            .is_some_and(|screen| self.stop_auto_continue_for_network(&event.source, screen, cx))
+        {
+            return;
+        }
         let session_id = event.session_id.clone().expect("policy requires identity");
         self.log_auto_continue("hook_retry", "scheduled", cx);
         self.schedule_auto_continue_send(event.source.clone(), session_id, delay, cx);
@@ -86,6 +93,9 @@ impl TerminalView {
         screen: &str,
         cx: &mut Context<Self>,
     ) {
+        if self.stop_auto_continue_for_network(program, screen, cx) {
+            return;
+        }
         let settings = cx.try_global::<Settings>();
         let enabled = settings.is_some_and(|settings| settings.ai_auto_continue);
         let max_attempts = settings
@@ -134,6 +144,36 @@ impl TerminalView {
             return;
         };
         self.schedule_auto_continue_send(program.to_owned(), session_id, delay, cx);
+    }
+
+    pub(super) fn stop_auto_continue_for_network(
+        &mut self,
+        program: &str,
+        screen: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(failure) = crate::ai_agents::auto_continue_error_text(program, screen, &[])
+            .filter(|failure| crate::ai_agents::network_error_reason(failure).is_some())
+        else {
+            return false;
+        };
+        if self.agent_activity.hook_seen()
+            && self.agent_activity.status() != AgentStatus::Failed
+            && self.screen_error_at_prompt.as_deref() == Some(failure.as_str())
+        {
+            return false;
+        }
+        self.cancel_auto_continue(cx, "network_unavailable");
+        self.set_screen_error_indicator(true, cx);
+        if self.auto_continue.reject_network_failure(&failure) {
+            self.log_auto_continue("screen_retry", "network_unavailable", cx);
+            cx.emit(TerminalViewEvent::Notification(crate::notify::Notification::AiTurnIssue {
+                program: program.to_owned(),
+                message: Some(failure),
+                outcome: crate::ai_hook::AiTurnOutcome::Failed,
+            }));
+        }
+        true
     }
 
     fn schedule_auto_continue_send(
@@ -208,6 +248,12 @@ impl TerminalView {
                         return false;
                     }
                     let screen = view.auto_continue_screen_snapshot();
+                    if screen.as_deref().is_some_and(|screen| {
+                        view.stop_auto_continue_for_network(&program, screen, cx)
+                    }) {
+                        return false;
+                    }
+                    let settings = cx.global::<Settings>();
                     let pause = view.auto_continue_screen_pause_reason(&program, screen.as_deref());
                     if pause == Some("composer_unavailable")
                         && screen.as_deref().is_some_and(|screen| {

@@ -3,6 +3,8 @@ use super::*;
 use gpui::{BorrowAppContext as _, TestAppContext};
 use std::time::Duration;
 
+mod network_tests;
+
 fn open(
     cx: &mut TestAppContext,
 ) -> (gpui::Entity<TerminalView>, &mut gpui::VisualTestContext, std::sync::mpsc::Receiver<Msg>) {

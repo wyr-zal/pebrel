@@ -201,6 +201,14 @@ impl Notification {
         )
     }
 
+    pub(crate) fn is_network_failure(&self) -> bool {
+        matches!(self, Self::AiTurnIssue {
+            outcome: crate::ai_hook::AiTurnOutcome::Failed,
+            message: Some(error),
+            ..
+        } if crate::ai_agents::network_error_reason(error).is_some())
+    }
+
     /// Source classification only. In-app preferences must not silence native
     /// notifications or infer an AI source from arbitrary message text.
     pub(crate) fn is_ai(&self) -> bool {
@@ -292,6 +300,9 @@ fn turn_issue_text(
     use crate::i18n::Message;
     match outcome {
         AiTurnOutcome::Failed => match message.filter(|message| !message.trim().is_empty()) {
+            Some(error) if crate::ai_agents::network_error_reason(error).is_some() => {
+                language.text(Message::NotificationNetworkUnavailable).to_owned()
+            },
             Some(error) => {
                 language.format(Message::NotificationTurnFailedReason, &[("error", error)])
             },

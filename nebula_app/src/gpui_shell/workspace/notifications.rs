@@ -22,7 +22,8 @@ fn delivery_channels(
     ai_toasts: bool,
 ) -> DeliveryChannels {
     DeliveryChannels {
-        in_app: (!visible || notification.is_attention()) && (ai_toasts || !notification.is_ai()),
+        in_app: (!visible || notification.is_attention() || notification.is_network_failure())
+            && (ai_toasts || !notification.is_ai()),
         // Keep native notification routing independent of the in-app preference.
         system: !visible,
     }
@@ -175,6 +176,34 @@ impl NebulaWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_error_reminder_is_visible_in_the_current_pane() {
+        let note = Notification::AiTurnIssue {
+            program: "claude".into(),
+            message: Some("API Error: dial tcp: lookup chatgpt.com: no such host".into()),
+            outcome: crate::ai_hook::AiTurnOutcome::Failed,
+        };
+        assert_eq!(
+            delivery_channels(&note, true, true),
+            DeliveryChannels { in_app: true, system: false }
+        );
+        assert_eq!(
+            delivery_channels(&note, false, true),
+            DeliveryChannels { in_app: true, system: true }
+        );
+        assert_eq!(
+            delivery_channels(&note, false, false),
+            DeliveryChannels { in_app: false, system: true }
+        );
+        assert_eq!(
+            delivery_channels(&note, true, false),
+            DeliveryChannels { in_app: false, system: false }
+        );
+        let (_, body) = note.raw_toast_text_in(crate::i18n::UiLanguage::ZhCn);
+        assert!(body.contains("网络"));
+        assert!(body.contains("手动"));
+    }
 
     #[test]
     fn disabling_in_app_ai_toasts_keeps_background_system_notifications() {

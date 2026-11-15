@@ -13,6 +13,7 @@ pub(crate) enum RetryEvidence {
 pub(crate) enum ScreenRetryReason {
     UnsupportedProvider,
     NoError,
+    NetworkUnavailable,
     Disabled,
     MissingSession,
     PromptNotArmed,
@@ -29,6 +30,7 @@ impl ScreenRetryReason {
         match self {
             Self::UnsupportedProvider => "unsupported_provider",
             Self::NoError => "no_match",
+            Self::NetworkUnavailable => "network_unavailable",
             Self::Disabled => "disabled",
             Self::MissingSession => "missing_session",
             Self::PromptNotArmed => "prompt_not_armed",
@@ -72,6 +74,11 @@ impl AutoContinue {
         self.attempts = 0;
         self.screen_failure_latched = None;
         self.last_screen_retry_log = None;
+    }
+
+    pub fn reject_network_failure(&mut self, failure: &str) -> bool {
+        self.cancel();
+        self.should_log_screen_retry(failure, ScreenRetryReason::NetworkUnavailable)
     }
 
     pub fn pending(&self) -> Option<RetryEvidence> {
@@ -221,6 +228,15 @@ impl AutoContinue {
                 should_log: false,
             };
         };
+        if crate::ai_agents::network_error_reason(failure).is_some()
+            && self.screen_failure_latched.as_deref() != Some(failure)
+        {
+            return ScreenRetryObservation {
+                delay: None,
+                reason: ScreenRetryReason::NetworkUnavailable,
+                should_log: self.reject_network_failure(failure),
+            };
+        }
         let reason = if !enabled {
             ScreenRetryReason::Disabled
         } else if session_id.is_none() {

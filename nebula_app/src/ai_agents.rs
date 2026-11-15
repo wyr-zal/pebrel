@@ -20,6 +20,9 @@ use std::time::{Duration, Instant, SystemTime};
 use regex::Regex;
 use serde::Deserialize;
 
+mod network_error;
+pub(crate) use network_error::reason as network_error_reason;
+
 #[cfg(test)]
 mod prompt_region_tests;
 mod screen_context;
@@ -908,7 +911,7 @@ pub fn auto_continue_error_text(
         }
         // Term::bounds_to_string already joins VT soft wraps. Never join prose rows.
         let normalized = row.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-        let error_marker = ["api error:", "error:", "fatal:", "[error]", "■ "]
+        let error_marker = ["api error:", "● api error:", "error:", "fatal:", "[error]", "■ "]
             .iter()
             .any(|marker| normalized.starts_with(marker));
         let custom_match = patterns.iter().take(MAX_AUTO_CONTINUE_ERROR_PATTERNS).any(|pattern| {
@@ -921,8 +924,15 @@ pub fn auto_continue_error_text(
             let (rule, gate) = bundled_codex_failure_rule();
             rule.state == RuleState::Failed && gate.matches(row)
         };
-        if custom_match || bundled {
-            evidence = Some(normalized.chars().take(512).collect());
+        let network_reason = error_marker.then(|| network_error_reason(&normalized)).flatten();
+        if custom_match || bundled || network_reason.is_some() {
+            let limit = 512 - network_reason.map_or(0, |reason| reason.len() + 2);
+            let preview: String = normalized.chars().take(limit).collect();
+            // Keep the non-retryable cause even when a long URL precedes it.
+            evidence = Some(match network_reason {
+                Some(reason) => format!("{reason}: {preview}"),
+                None => preview,
+            });
         }
     }
     evidence
