@@ -38,6 +38,8 @@ pub(super) struct WslCwdObserver {
     last_diagnostic: Option<&'static str>,
     diagnostics_remaining: u8,
     closed: AtomicBool,
+    startup_trace_remaining: u8,
+    startup_trace_last: Option<String>,
 }
 
 pub(super) use crate::platform::ai_session_identity::ObservedWslSessionScope as WslIdentityScope;
@@ -88,11 +90,18 @@ impl Default for WslCwdObserver {
             last_diagnostic: None,
             diagnostics_remaining: MAX_DIAGNOSTICS_PER_COMMAND,
             closed: AtomicBool::new(false),
+            startup_trace_remaining: 48,
+            startup_trace_last: None,
         }
     }
 }
 
 impl WslCwdObserver {
+    pub(super) fn reset_startup_trace(&mut self) {
+        self.startup_trace_remaining = 48;
+        self.startup_trace_last = None;
+    }
+
     pub(super) fn prepare_submission(&mut self, boundary: Option<NativeLaunchBoundary>) {
         self.invalidate();
         self.pending_submission = true;
@@ -571,6 +580,48 @@ fn command_line_contains_wsl(value: &str) -> bool {
 }
 
 impl TerminalView {
+    pub(super) fn trace_wsl_startup(&mut self, stage: &'static str, cx: &Context<Self>) {
+        if !self.recovery.awaiting_confirmation
+            || !self.recovery.target.as_ref().is_some_and(|target| target.wsl_launch.is_some())
+        {
+            return;
+        }
+        let observer = &mut self.wsl_cwd_observer;
+        if observer.startup_trace_remaining == 0 {
+            return;
+        }
+        let state = format!(
+            "stage={stage} boundary={} command_id={} candidate={} literal={} expected={} started={} submission={} active={} probe={} enter={} hook={} running={}",
+            observer.boundary.is_some(),
+            observer.command_id.is_some(),
+            observer.command_candidate,
+            observer.literal_invocation.is_some(),
+            observer.agent_expected,
+            observer.command_started,
+            observer.pending_submission,
+            observer.active,
+            observer.pending.is_some(),
+            self.pending_runtime_submit.is_some(),
+            self.agent_activity.hook_seen(),
+            self.command_running,
+        );
+        if observer.startup_trace_last.as_ref() == Some(&state) {
+            return;
+        }
+        observer.startup_trace_last = Some(state.clone());
+        observer.startup_trace_remaining -= 1;
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let record = format!("startup seq={sequence} {state}");
+        let pane = self.pane_id;
+        let epoch = observer.epoch;
+        cx.background_executor()
+            .spawn(async move {
+                crate::logging::agent_state_diagnostic(pane, epoch, &record);
+            })
+            .detach();
+    }
+
     fn diagnose_wsl_agent(&mut self, reason: &'static str, cx: &Context<Self>) {
         if self.wsl_cwd_observer.take_diagnostic(reason) {
             let pane = self.pane_id;
@@ -607,7 +658,9 @@ impl TerminalView {
         if self.wsl_cwd_observer.expects_agent() && self.wsl_cwd_observer.boundary.is_none() {
             self.diagnose_wsl_agent("missing_launch_boundary", cx);
         }
+        self.trace_wsl_startup("watchdog", cx);
         let Some(ticket) = self.wsl_cwd_observer.begin_probe(now) else { return };
+        self.trace_wsl_startup("probe_started", cx);
         crate::logging::debug_log("wsl_cwd_observer event=probe_start");
         let Some(session) = &self.session else { return };
         let shell_pid = session.shell_pid;

@@ -378,6 +378,8 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         agent.normalize_identity();
+        #[cfg(windows)]
+        self.wsl_cwd_observer.reset_startup_trace();
         self.recovery = SessionRecovery {
             target: Some(agent.clone()),
             live: None,

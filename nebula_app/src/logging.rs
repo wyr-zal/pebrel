@@ -144,7 +144,7 @@ pub(crate) fn auto_continue_diagnostic(pane: u64, stage: &'static str, reason: &
 }
 
 /// Reason-only, command-budgeted observations remain available at Warn level.
-pub(crate) fn agent_state_diagnostic(pane: u64, epoch: u64, reason: &'static str) {
+pub(crate) fn agent_state_diagnostic(pane: u64, epoch: u64, reason: &str) {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis())

@@ -253,6 +253,58 @@ fn allowed_option(kind: AgentKind, flag: &str) -> (bool, bool) {
     (valued, valued || boolean)
 }
 
+/// Decode the literal PowerShell invocation emitted by session recovery.
+/// Backslashes are paths; doubled single quotes stay inside the quoted word.
+pub(super) fn powershell_literal_words(text: &str) -> Option<Vec<String>> {
+    if text.len() > 64 * 1024 || text.chars().any(char::is_control) {
+        return None;
+    }
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut started = false;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (Some('\''), '\'') if chars.peek() == Some(&'\'') => {
+                chars.next();
+                word.push('\'');
+            },
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (Some('\''), ch) => word.push(ch),
+            (Some('"'), '$' | '`') => return None,
+            (Some('"'), ch) => word.push(ch),
+            (None, '\'' | '"') => {
+                quote = Some(ch);
+                started = true;
+            },
+            (None, ch) if ch.is_whitespace() => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            },
+            (
+                None,
+                '$' | '`' | ';' | '|' | '&' | '<' | '>' | '(' | ')' | '#' | '*' | '?' | '[' | ']'
+                | '{' | '}' | '~' | ',',
+            ) => return None,
+            (None, ch) => {
+                word.push(ch);
+                started = true;
+            },
+            _ => return None,
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if started {
+        words.push(word);
+    }
+    Some(words)
+}
+
 /// Decode literal POSIX words only. Expansion, pipelines and additional Shell
 /// commands are unsupported rather than being serialized for later execution.
 pub(super) fn literal_words(text: &str) -> Option<Vec<String>> {

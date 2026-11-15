@@ -976,6 +976,14 @@ impl TerminalView {
                     } else {
                         false
                     };
+                    match name.as_str() {
+                        "pebrel_command_id" => self.trace_wsl_startup("command_id", cx),
+                        "pebrel_command" => self.trace_wsl_startup("command_text", cx),
+                        crate::completion_context::ARGV_VAR => {
+                            self.trace_wsl_startup("command_argv", cx)
+                        },
+                        _ => {},
+                    }
                     let identity_changed =
                         matches!(name.as_str(), "pebrel_command_id" | "pebrel_command")
                             && self.sync_wsl_agent_identity_with_context(cx);

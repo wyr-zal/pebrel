@@ -42,13 +42,15 @@ enum CommandWrapper {
 
 impl WslAgentLaunch {
     pub(crate) fn literal_invocation(value: &str) -> Option<Vec<String>> {
-        let value = value
-            .split_once('\n')
-            .filter(|(owner, _)| owner.starts_with("pwsh:"))
-            .map_or(value, |(_, command)| command)
-            .trim_start();
+        let owner_command = value.split_once('\n').filter(|(owner, _)| owner.starts_with("pwsh:"));
+        let value = owner_command.map_or(value, |(_, command)| command).trim_start();
+        let powershell = owner_command.is_some() || value.starts_with("& ");
         let value = value.strip_prefix("& ").map_or(value, str::trim_start);
-        let args = command::literal_words(value)?;
+        let args = if powershell {
+            command::powershell_literal_words(value)?
+        } else {
+            command::literal_words(value)?
+        };
         crate::shell_detect::is_wsl_launcher(args.first()?).then_some(args)
     }
 

@@ -13,8 +13,15 @@ pub(crate) const NEBULA_GHOST_MAX: usize = 96;
 /// First word of a committed command line, normalized to a program identity:
 /// lowercase, without path prefix or common Windows launcher extensions.
 pub(crate) fn extract_program(line: &str) -> Option<String> {
-    let first = line.trim().split_whitespace().next()?;
-    let base = first.trim_matches('"').rsplit(['/', '\\']).next().unwrap_or(first);
+    let line = line.trim();
+    let line = line.strip_prefix("& ").map_or(line, str::trim_start);
+    let first = if let Some(quote) = line.chars().next().filter(|ch| matches!(ch, '\'' | '"')) {
+        let rest = &line[quote.len_utf8()..];
+        &rest[..rest.find(quote)?]
+    } else {
+        line.split_whitespace().next()?
+    };
+    let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
     let mut name = base.to_ascii_lowercase();
     for ext in [".exe", ".cmd", ".bat", ".ps1", ".com"] {
         if let Some(stripped) = name.strip_suffix(ext) {

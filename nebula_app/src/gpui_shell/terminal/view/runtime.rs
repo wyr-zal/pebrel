@@ -53,6 +53,8 @@ impl TerminalView {
 
     pub(super) fn on_command_start(&mut self, cx: &mut Context<Self>) {
         #[cfg(windows)]
+        self.trace_wsl_startup("command_start_received", cx);
+        #[cfg(windows)]
         let launch_boundary = self.native_command_boundary.clone();
         #[cfg(windows)]
         let wsl_submission = self.wsl_cwd_observer.take_pending_submission();
@@ -111,6 +113,8 @@ impl TerminalView {
         if !self.agent_activity.hook_seen() && self.wsl_cwd_observer.mark_command_start() {
             cx.emit(TerminalViewEvent::TitleChanged);
         }
+        #[cfg(windows)]
+        self.trace_wsl_startup("command_start_applied", cx);
         self.mark_command_running();
         self.probe_missing_codex_session(cx);
         // 首个词就是一个交互式 shell（`cmd`、`wsl`、裸 `bash`）：133;C
@@ -201,6 +205,8 @@ impl TerminalView {
     /// the primary edge; the cached-prompt path calls the same reset so the two
     /// lifecycle routes cannot drift apart.
     pub(super) fn clear_foreground_agent_state(&mut self, cx: &mut Context<Self>) -> bool {
+        #[cfg(windows)]
+        self.trace_wsl_startup("foreground_clear", cx);
         self.pending_recovery_hooks.clear();
         #[cfg(windows)]
         {
@@ -809,6 +815,10 @@ impl TerminalView {
                 "input_in_progress",
                 "the pane is still committing previous runtime input",
             ));
+        }
+        #[cfg(windows)]
+        if submit {
+            self.trace_wsl_startup("runtime_submission", cx);
         }
         let agent = self.runtime_agent();
         let codex_submit = submit && agent.as_ref().is_some_and(|agent| agent.kind == "codex");
@@ -1603,11 +1613,23 @@ impl TerminalView {
         if screen == pending.baseline_screen {
             return;
         }
+        #[cfg(windows)]
+        self.trace_wsl_startup("enter_ready", cx);
         let pending = self.pending_runtime_submit.take().expect("checked above");
         #[cfg(windows)]
-        if self.recovery.requires_foreground_receipt() {
+        if self.recovery.requires_foreground_receipt()
+            || (self.recovery.awaiting_confirmation
+                && self.recovery.target.as_ref().is_some_and(|target| target.wsl_launch.is_some())
+                && self.runtime_chat_agent().is_none()
+                && crate::session::WslAgentLaunch::literal_invocation(&self.suggest.last_committed)
+                    .is_some())
+        {
+            // A queued WSL recovery must own the boundary immediately before
+            // Enter, after startup output and the command echo have settled.
             self.capture_native_command_boundary();
         }
+        #[cfg(windows)]
+        self.trace_wsl_startup("enter_sending", cx);
         self.write_input(pending.submit_bytes, cx);
     }
 }
