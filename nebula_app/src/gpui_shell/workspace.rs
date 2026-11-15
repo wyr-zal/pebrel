@@ -1639,16 +1639,6 @@ impl NebulaWorkspace {
         view.read(cx).local_cwd()
     }
 
-    /// 聚焦 pane 的 WSL 发行版（spawn 快照）+ 来宾目录；不是 WSL 时为 `None`。
-    /// Git 视图拿它在来宾里直接跑 git，不经
-    /// 任何 UNC 映射，所以宿主看不见 WSL 文件系统时依然有效。
-    fn active_wsl_cwd(&self, cx: &App) -> Option<crate::shell_detect::WslCwd> {
-        let view = self.tabs.get(self.active).and_then(WorkspaceTab::focused_view)?.read(cx);
-        let distro = view.wsl_distro()?.to_owned();
-        let guest = crate::shell_detect::wsl_guest_cwd(&view.cwd)?;
-        Some(crate::shell_detect::WslCwd { distro, guest: guest.to_owned() })
-    }
-
     /// 抽屉这一帧该跟随的位置。WSL 先分流：只有 `/mnt/<盘>` 映射到宿主盘，
     /// `/`、`/home`、`/etc` 等始终交给来宾 `find`，不依赖不稳定的 UNC。
     ///

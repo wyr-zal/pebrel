@@ -18,9 +18,13 @@ fn observed_agent_launch_is_saved_and_restored_after_the_original_window_is_clos
     let directory = tempfile::tempdir().unwrap();
     let host = directory.path().join("host A");
     let other = directory.path().join("other tab");
-    for path in [&host, &other] {
+    let mounted = directory.path().join("guest C's 目录");
+    for path in [&host, &other, &mounted] {
         std::fs::create_dir(path).unwrap();
     }
+    let mounted_path = mounted.to_string_lossy().replace('\\', "/");
+    let mounted_guest =
+        format!("/mnt/{}{}", mounted_path[..1].to_ascii_lowercase(), &mounted_path[2..]);
     let guest = "/mnt/f/guest B's 项目";
     let id = "01a1aedc-d6f0-7db0-8875-882c249ef4a2";
     let launch = LaunchSession::Shell {
@@ -80,7 +84,63 @@ fn observed_agent_launch_is_saved_and_restored_after_the_original_window_is_clos
             assert!(agent.resume_command().unwrap().contains("-e sh -lc"));
             let file = directory.path().join("session.json");
             crate::session::save_to(&file, &snapshot).unwrap();
-            crate::session::load_from(&file).unwrap()
+            let saved = crate::session::load_from(&file).unwrap();
+            let first = workspace.tabs[0].focused_view().unwrap().clone();
+            let located =
+                crate::shell_detect::WslCwd { distro: "Ubuntu-22.04".into(), guest: guest.into() };
+            assert_eq!(workspace.active_wsl_cwd(cx), Some(located.clone()));
+            workspace.side_panel.open = true;
+            workspace.on_terminal_event(&first, &TerminalViewEvent::TitleChanged, window, cx);
+            assert_eq!(workspace.side_panel.file_wsl_root(), Some(&located));
+            first.update(cx, |view, cx| {
+                view.install_wsl_restart_context_test_fixture(
+                    AgentKind::Codex,
+                    id,
+                    &mounted_guest,
+                    cx,
+                );
+                view.seed_restored_cwd(host.to_string_lossy().into_owned(), cx);
+            });
+            workspace.side_panel.view = crate::display::side_panel::PanelView::Git;
+            workspace.on_terminal_event(&first, &TerminalViewEvent::TitleChanged, window, cx);
+            assert_eq!(workspace.active_wsl_cwd(cx).unwrap().guest, mounted_guest);
+            assert_eq!(workspace.side_panel.root(), Some(mounted.as_path()));
+            assert_eq!(workspace.side_panel.file_wsl_root(), None);
+            assert_eq!(first.read(cx).local_cwd(), Some(host.clone()));
+            workspace.active = 1;
+            workspace.sync_side_panel_to_active(true, cx);
+            workspace.on_terminal_event(&first, &TerminalViewEvent::TitleChanged, window, cx);
+            assert_eq!(workspace.side_panel.root(), Some(other.as_path()));
+            assert_eq!(workspace.active_wsl_cwd(cx), None);
+            assert_eq!(workspace.snapshot_session(cx).tabs[1].cwd, other.to_string_lossy());
+            workspace.active = 0;
+            workspace.side_panel.view = crate::display::side_panel::PanelView::Files;
+            workspace.sync_side_panel_to_active(true, cx);
+            assert_eq!(workspace.side_panel.root(), Some(mounted.as_path()));
+            first.update(cx, |view, _| view.set_observed_wsl_location_for_test(None));
+            workspace.on_terminal_event(&first, &TerminalViewEvent::TitleChanged, window, cx);
+            assert_eq!(workspace.active_wsl_cwd(cx), None);
+            assert_eq!(workspace.side_panel.root(), Some(host.as_path()));
+            first.update(cx, |view, cx| {
+                let shell = nebula_terminal::tty::Shell::new(
+                    "wsl.exe".into(),
+                    vec!["-d".into(), "FrozenDistro".into()],
+                );
+                view.exec_context = Some(crate::runtime_exec::PaneExecContext::from_pty_options(
+                    &nebula_terminal::tty::Options { shell: Some(shell), ..Default::default() },
+                ));
+                view.seed_restored_cwd("/home/worker/native".into(), cx);
+            });
+            let native = crate::shell_detect::WslCwd {
+                distro: "FrozenDistro".into(),
+                guest: "/home/worker/native".into(),
+            };
+            assert_eq!(workspace.active_wsl_cwd(cx), Some(native.clone()));
+            workspace.sync_side_panel_to_active(false, cx);
+            assert_eq!(workspace.side_panel.file_wsl_root(), Some(&native));
+            first.update(cx, |view, _| view.ssh_destination = Some("fixture-host".into()));
+            assert_eq!(workspace.active_wsl_cwd(cx), None);
+            saved
         })
     });
     window.update(|window, _| window.remove_window());

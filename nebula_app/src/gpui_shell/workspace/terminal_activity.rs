@@ -17,6 +17,18 @@ impl WorkspaceTab {
 }
 
 impl NebulaWorkspace {
+    /// Files/Git 跟随已核验的前台 WSL 位置；没有嵌套 Agent 时沿用 pane 的启动环境。
+    pub(super) fn active_wsl_cwd(&self, cx: &App) -> Option<crate::shell_detect::WslCwd> {
+        let view = self.tabs.get(self.active).and_then(WorkspaceTab::focused_view)?.read(cx);
+        if view.ssh_destination.is_some() {
+            return None;
+        }
+        let (distro, cwd) = view.observed_wsl_cwd().or_else(|| {
+            Some((view.wsl_distro()?, crate::shell_detect::wsl_guest_cwd(&view.cwd)?))
+        })?;
+        Some(crate::shell_detect::WslCwd { distro: distro.to_owned(), guest: cwd.to_owned() })
+    }
+
     pub(super) fn on_terminal_event(
         &mut self,
         view: &Entity<TerminalView>,
