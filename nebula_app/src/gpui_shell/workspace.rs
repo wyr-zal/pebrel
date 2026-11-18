@@ -783,6 +783,7 @@ pub struct NebulaWorkspace {
     /// 与 RuntimeServer 共享同一状态中心，快照、wait、subscribe 与 agents.list
     /// 必须消费同一份 revision/state_change_seq 权威。
     runtime_hub: crate::runtime_api::RuntimeHub,
+    taskbar_progress: std::cell::Cell<crate::taskbar::TaskProgress>,
     /// runtime API 里必须等窗口的命令（目前是 `tab.new`）。
     runtime_pending: Vec<std::sync::Arc<crate::runtime_api::RuntimeDispatch>>,
 }
@@ -1005,6 +1006,7 @@ impl NebulaWorkspace {
             runtime_window_id,
             window_role,
             runtime_hub,
+            taskbar_progress: std::cell::Cell::new(crate::taskbar::TaskProgress::None),
             runtime_pending: Vec::new(),
         };
         // 配置装载错误的驻留横幅（消息栏层：用户要去修文件，必须看见）。
@@ -1448,6 +1450,7 @@ impl NebulaWorkspace {
                 self.pane_bounds.borrow_mut().remove(&pane_id);
                 self.mark_structural_resize(tab_ix, cx);
                 if tab_ix == self.active {
+                    self.sync_taskbar_progress(window, cx);
                     if self.pane_rename.is_none() {
                         self.focus_active(window, cx);
                     }
@@ -1471,31 +1474,6 @@ impl NebulaWorkspace {
     /// `busy_child(shell_pid)` 判据；只检查当前 Tab 会漏掉后台仍在编译的任务。
     fn busy_process_in_window(&self, cx: &App) -> Option<String> {
         (0..self.tabs.len()).find_map(|tab_ix| self.busy_process_in_tab(tab_ix, None, cx))
-    }
-
-    /// 聚焦另一个 pane（点击上报或方向导航落点）。
-    fn focus_pane(
-        &mut self,
-        tab_ix: usize,
-        pane_id: u64,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        {
-            let Some(WorkspaceTab::Terminal { panes, focused, .. }) = self.tabs.get_mut(tab_ix)
-            else {
-                return;
-            };
-            if *focused == pane_id || !panes.iter().any(|pane| pane.id == pane_id) {
-                return;
-            }
-            *focused = pane_id;
-        }
-        if tab_ix == self.active {
-            self.focus_active(window, cx);
-            self.sync_side_panel_to_active(true, cx);
-        }
-        cx.notify();
     }
 
     /// ctrl+alt+方向：按上一帧 pane 矩形找目标方向最近邻（垂直漂移 4 倍
@@ -1583,6 +1561,7 @@ impl NebulaWorkspace {
             if self.settings_tab_open {
                 self.open_settings(window, cx);
             } else {
+                self.sync_taskbar_progress(window, cx);
                 self.close_empty_workspace(window, cx);
                 return;
             }

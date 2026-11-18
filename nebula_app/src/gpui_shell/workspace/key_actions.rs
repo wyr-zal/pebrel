@@ -16,6 +16,7 @@ pub(super) fn move_target(active: usize, len: usize, right: bool) -> Option<usiz
 
 impl NebulaWorkspace {
     pub(super) fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_taskbar_progress(window, cx);
         if self.settings_open {
             if let Some((view, _)) = self.settings_surface.as_ref() {
                 let focus = view.read(cx).focus_handle(cx);

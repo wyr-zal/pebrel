@@ -59,6 +59,20 @@ fn magpie_keeps_login_shell_and_replaces_directory_and_resume_target() {
 }
 
 #[test]
+fn powershell_continued_literal_launch_retains_agent_intent() {
+    for newline in ["\n", "\r\n"] {
+        let text = format!(
+            "pwsh:fixture\n`{newline}wsl.exe -d 'Ubuntu-22.04' --cd '/mnt/f/ALL-AI-Workspace' -e sh -lc 'exec ${{SHELL:-sh}} -lic ''claude --resume'''"
+        );
+        let argv = WslAgentLaunch::literal_invocation(&text).expect("literal continued WSL launch");
+        assert_eq!(WslAgentLaunch::requested_agent(&argv), Some(AgentKind::Claude));
+        assert_eq!(argv[4], "/mnt/f/ALL-AI-Workspace");
+    }
+    assert!(WslAgentLaunch::literal_invocation("pwsh:fixture\n` wsl.exe -e claude").is_none());
+    assert!(WslAgentLaunch::literal_invocation("`\nwsl.exe -e claude").is_none());
+}
+
+#[test]
 fn direct_launch_keeps_user_program_and_necessary_agent_options() {
     let mut launch = capture(
         AgentKind::Codex,

@@ -49,6 +49,40 @@ fn completed_shell_boundary_preserves_the_next_wsl_identity_and_working_state(
 }
 
 #[gpui::test]
+fn continued_powershell_launch_projects_verified_claude_and_guest_directory(
+    cx: &mut TestAppContext,
+) {
+    let (entity, window, _) = open(cx);
+    entity.update(window, |view, cx| {
+        let _ = start_host_wsl(view, 'a', cx);
+        view.process_event(Event::CommandDone { exit_code: Some(0) }, cx);
+        view.wsl_cwd_observer.prepare_submission(Some(NativeLaunchBoundary {
+            time: 101,
+            shell: ProcessStamp { pid: 10, start_time: 90 },
+            existing_branches: Default::default(),
+        }));
+        report_command(
+            view,
+            'b',
+            "`\nwsl.exe -d 'Ubuntu-22.04' --cd '/mnt/f/ALL-AI-Workspace' -e sh -lc 'exec ${SHELL:-sh} -lic ''claude --resume'''",
+            cx,
+        );
+        let ticket = view.wsl_cwd_observer.begin_probe(Instant::now()).expect("current probe");
+        assert!(view.runtime_agent().is_none());
+        let mut receipt = location();
+        receipt.cwd = "/mnt/f/ALL-AI-Workspace".into();
+        view.apply_wsl_cwd_probe_result(&ticket, WslLocationProbe::Found(receipt), true, cx);
+        assert_eq!(view.presentation_program(), Some("claude"));
+        assert_eq!(view.runtime_agent().unwrap().kind, "claude");
+        assert_eq!(view.current_working_directory(), Some("/mnt/f/ALL-AI-Workspace"));
+        assert_eq!(view.runtime_execution().unwrap(), crate::runtime_api::RuntimePaneExecution::Wsl {
+            distribution: Some("Ubuntu-22.04".into()),
+            cwd: "/mnt/f/ALL-AI-Workspace".into(),
+        });
+    });
+}
+
+#[gpui::test]
 fn pending_shell_boundary_preserves_new_wsl_submission_and_rejects_the_old_probe(
     cx: &mut TestAppContext,
 ) {

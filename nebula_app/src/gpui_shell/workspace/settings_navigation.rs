@@ -81,6 +81,7 @@ impl NebulaWorkspace {
 
         self.settings_tab_open = true;
         self.settings_open = true;
+        self.sync_taskbar_progress(window, cx);
         self.sync_settings_layout(tab_reveal_instant(cx));
 
         self.settings_restore_side_panel_open = self.side_panel.open;

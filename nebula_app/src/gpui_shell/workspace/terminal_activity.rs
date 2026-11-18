@@ -17,6 +17,41 @@ impl WorkspaceTab {
 }
 
 impl NebulaWorkspace {
+    pub(super) fn focus_pane(
+        &mut self,
+        tab_ix: usize,
+        pane_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        {
+            let Some(WorkspaceTab::Terminal { panes, focused, .. }) = self.tabs.get_mut(tab_ix)
+            else {
+                return;
+            };
+            if *focused == pane_id || !panes.iter().any(|pane| pane.id == pane_id) {
+                return;
+            }
+            *focused = pane_id;
+        }
+        if tab_ix == self.active {
+            self.focus_active(window, cx);
+            self.sync_side_panel_to_active(true, cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn sync_taskbar_progress(&self, window: &Window, cx: &App) {
+        let progress = (!self.settings_open)
+            .then(|| self.tabs.get(self.active).and_then(WorkspaceTab::focused_view))
+            .flatten()
+            .map(|view| view.read(cx))
+            .map_or(crate::taskbar::TaskProgress::None, TerminalView::effective_taskbar_progress);
+        if self.taskbar_progress.replace(progress) != progress {
+            crate::taskbar::apply(windowing::native_hwnd(window).unwrap_or(0), progress);
+        }
+    }
+
     /// Files/Git 跟随已核验的前台 WSL 位置；没有嵌套 Agent 时沿用 pane 的启动环境。
     pub(super) fn active_wsl_cwd(&self, cx: &App) -> Option<crate::shell_detect::WslCwd> {
         let view = self.tabs.get(self.active).and_then(WorkspaceTab::focused_view)?.read(cx);
@@ -57,6 +92,7 @@ impl NebulaWorkspace {
                     .and_then(WorkspaceTab::focused_view)
                     .is_some_and(|active| active.entity_id() == view.entity_id());
                 if is_active_pane {
+                    self.sync_taskbar_progress(window, cx);
                     self.sync_side_panel_to_active(false, cx);
                 }
                 cx.notify();
@@ -65,6 +101,7 @@ impl NebulaWorkspace {
                 if let Some((tab_ix, pane_id)) = self.locate_pane(view.entity_id()) {
                     self.runtime_hub.record_pane_exited(self.runtime_window_id, pane_id);
                     if view.read(cx).local_session_failed() {
+                        self.sync_taskbar_progress(window, cx);
                         cx.notify();
                     } else {
                         self.close_pane(tab_ix, pane_id, window, cx);
@@ -92,16 +129,8 @@ impl NebulaWorkspace {
             TerminalViewEvent::FontSizeChanged => self.apply_runtime_settings(cx),
             // 任务栏是窗口级的，只反映**正被看着的那个 pane**：后台 tab 里的
             // 构建进度投到同一个按钮上只会互相覆盖，读数还不如没有。
-            TerminalViewEvent::ProgressChanged(progress) => {
-                if let Some((tab_ix, pane_id)) = self.locate_pane(view.entity_id())
-                    && tab_ix == self.active
-                    && matches!(
-                        self.tabs.get(tab_ix),
-                        Some(WorkspaceTab::Terminal { focused, .. }) if *focused == pane_id
-                    )
-                {
-                    crate::taskbar::apply(windowing::native_hwnd(window).unwrap_or(0), *progress);
-                }
+            TerminalViewEvent::ProgressChanged(_) => {
+                self.sync_taskbar_progress(window, cx);
                 // 后台 pane 也要刷新自己的 tab badge；一次协议事件只触发一次
                 // workspace render，只有 Running 状态会在 render 后续接共享时钟。
                 cx.notify();
@@ -182,6 +211,7 @@ impl NebulaWorkspace {
 #[cfg(all(test, feature = "gpui-test-support"))]
 mod tests {
     mod session_failure;
+    mod taskbar_progress;
 
     use super::*;
     use crate::gpui_shell::terminal::element::snapshot_probe::{self, PaintedSnapshot};

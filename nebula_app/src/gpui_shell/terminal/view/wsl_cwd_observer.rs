@@ -561,12 +561,7 @@ fn valid_command_id(command_id: &str) -> bool {
 }
 
 fn command_line_contains_wsl(value: &str) -> bool {
-    // PowerShell prefixes its text with the shell owner; Bash reports raw text.
-    let command = value
-        .split_once('\n')
-        .filter(|(owner, _)| owner.starts_with("pwsh:"))
-        .map_or(value, |(_, command)| command)
-        .trim_start();
+    let (command, _) = crate::session::WslAgentLaunch::invocation_text(value);
     let command = command.strip_prefix('&').map_or(command, str::trim_start);
     let executable =
         if let Some(quote) = command.chars().next().filter(|quote| matches!(quote, '\'' | '"')) {
@@ -1080,6 +1075,23 @@ mod tests {
         assert!(command_line_contains_wsl("wsl.exe -d Ubuntu-22.04 \\\n  --cd /mnt/f/ProjectLearn"));
         assert!(command_line_contains_wsl("pwsh:fixture\nwsl.exe -d Ubuntu-22.04"));
         assert!(!command_line_contains_wsl("printf 'first\nwsl.exe -d Ubuntu-22.04'"));
+    }
+
+    #[test]
+    fn powershell_continued_wsl_launch_activates_the_bound_probe() {
+        for newline in ["\n", "\r\n"] {
+            let mut observer = WslCwdObserver::default();
+            observer.prepare_submission(Some(boundary()));
+            observer.accept_command_id("abcdef0123456789abcdef0123456789");
+            observer.accept_command_line(&format!(
+                "pwsh:fixture\n`{newline}wsl.exe -d 'Ubuntu-22.04' --cd '/mnt/f/ALL-AI-Workspace' -e sh -lc 'exec ${{SHELL:-sh}} -lic ''claude --resume'''"
+            ));
+            observer.mark_command_start();
+            assert!(observer.active, "the current WSL command must activate observation");
+            assert!(observer.expects_agent(), "the literal command must retain Claude intent");
+        }
+        assert!(!command_line_contains_wsl("`\nwsl.exe -e claude"));
+        assert!(!command_line_contains_wsl("pwsh:fixture\nWrite-Output 'wsl.exe -e claude'"));
     }
 
     #[test]

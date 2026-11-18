@@ -61,6 +61,14 @@ impl ProgramStatus {
 }
 
 impl TerminalView {
+    pub(in crate::gpui_shell) fn effective_taskbar_progress(&self) -> TaskProgress {
+        if self.exited.is_some() || self.local_session_failed() {
+            TaskProgress::None
+        } else {
+            self.progress
+        }
+    }
+
     pub(super) fn effective_program_status(&self) -> Option<&ProgramStatus> {
         // Explicit program state wins over Hook and screen/process fallback.
         // Hook ownership still supplies session identity, answers and requests.
