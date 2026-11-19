@@ -14,6 +14,8 @@ pub(super) struct SessionPersistence {
     saved: Option<Session>,
     quitting: bool,
     isolated: bool,
+    restoring: Option<Session>,
+    unrestored: Vec<Session>,
 }
 
 impl Default for SessionPersistence {
@@ -23,6 +25,8 @@ impl Default for SessionPersistence {
             saved: None,
             quitting: false,
             isolated: crate::platform::elevation::requires_isolation(),
+            restoring: None,
+            unrestored: Vec::new(),
         }
     }
 }
@@ -45,6 +49,41 @@ impl SessionPersistence {
         self.quitting = false;
     }
 
+    pub(super) fn begin_directory_restore(&mut self, session: Session) {
+        self.latest = Some(session.clone());
+        self.restoring = Some(session);
+    }
+
+    pub(super) fn finish_directory_restore(&mut self, unrestored: Vec<Session>) {
+        self.unrestored = unrestored;
+        self.restoring = None;
+    }
+
+    fn include_unrestored(&self, current: Session) -> std::io::Result<Session> {
+        if self.unrestored.is_empty() {
+            return Ok(current);
+        }
+        let boot_attempts = current.boot_attempts;
+        let current = current.into_update_windows()?;
+        let last = current.len().saturating_sub(1);
+        let mut windows = self
+            .unrestored
+            .iter()
+            .cloned()
+            .map(|mut session| {
+                // 存活到正常保存即结束启动断路器；未启动的目标另行保留。
+                session.boot_attempts = 0;
+                (false, session)
+            })
+            .collect::<Vec<_>>();
+        windows.extend(
+            current.into_iter().enumerate().map(|(index, session)| (index == last, session)),
+        );
+        let mut combined = combine_sessions(windows).expect("restore snapshot contains windows");
+        combined.boot_attempts = boot_attempts;
+        Ok(combined)
+    }
+
     pub(super) fn save(
         &mut self,
         current: Option<Session>,
@@ -59,9 +98,18 @@ impl SessionPersistence {
         reason: SaveReason,
         write: impl FnOnce(&Session) -> std::io::Result<()>,
     ) -> std::io::Result<()> {
+        let system_ending = crate::platform::session_end::is_pending();
+        let current = if let Some(original) = &self.restoring {
+            // 所有保存入口共用保护，关窗/退出也不能落盘半套恢复窗口。
+            if !system_ending && matches!(reason, SaveReason::Checkpoint | SaveReason::TabsClosed) {
+                return Ok(());
+            }
+            Some(original.clone())
+        } else {
+            current.map(|session| self.include_unrestored(session)).transpose()?
+        };
         let retry_checkpoint = reason == SaveReason::Checkpoint
             && current.as_ref().is_none_or(|session| session.tabs.is_empty());
-        let system_ending = crate::platform::session_end::is_pending();
         let candidate = if system_ending {
             // System teardown can end PTYs before the UI exits. Keep the last
             // complete workspace, not the progressively removed tabs/AI targets.
@@ -116,6 +164,10 @@ impl SessionPersistence {
 #[cfg(test)]
 #[path = "session_persistence/shutdown_tests.rs"]
 mod shutdown_tests;
+
+#[cfg(test)]
+#[path = "session_persistence/directory_restore_tests.rs"]
+mod directory_restore_tests;
 
 #[cfg(test)]
 mod tests {

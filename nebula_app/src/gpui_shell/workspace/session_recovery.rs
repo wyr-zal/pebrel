@@ -9,6 +9,40 @@ mod restart_agent_context_tests;
 mod restart_cwd_tests;
 
 impl NebulaWorkspace {
+    pub(super) fn start_workspace_session(
+        &mut self,
+        startup: windowing::WorkspaceStartup,
+        settings: &nebula_settings::RuntimeSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match startup {
+            windowing::WorkspaceStartup::RestoreSnapshot { session, resume_ai } => {
+                self.restore_update_session(&session, resume_ai, window, cx);
+            },
+            windowing::WorkspaceStartup::RestoreUpdate(session) => {
+                if !self.restore_update_session(&session, settings.resume_ai, window, cx) {
+                    self.add_terminal_at(Self::cold_start_cwd(), None, window, cx);
+                }
+            },
+            windowing::WorkspaceStartup::RestoreOrDefault => {
+                // 只有首窗恢复全局 session，避免每个新窗口重复回放同一批 PTY。
+                if !settings.restore_session
+                    || !self.try_restore_session(settings.resume_ai, window, cx)
+                {
+                    self.add_terminal_at(Self::cold_start_cwd(), None, window, cx);
+                }
+            },
+            windowing::WorkspaceStartup::NewTerminal { cwd } => {
+                self.add_terminal_at(cwd, None, window, cx);
+            },
+            windowing::WorkspaceStartup::LaunchTerminal { cwd, launch } => {
+                self.add_terminal_with(launch, cwd, None, window, cx);
+            },
+            windowing::WorkspaceStartup::Empty => {},
+        }
+    }
+
     pub(super) fn save_clean_window_session(
         &mut self,
         window: &Window,
@@ -96,15 +130,26 @@ impl NebulaWorkspace {
         }
         self.active = session.active_tab.min(self.tabs.len().saturating_sub(1));
         self.focus_active(window, cx);
+        self.report_restored_session(restored, crashed, window, cx);
+        true
+    }
+
+    pub(super) fn report_restored_session(
+        &mut self,
+        restored: usize,
+        crashed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let message = if crashed {
             Message::SessionTabsReopenedAfterCrash
         } else {
             Message::SessionTabsReopened
         };
+        let language = crate::gpui_shell::config::ui_language(cx);
         let text = language.format(message, &[("count", &restored.to_string())]);
-        crate::gpui_shell::toast::toast(window, cx, ToastKind::Info, text);
+        crate::gpui_shell::toast::toast(window, cx, crate::display::ToastKind::Info, text);
         cx.notify();
-        true
     }
 
     /// 按保存的逐 pane 启动环境重建分屏树。旧文件缺少逐 pane 描述时，

@@ -2,6 +2,8 @@
 
 use super::*;
 
+mod directory_restore;
+
 pub(crate) fn open_initial_window(
     cx: &mut App,
     ai_events: std::sync::mpsc::Receiver<crate::ai_hook::AiHookEvent>,
@@ -10,6 +12,7 @@ pub(crate) fn open_initial_window(
     initial_command: Option<crate::config::ui_config::Program>,
     shell_id: Option<String>,
     launched_at_login: bool,
+    restore_before_directory: bool,
 ) {
     if let Some(sessions) = crate::update_download::handoff::restore_ticket() {
         if let Err(error) = open_update_windows(sessions, Some(ai_events), Some(shell_events), cx) {
@@ -18,6 +21,34 @@ pub(crate) fn open_initial_window(
                 !cx.global::<WindowRegistry>().entries.is_empty(),
                 "failed to reopen updated workspace"
             );
+        }
+        return;
+    }
+    let isolated = crate::platform::elevation::requires_isolation();
+    if restore_before_directory
+        && !isolated
+        && !launched_at_login
+        && initial_command.is_none()
+        && shell_id.is_none()
+        && let Some(cwd) = initial_cwd.clone()
+    {
+        if let Err(error) =
+            directory_restore::open_directory_startup(cx, ai_events, shell_events, cwd)
+        {
+            log::error!("Could not restore the directory workspace: {error}");
+            if let Some(entry) = entries_by_mru(cx).into_iter().next() {
+                let _ = entry.handle.update(cx, |_, window, cx| {
+                    crate::gpui_shell::toast::banner(
+                        window,
+                        cx,
+                        crate::display::ToastKind::Warning,
+                        error.to_string(),
+                    );
+                });
+            } else {
+                crate::platform::startup::report_error(&error, true);
+                cx.quit();
+            }
         }
         return;
     }
@@ -30,11 +61,7 @@ pub(crate) fn open_initial_window(
             },
         }
     } else {
-        initial_startup(
-            initial_cwd,
-            initial_command,
-            crate::platform::elevation::requires_isolation(),
-        )
+        initial_startup(initial_cwd, initial_command, isolated)
     };
     let start_hidden = initial_window_hidden(
         &startup,
@@ -95,20 +122,28 @@ pub(super) fn initial_startup(
     }
 }
 
+#[cfg(all(test, feature = "gpui-test-support"))]
+mod directory_restore_tests;
+
 #[cfg(test)]
 mod startup_tests {
     use super::*;
 
     #[test]
-    fn an_external_folder_opens_a_new_terminal_instead_of_restoring_an_old_directory() {
+    fn an_explicit_folder_keeps_its_new_terminal_launch_intent() {
         use clap::Parser as _;
         use nebula_settings::{RawSettings, RuntimeSettings};
 
         let root = tempfile::Builder::new().prefix("pebrel 首次启动 ").tempdir().unwrap();
-        let invocation = crate::cli::Options::try_parse_from(["pebrel"]).unwrap();
         for name in ["A folder", "B 目录"] {
             let directory = root.path().join(name);
             std::fs::create_dir(&directory).unwrap();
+            let invocation = crate::cli::Options::try_parse_from([
+                "pebrel",
+                "--working-directory",
+                directory.to_str().unwrap(),
+            ])
+            .unwrap();
             for shell_id in ["pwsh", "wsl:Ubuntu-22.04"] {
                 let settings = RuntimeSettings::from_raw(&RawSettings::from_text(&format!(
                     "shell={shell_id}"
@@ -117,7 +152,7 @@ mod startup_tests {
                 let WorkspaceStartup::NewTerminal { cwd: Some(actual) } =
                     initial_startup(cwd, None, false)
                 else {
-                    panic!("external directory must not restore an old workspace")
+                    panic!("explicit directory must keep its new terminal launch intent")
                 };
                 assert_eq!(actual, directory);
             }

@@ -108,6 +108,7 @@ mod transfer_tests;
 pub(crate) enum WorkspaceStartup {
     RestoreOrDefault,
     RestoreUpdate(crate::session::Session),
+    RestoreSnapshot { session: crate::session::Session, resume_ai: bool },
     NewTerminal { cwd: Option<PathBuf> },
     LaunchTerminal { cwd: Option<PathBuf>, launch: crate::session::LaunchSession },
     Empty,
@@ -368,8 +369,18 @@ fn open_workspace_window_with_visibility(
     let (runtime_window_id, runtime_hub) = allocate_window(cx);
     let runtime = nebula_settings::RuntimeSettings::load();
     startup_geometry::load_restore(runtime_window_id, &startup, role, cx);
-    let mut options =
-        startup_geometry::options(cx, focus, role, runtime.sidebar_width, runtime_window_id);
+    let restored = match &startup {
+        WorkspaceStartup::RestoreSnapshot { session, .. } => session.window,
+        _ => None,
+    };
+    let mut options = startup_geometry::options(
+        cx,
+        focus,
+        role,
+        runtime.sidebar_width,
+        runtime_window_id,
+        restored,
+    );
     if start_hidden {
         options.show = false;
         options.focus = false;

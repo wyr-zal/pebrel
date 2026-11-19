@@ -90,6 +90,7 @@ pub fn run_shell(
     shell_id: Option<String>,
     config_file: Option<std::path::PathBuf>,
     launched_at_login: bool,
+    restore_before_directory: bool,
 ) {
     if crate::platform::CAPABILITIES.self_update_install {
         match crate::update_download::handoff::installation_in_progress() {
@@ -229,7 +230,6 @@ pub fn run_shell(
     }
     if runtime_server.is_some() {
         crate::mobile_connection::resume_saved();
-        crate::mobile_web::resume_saved();
     }
     let _runtime_server = runtime_server;
     let _acrylic = crate::platform::acrylic::RunGuard::default();
@@ -266,9 +266,9 @@ pub fn run_shell(
             initial_command,
             shell_id,
             launched_at_login,
+            restore_before_directory,
         );
     });
-    crate::mobile_web::shutdown();
     crate::tray::shutdown();
     crate::ai_hook::shutdown();
 }
@@ -350,6 +350,7 @@ fn open_main_window(
     initial_command: Option<crate::config::ui_config::Program>,
     shell_id: Option<String>,
     launched_at_login: bool,
+    restore_before_directory: bool,
 ) {
     workspace::windowing::initialize(cx, runtime_hub);
     workspace::windowing::open_initial_window(
@@ -360,6 +361,7 @@ fn open_main_window(
         initial_command,
         shell_id,
         launched_at_login,
+        restore_before_directory,
     );
 }
 

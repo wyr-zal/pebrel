@@ -1022,28 +1022,7 @@ impl NebulaWorkspace {
                 notice,
             );
         }
-        match startup {
-            windowing::WorkspaceStartup::RestoreUpdate(session) => {
-                if !this.restore_update_session(&session, runtime.resume_ai, window, cx) {
-                    this.add_terminal_at(Self::cold_start_cwd(), None, window, cx);
-                }
-            },
-            windowing::WorkspaceStartup::RestoreOrDefault => {
-                // 只有首窗恢复全局 session，避免每个新窗口重复回放同一批 PTY。
-                if !runtime.restore_session
-                    || !this.try_restore_session(runtime.resume_ai, window, cx)
-                {
-                    this.add_terminal_at(Self::cold_start_cwd(), None, window, cx);
-                }
-            },
-            windowing::WorkspaceStartup::NewTerminal { cwd } => {
-                this.add_terminal_at(cwd, None, window, cx);
-            },
-            windowing::WorkspaceStartup::LaunchTerminal { cwd, launch } => {
-                this.add_terminal_with(launch, cwd, None, window, cx);
-            },
-            windowing::WorkspaceStartup::Empty => {},
-        }
+        this.start_workspace_session(startup, &runtime, window, cx);
         if let Some(ai_events) = ai_events {
             Self::start_ai_hook_pump(ai_events, cx);
             // 全局热键是进程级单例，只在承载 ai-hook 泵的那扇初始窗口注册一次。

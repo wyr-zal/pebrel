@@ -107,6 +107,10 @@ pub(in crate::gpui_shell::workspace) fn restored_size(
     startup: &WorkspaceStartup,
     cx: &App,
 ) -> bool {
+    if let WorkspaceStartup::RestoreSnapshot { session, .. } = startup {
+        return session.window.is_some_and(|window| window.width > 0 && window.height > 0)
+            && cx.try_global::<StartupWindow>().is_none_or(|config| config.dimensions.is_none());
+    }
     id == 1
         && matches!(startup, WorkspaceStartup::RestoreOrDefault)
         && cx
@@ -120,9 +124,10 @@ pub(super) fn options(
     role: WindowRole,
     sidebar_width: f32,
     id: u64,
+    restored: Option<crate::session::WindowState>,
 ) -> WindowOptions {
     match role {
-        WindowRole::Regular => regular_options(id, focus, sidebar_width, cx),
+        WindowRole::Regular => regular_options(id, focus, sidebar_width, cx, restored),
         WindowRole::QuickTerminal => {
             let (display_id, visible) = super::quick_terminal_anchor_display(cx)
                 .map(|(id, bounds)| (Some(id), bounds))
@@ -168,9 +173,14 @@ pub(super) fn regular_options(
     focus: bool,
     sidebar_width: f32,
     cx: &mut App,
+    restored: Option<crate::session::WindowState>,
 ) -> WindowOptions {
+    // 显式位置/尺寸各自优先；两者均未指定时才沿用保存的最大化状态。
+    // 未显式设置的几何信息按当前恢复窗口取值，兼容旧首窗的全局回退。
     let config = cx.try_global::<StartupWindow>();
-    let restored = (id == 1).then(|| config.and_then(|config| config.restored)).flatten();
+    let restored = restored
+        .filter(|window| window.width > 0 && window.height > 0)
+        .or_else(|| (id == 1).then(|| config.and_then(|config| config.restored)).flatten());
     let configured =
         config.and_then(|config| config.position).map(|position| (position.x, position.y));
     let physical = configured.or_else(|| restored.and_then(|window| window.position));
@@ -366,7 +376,7 @@ mod tests {
             assert!(restored_size(1, &WorkspaceStartup::RestoreOrDefault, cx));
             assert!(!restored_size(2, &WorkspaceStartup::RestoreOrDefault, cx));
             assert!(!restored_size(1, &WorkspaceStartup::Empty, cx));
-            let options = regular_options(1, false, 230.0, cx);
+            let options = regular_options(1, false, 230.0, cx, None);
             assert_eq!(
                 options.window_bounds.unwrap().get_bounds().size,
                 size(px(900.0), px(650.0))
@@ -374,6 +384,43 @@ mod tests {
             cx.global_mut::<StartupWindow>().dimensions =
                 Some(crate::config::window::Dimensions { columns: 155, lines: 43 });
             assert!(!restored_size(1, &WorkspaceStartup::RestoreOrDefault, cx));
+        });
+    }
+
+    #[cfg(feature = "gpui-test-support")]
+    #[gpui::test]
+    fn each_directory_restore_window_uses_its_own_saved_geometry(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(StartupWindow {
+                restored: Some(crate::session::WindowState {
+                    width: 780,
+                    height: 550,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            for (id, width, height, maximized) in [(1, 900, 650, false), (2, 980, 700, true)] {
+                let mut session = crate::session::Session::new(0, vec![]);
+                session.window = Some(crate::session::WindowState {
+                    width,
+                    height,
+                    maximized,
+                    ..Default::default()
+                });
+                let startup = WorkspaceStartup::RestoreSnapshot { session, resume_ai: false };
+                assert!(restored_size(id, &startup, cx));
+                let WorkspaceStartup::RestoreSnapshot { session, .. } = &startup else {
+                    unreachable!();
+                };
+                let options = regular_options(id, false, 230.0, cx, session.window);
+                let bounds = options.window_bounds.unwrap();
+                assert_eq!(bounds.get_bounds().size, size(px(width as f32), px(height as f32)));
+                assert_eq!(matches!(bounds, WindowBounds::Maximized(_)), maximized);
+                cx.global_mut::<StartupWindow>().dimensions =
+                    Some(crate::config::window::Dimensions { columns: 155, lines: 43 });
+                assert!(!restored_size(id, &startup, cx));
+                cx.global_mut::<StartupWindow>().dimensions = None;
+            }
         });
     }
 

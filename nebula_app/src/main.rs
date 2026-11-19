@@ -88,8 +88,6 @@ mod math;
 mod message_bar;
 mod migrate;
 mod mobile_connection;
-#[cfg(feature = "gpui-shell")]
-mod mobile_web;
 mod motion;
 mod mux;
 mod native_result_model;
@@ -233,10 +231,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         // `--shell <id>`（右键菜单「在 Pebrel 中打开（Ubuntu）」用它）一路带到
         // 首个标签；缺省仍然用设置里的默认 shell。
         let shell_id = terminal_options.shell_id();
+        let inherited_directory = platform::startup::inherited_launch_directory();
+        let restore_before_directory =
+            restore_before_inherited_directory(&options, inherited_directory.as_deref());
         let initial_cwd = launch_directory(
             &options,
             &nebula_settings::RuntimeSettings::load(),
-            platform::startup::inherited_launch_directory(),
+            inherited_directory,
         );
         platform::startup::prepare_gui();
         let _log_file = logging::initialize(&options).expect("Unable to initialize logger");
@@ -281,6 +282,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             shell_id,
             options.config_file.clone(),
             options.launched_at_login,
+            restore_before_directory,
         );
         return Ok(());
     }
@@ -655,6 +657,20 @@ fn resident_launch_directory(
     )
 }
 
+fn restore_before_inherited_directory(
+    options: &Options,
+    inherited: Option<&std::path::Path>,
+) -> bool {
+    let terminal = &options.window_options.terminal_options;
+    inherited.is_some()
+        && terminal.working_directory.is_none()
+        && terminal.directory.is_none()
+        && terminal.command().is_none()
+        && terminal.shell.is_none()
+        && !options.launched_at_login
+        && !options.daemon
+}
+
 /// Cold startup and handover share this invocation's explicitly selected folder.
 fn launch_directory(
     options: &Options,
@@ -809,6 +825,26 @@ mod resident_launch_tests {
                 launch_directory(&options, &settings, Some(inherited.path().into())),
                 Some(explicit.path().into()),
             );
+        }
+    }
+
+    #[test]
+    fn only_bare_inherited_directory_requests_restore_before_opening() {
+        let inherited = std::path::Path::new("project folder");
+        let bare = Options::try_parse_from(["pebrel"]).unwrap();
+        assert!(restore_before_inherited_directory(&bare, Some(inherited)));
+        assert!(!restore_before_inherited_directory(&bare, None));
+        for arguments in [
+            vec!["pebrel", "--working-directory", "explicit folder"],
+            vec!["pebrel", "positional folder"],
+            vec!["pebrel", "--shell", "pwsh"],
+            vec!["pebrel", "--shell", ""],
+            vec!["pebrel", "--launched-at-login"],
+            vec!["pebrel", "--daemon"],
+            vec!["pebrel", "-e", "fixture-shell", "literal argument"],
+        ] {
+            let options = Options::try_parse_from(arguments).unwrap();
+            assert!(!restore_before_inherited_directory(&options, Some(inherited)));
         }
     }
 
