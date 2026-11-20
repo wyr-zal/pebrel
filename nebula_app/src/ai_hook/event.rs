@@ -196,12 +196,15 @@ impl AiPermissionMode {
     }
 }
 
-/// Claude `Stop` 会携带本回合的后台 Task 列表。主回合停止不等于后台
-/// subagent 已经停止；至少一个 task 仍 running 时，Pane 必须保持 Working。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Claude `Stop` 携带的后台任务。整体任务仍按 active 判断；Shell 分类只用于
+/// 区分当前回答的徽标，不表示后台任务已完成。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct AiBackgroundTasks {
     pub active: u32,
     pub total: u32,
+    pub active_shells: u32,
+    /// 所有活动 Shell 都有唯一且无需转换的 OSC ID 时才保留，最多 256 项。
+    pub shell_ids: Option<Vec<String>>,
 }
 
 /// 权限/等待输入事件的可行动上下文。`raw_context` 是经过字段脱敏、深度和
@@ -354,7 +357,7 @@ impl AiHookEvent {
     }
 
     pub fn active_background_tasks(&self) -> u32 {
-        self.background_tasks.map_or(0, |tasks| tasks.active)
+        self.background_tasks.as_ref().map_or(0, |tasks| tasks.active)
     }
 
     pub(crate) fn has_unverifiable_native_transcript(&self) -> bool {

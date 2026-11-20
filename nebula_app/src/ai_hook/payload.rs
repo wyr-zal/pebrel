@@ -86,10 +86,12 @@ pub(super) fn attention_is_actionable(payload: &Value) -> bool {
 
 pub(super) fn background_task_summary(payload: &Value) -> Option<AiBackgroundTasks> {
     let tasks = payload.get("background_tasks")?;
-    let mut active = 0u32;
-    let mut total = 0u32;
-    count_background_tasks(tasks, &mut active, &mut total);
-    Some(AiBackgroundTasks { active, total })
+    let mut summary = AiBackgroundTasks { shell_ids: Some(Vec::new()), ..Default::default() };
+    count_background_tasks(tasks, &mut summary);
+    if let Some(ids) = &mut summary.shell_ids {
+        ids.sort_unstable();
+    }
+    Some(summary)
 }
 
 /// 数出这批后台活儿里有多少还在跑。
@@ -104,27 +106,52 @@ pub(super) fn background_task_summary(payload: &Value) -> Option<AiBackgroundTas
 /// work … Empty array when nothing is in flight*，它的存在就是为了让 hook 区分
 /// 「真的收工」和「在等后台活儿把自己叫醒」。所以这里不再按类型过滤，只看每笔的
 /// 状态。
-fn count_background_tasks(value: &Value, active: &mut u32, total: &mut u32) {
+fn count_background_tasks(value: &Value, summary: &mut AiBackgroundTasks) {
     match value {
         Value::Array(values) => {
             for value in values {
-                count_background_tasks(value, active, total);
+                count_background_tasks(value, summary);
             }
         },
         Value::Object(task) => {
             if is_task_entry(task) {
-                *total = total.saturating_add(1);
+                summary.total = summary.total.saturating_add(1);
                 if task_is_in_flight(task) {
-                    *active = active.saturating_add(1);
+                    summary.active = summary.active.saturating_add(1);
+                    if task.get("type").and_then(Value::as_str).is_some_and(|kind| {
+                        kind.eq_ignore_ascii_case("shell") || kind.eq_ignore_ascii_case("local_bash")
+                    }) {
+                        summary.active_shells = summary.active_shells.saturating_add(1);
+                        record_shell_id(task, summary);
+                    }
                 }
                 return;
             }
             // 既没有类型也没有状态的中间层对象（旧 wire 形状的包装）继续往下找。
             for value in task.values() {
-                count_background_tasks(value, active, total);
+                count_background_tasks(value, summary);
             }
         },
         _ => {},
+    }
+}
+
+fn record_shell_id(task: &serde_json::Map<String, Value>, summary: &mut AiBackgroundTasks) {
+    let Some(ids) = &mut summary.shell_ids else { return };
+    // Claude 将非法字符替换并截到 32 字符；只接纳转换前后完全相同的 ID。
+    // 缺失、冲突或超限时撤销整组映射，不能用部分列表排除 OSC 子任务。
+    let id = task.get("id").and_then(Value::as_str).filter(|id| {
+        !id.is_empty()
+            && id.len() <= 32
+            && id.bytes().all(|ch| ch.is_ascii_alphanumeric() || b"_.+-".contains(&ch))
+    });
+    if let Some(id) = id
+        && ids.len() < 256
+        && !ids.iter().any(|seen| seen == id)
+    {
+        ids.push(id.to_owned());
+    } else {
+        summary.shell_ids = None;
     }
 }
 

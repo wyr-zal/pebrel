@@ -59,7 +59,8 @@ fn pi_result_metadata_distinguishes_legacy_unknown_and_background_work() {
         assert!(activity.apply_hook(&event));
         assert_eq!(activity.status(), status);
         assert_eq!(Notification::from_ai_hook(&event, None, false).is_some(), notifies);
-        event.background_tasks = Some(AiBackgroundTasks { active: 1, total: 1 });
+        event.background_tasks =
+            Some(AiBackgroundTasks { active: 1, total: 1, ..Default::default() });
         assert!(activity.apply_hook(&event));
         assert_eq!(activity.status(), AgentStatus::Working);
         assert!(Notification::from_ai_hook(&event, None, false).is_none());

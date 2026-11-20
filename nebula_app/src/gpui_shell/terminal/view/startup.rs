@@ -359,6 +359,7 @@ impl TerminalView {
             agent_activity: Default::default(),
             program_status: None,
             program_status_seen: false,
+            program_root_state: None,
             pty_failed: false,
             #[cfg(windows)]
             codex_failure_probe: None,

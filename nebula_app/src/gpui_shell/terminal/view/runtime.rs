@@ -305,6 +305,9 @@ impl TerminalView {
             AgentStatus::Working => return RuntimeTaskState::Running,
             AgentStatus::Done => return RuntimeTaskState::Finished,
             AgentStatus::Failed => return RuntimeTaskState::Failed,
+            AgentStatus::Idle if self.agent_activity.background_tasks_active() => {
+                return RuntimeTaskState::Running;
+            },
             AgentStatus::Idle => return RuntimeTaskState::Idle,
             AgentStatus::Blocked => unreachable!("handled above"),
             AgentStatus::Unknown => {},
@@ -440,6 +443,9 @@ impl TerminalView {
             }
             return SidebarActivity::Failed;
         }
+        if self.background_shell_rest_is_current() {
+            return SidebarActivity::Idle;
+        }
         if self.effective_program_status().is_none()
             && let Some(activity) =
                 progress_sidebar_activity(self.progress, self.agent_activity.status())
@@ -477,6 +483,16 @@ impl TerminalView {
             crate::runtime_api::RuntimeTaskState::Failed => unreachable!("handled above"),
             crate::runtime_api::RuntimeTaskState::Idle => SidebarActivity::Idle,
         }
+    }
+
+    fn background_shell_rest_is_current(&self) -> bool {
+        let Some(rest) = self.agent_activity.background_shell_rest() else {
+            return false;
+        };
+        let Some(status) = self.effective_program_status() else {
+            return true;
+        };
+        rest.shell_ids().is_some_and(|ids| status.supports_background_shell_rest(ids))
     }
 
     /// 普通全屏 TUI（lazygit、btop、vim、终端复用器……）占据 alternate screen 时是在等

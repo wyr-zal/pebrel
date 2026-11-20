@@ -205,9 +205,76 @@ fn claude_stop_counts_every_in_flight_background_task() {
     let event = parse_remote_envelope(raw, Some(3)).unwrap();
     assert_eq!(event.kind, AiHookKind::TurnDone);
     assert_eq!(event.active_background_tasks(), 2, "local_bash 与 monitor 都还在跑");
-    assert_eq!(event.background_tasks.unwrap().total, 4);
+    let tasks = event.background_tasks.unwrap();
+    assert_eq!(tasks.total, 4);
+    assert_eq!(tasks.active_shells, 1);
+    assert_eq!(tasks.shell_ids, None, "a missing shell ID disables the OSC mapping");
     assert!(capabilities_for("claude").background_tasks);
     assert!(!capabilities_for("pi").attention_context);
+}
+
+#[test]
+fn shell_task_summary_keeps_only_complete_unique_osc_safe_ids() {
+    let parse = |tasks: serde_json::Value| {
+        let payload = serde_json::json!({
+            "session_id": "s",
+            "hook_event_name": "Stop",
+            "background_tasks": tasks,
+        });
+        let wire = format!("nebula-hook/1 source=claude pane=3\n{payload}");
+        parse_remote_envelope(wire.as_bytes(), Some(3)).unwrap()
+    };
+
+    let valid = parse(serde_json::json!({"entries": [
+        {"id": "service_1", "type": "shell", "status": "running"},
+        {"id": "local-2", "type": "local_bash", "status": "running"}
+    ]}));
+    let summary = valid.background_tasks.unwrap();
+    assert_eq!(summary.active, 2);
+    assert_eq!(summary.active_shells, 2);
+    assert_eq!(summary.shell_ids, Some(vec!["local-2".into(), "service_1".into()]));
+
+    for (label, tasks, active) in [
+        ("missing", serde_json::json!([{"type":"shell","status":"running"}]), 1),
+        (
+            "duplicate",
+            serde_json::json!([
+                {"id":"same","type":"shell","status":"running"},
+                {"id":"same","type":"shell","status":"running"}
+            ]),
+            2,
+        ),
+        ("unsafe", serde_json::json!([{"id":"service/one","type":"shell","status":"running"}]), 1),
+        (
+            "truncated",
+            serde_json::json!([{"id":"123456789012345678901234567890123","type":"shell","status":"running"}]),
+            1,
+        ),
+    ] {
+        let event = parse(tasks);
+        let summary = event.background_tasks.unwrap();
+        assert_eq!(summary.active, active, "{label} ID must not change task accounting");
+        assert_eq!(summary.active_shells, active, "{label} ID must not change classification");
+        assert_eq!(summary.shell_ids, None, "{label} ID must disable the full OSC mapping");
+    }
+}
+
+#[test]
+fn shell_task_id_changes_are_part_of_the_hook_deduplication_fingerprint() {
+    let parse = |id: &str| {
+        let payload = serde_json::json!({
+            "session_id": "s",
+            "prompt_id": "turn",
+            "hook_event_name": "Stop",
+            "background_tasks": [{"id":id,"type":"shell","status":"running"}],
+        });
+        let wire = format!("nebula-hook/1 source=claude pane=3\n{payload}");
+        parse_remote_envelope(wire.as_bytes(), Some(3)).unwrap()
+    };
+    let mut gate = AiHookEventGate::default();
+    assert!(gate.accept(&parse("service-a"), 3));
+    assert!(gate.accept(&parse("service-b"), 3), "a changed task identity is new evidence");
+    assert!(!gate.accept(&parse("service-b"), 3), "the identical Stop remains deduplicated");
 }
 
 /// 空数组 = 真的收工：守卫必须放行，否则完成通知永远不弹。

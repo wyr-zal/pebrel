@@ -431,3 +431,298 @@ fn protocol_progress_changes_once_at_reset_or_transport_failure(cx: &mut TestApp
         }
     }
 }
+
+fn shell_event(session: &str, name: &str, kind: &str) -> crate::ai_hook::AiHookEvent {
+    let tasks = (0..4)
+        .map(|index| {
+            serde_json::json!({
+                "id": format!("service{index}"), "type": kind, "status": "running"
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload = serde_json::json!({
+        "hook_event_name": name, "session_id": session, "prompt_id": "first",
+        "background_tasks": tasks,
+    });
+    let envelope = format!("nebula-hook/1 source=claude pane=42\n{payload}");
+    crate::ai_hook::parse_remote_envelope(envelope.as_bytes(), Some(42)).unwrap()
+}
+
+fn shell_reports(root: &str) -> Vec<u8> {
+    let mut reports = format!("\x1b]7501;state={root}:app=claude-code\x07");
+    for index in 0..4 {
+        reports.push_str(&format!("\x1b]7501;state=working:app=claude-code:id=service{index}\x07"));
+    }
+    reports.into_bytes()
+}
+
+#[gpui::test]
+fn shell_only_stop_quiets_claude_osc_background_records_without_finishing_task(
+    cx: &mut TestAppContext,
+) {
+    for kind in ["shell", "local_bash"] {
+        for root in ["done", "working"] {
+            for stop_first in [true, false] {
+                let session = format!("shell-stop-{kind}-{root}-{stop_first}");
+                let (view, window, _) = open(cx);
+                let notifications = std::rc::Rc::new(std::cell::Cell::new(0));
+                let count = notifications.clone();
+                let _subscription = window.update(|_, cx| {
+                    cx.subscribe(&view, move |_, event, _| {
+                        if matches!(event, TerminalViewEvent::Notification(_)) {
+                            count.set(count.get() + 1);
+                        }
+                    })
+                });
+                view.update(window, |view, cx| {
+                    let mut wire = Wire::install(view);
+                    assert!(view.handle_ai_hook(&shell_event(&session, "UserPromptSubmit", kind), cx));
+                    let stop = shell_event(&session, "Stop", kind);
+                    assert_eq!(stop.active_background_tasks(), 4);
+                    if stop_first {
+                        assert!(view.handle_ai_hook(&stop, cx));
+                    }
+                    wire.feed(view, cx, &shell_reports(root));
+                    if !stop_first {
+                        assert!(view.handle_ai_hook(&stop, cx));
+                    }
+                    assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running);
+                    assert_eq!(view.runtime_agent().unwrap().state_source, RuntimeAgentStateSource::Osc7501);
+                    assert_eq!(
+                        view.sidebar_activity(), SidebarActivity::Idle,
+                        "shell-only Stop must quiet the badge: {kind}, root={root}, stop_first={stop_first}"
+                    );
+                    view.sync_activity_badges(cx);
+                    assert!(view.completed_at.is_none());
+                    assert_eq!(view.progress, TaskProgress::Indeterminate);
+                });
+                assert_eq!(notifications.get(), 0, "background work must not notify completion");
+            }
+        }
+    }
+}
+
+#[gpui::test]
+fn shell_rest_stops_when_osc_reports_unmatched_or_non_shell_work(cx: &mut TestAppContext) {
+    for (report, state, badge) in [
+        (
+            "state=working:app=claude-code:id=untracked",
+            RuntimeTaskState::Running,
+            SidebarActivity::Running,
+        ),
+        ("state=working:app=cargo:id=other", RuntimeTaskState::Running, SidebarActivity::Running),
+        (
+            "state=blocked:kind=permission:app=claude-code:id=service0",
+            RuntimeTaskState::Attention,
+            SidebarActivity::Attention,
+        ),
+        (
+            "state=error:app=claude-code:id=service0",
+            RuntimeTaskState::Failed,
+            SidebarActivity::CommandFailed,
+        ),
+    ] {
+        let session = format!("shell-rest-veto-{report}");
+        let (view, window, _) = open(cx);
+        view.update(window, |view, cx| {
+            let mut wire = Wire::install(view);
+            assert!(view.handle_ai_hook(&shell_event(&session, "UserPromptSubmit", "shell"), cx));
+            assert!(view.handle_ai_hook(&shell_event(&session, "Stop", "shell"), cx));
+            wire.feed(view, cx, &shell_reports("working"));
+            let bytes = format!("\x1b]7501;{report}\x07");
+            wire.feed(view, cx, bytes.as_bytes());
+            assert_eq!(view.runtime_task_state(), state, "{report}");
+            assert_eq!(view.sidebar_activity(), badge, "{report}");
+            assert!(
+                view.agent_activity.background_shell_rest().is_none(),
+                "{report} must revoke the qualification"
+            );
+            // The contradiction is new work, not a transient veto: clearing the
+            // OSC records must not resurrect the old Stop's rest.
+            wire.feed(view, cx, b"\x1b]7501;state=clear\x07");
+            assert_eq!(view.sidebar_activity(), SidebarActivity::Running, "{report}");
+        });
+    }
+}
+
+#[gpui::test]
+fn root_done_without_active_children_keeps_runtime_and_quiets_only_the_badge(
+    cx: &mut TestAppContext,
+) {
+    let (view, window, _) = open(cx);
+    view.update(window, |view, cx| {
+        let mut wire = Wire::install(view);
+        let session = "shell-rest-root-done-only";
+        assert!(view.handle_ai_hook(&shell_event(session, "UserPromptSubmit", "shell"), cx));
+        assert!(view.handle_ai_hook(&shell_event(session, "Stop", "shell"), cx));
+        wire.feed(view, cx, b"\x1b]7501;state=done:app=claude-code\x07");
+        // Explicit OSC Done stays authoritative for Runtime and waits (existing
+        // priority); only the shared badge projection rests for the ended answer.
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Finished);
+        assert_eq!(view.sidebar_activity(), SidebarActivity::Idle);
+    });
+}
+
+#[gpui::test]
+fn root_working_transition_revokes_shell_rest_even_when_selection_stays_working(
+    cx: &mut TestAppContext,
+) {
+    for previous_root in ["idle", "done"] {
+        let session = format!("shell-root-transition-{previous_root}");
+        let (view, window, _) = open(cx);
+        view.update(window, |view, cx| {
+            let mut wire = Wire::install(view);
+            assert!(view.handle_ai_hook(&shell_event(&session, "UserPromptSubmit", "shell"), cx));
+            assert!(view.handle_ai_hook(&shell_event(&session, "Stop", "shell"), cx));
+            wire.feed(view, cx, &shell_reports(previous_root));
+            assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running);
+            assert_eq!(view.sidebar_activity(), SidebarActivity::Idle);
+            if previous_root == "done" {
+                wire.feed(view, cx, b"\x1b]7501;state=clear\x07");
+                assert_eq!(view.sidebar_activity(), SidebarActivity::Idle);
+            }
+            wire.feed(view, cx, b"\x1b]7501;state=working:app=claude-code\x07");
+            assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running);
+            assert_eq!(view.sidebar_activity(), SidebarActivity::Running);
+        });
+    }
+}
+
+#[gpui::test]
+fn clearing_osc_records_falls_back_to_the_trusted_shell_stop(cx: &mut TestAppContext) {
+    let (view, window, _) = open(cx);
+    view.update(window, |view, cx| {
+        let mut wire = Wire::install(view);
+        let session = "shell-rest-clear";
+        assert!(view.handle_ai_hook(&shell_event(session, "UserPromptSubmit", "shell"), cx));
+        assert!(view.handle_ai_hook(&shell_event(session, "Stop", "shell"), cx));
+        wire.feed(view, cx, &shell_reports("working"));
+        assert_eq!(view.sidebar_activity(), SidebarActivity::Idle);
+        wire.feed(view, cx, b"\x1b]7501;state=clear\x07");
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running);
+        assert_eq!(view.sidebar_activity(), SidebarActivity::Idle);
+    });
+}
+
+#[gpui::test]
+fn a_new_prompt_revokes_shell_rest_and_restores_the_running_badge(cx: &mut TestAppContext) {
+    let (view, window, _) = open(cx);
+    view.update(window, |view, cx| {
+        let session = "shell-rest-new-prompt";
+        assert!(view.handle_ai_hook(&shell_event(session, "UserPromptSubmit", "shell"), cx));
+        assert!(view.handle_ai_hook(&shell_event(session, "Stop", "shell"), cx));
+        assert_eq!(view.sidebar_activity(), SidebarActivity::Idle);
+        assert!(view.handle_ai_hook(&hook(session, "UserPromptSubmit", 9), cx));
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running);
+        assert_eq!(view.sidebar_activity(), SidebarActivity::Running);
+    });
+}
+
+#[gpui::test]
+fn incomplete_shell_id_mapping_blocks_osc_quieting_but_not_hook_only_rest(cx: &mut TestAppContext) {
+    for with_osc in [false, true] {
+        let session = format!("shell-rest-missing-id-{with_osc}");
+        let (view, window, _) = open(cx);
+        view.update(window, |view, cx| {
+            let mut wire = Wire::install(view);
+            assert!(view.handle_ai_hook(&shell_event(&session, "UserPromptSubmit", "shell"), cx));
+            let mut stop = shell_event(&session, "Stop", "shell");
+            stop.background_tasks.as_mut().unwrap().shell_ids = None;
+            assert!(view.handle_ai_hook(&stop, cx));
+            if with_osc {
+                wire.feed(view, cx, &shell_reports("working"));
+            }
+            assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running);
+            assert_eq!(
+                view.sidebar_activity(),
+                if with_osc { SidebarActivity::Running } else { SidebarActivity::Idle }
+            );
+        });
+    }
+}
+
+#[gpui::test]
+fn osc_shell_ids_qualify_without_an_explicit_app_and_children_inherit_it(cx: &mut TestAppContext) {
+    // 真实 OSC 7501 可能省略 app：根和子记录都不带时，只能凭可精确对应的
+    // Shell ID 认定这是同一个 Claude 回合的后台 Shell；无法对应则继续转圈。
+    for (label, reports) in [
+        (
+            "no-app-done",
+            b"\x1b]7501;state=done\x07\x1b]7501;state=working:id=service0\x07\
+              \x1b]7501;state=working:id=service1\x07"
+                .to_vec(),
+        ),
+        (
+            "inherited-app",
+            b"\x1b]7501;state=done:app=claude-code\x07\x1b]7501;state=working:id=service0\x07\
+              \x1b]7501;state=working:id=service1\x07"
+                .to_vec(),
+        ),
+    ] {
+        let session = format!("shell-rest-{label}");
+        let (view, window, _) = open(cx);
+        view.update(window, |view, cx| {
+            let mut wire = Wire::install(view);
+            assert!(view.handle_ai_hook(&shell_event(&session, "UserPromptSubmit", "shell"), cx));
+            assert!(view.handle_ai_hook(&shell_event(&session, "Stop", "shell"), cx));
+            wire.feed(view, cx, &reports);
+            assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running, "{label}");
+            assert_eq!(view.sidebar_activity(), SidebarActivity::Idle, "{label}");
+        });
+    }
+
+    let session = "shell-rest-no-app-untracked";
+    let (view, window, _) = open(cx);
+    view.update(window, |view, cx| {
+        let mut wire = Wire::install(view);
+        assert!(view.handle_ai_hook(&shell_event(session, "UserPromptSubmit", "shell"), cx));
+        assert!(view.handle_ai_hook(&shell_event(session, "Stop", "shell"), cx));
+        wire.feed(view, cx, b"\x1b]7501;state=done\x07\x1b]7501;state=working:id=untracked\x07");
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running);
+        assert_eq!(view.sidebar_activity(), SidebarActivity::Running);
+    });
+}
+
+#[gpui::test]
+fn failed_or_cancelled_shell_stop_never_establishes_badge_rest(cx: &mut TestAppContext) {
+    for outcome in [
+        crate::ai_hook::AiTurnOutcome::Failed,
+        crate::ai_hook::AiTurnOutcome::Cancelled,
+        crate::ai_hook::AiTurnOutcome::Incomplete,
+    ] {
+        let session = format!("shell-rest-outcome-{outcome:?}");
+        let (view, window, _) = open(cx);
+        view.update(window, |view, cx| {
+            assert!(view.handle_ai_hook(&shell_event(&session, "UserPromptSubmit", "shell"), cx));
+            let mut stop = shell_event(&session, "Stop", "shell");
+            stop.turn_outcome = outcome;
+            assert!(view.handle_ai_hook(&stop, cx));
+            assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running);
+            assert_eq!(view.sidebar_activity(), SidebarActivity::Running);
+        });
+    }
+}
+
+#[gpui::test]
+fn overall_running_state_survives_foreground_cancel_while_background_work_is_active(
+    cx: &mut TestAppContext,
+) {
+    let (view, window, _) = open(cx);
+    view.update(window, |view, cx| {
+        let session = "shell-rest-cancelled-answer";
+        assert!(view.handle_ai_hook(&shell_event(session, "UserPromptSubmit", "shell"), cx));
+        assert!(view.handle_ai_hook(&shell_event(session, "Stop", "shell"), cx));
+        assert!(view.handle_ai_hook(&hook(session, "PostToolUse", 10), cx));
+        view.agent_activity.request_cancel();
+        let idle = || crate::ai_agents::Detection {
+            agent: crate::ai_agents::AgentKind::Claude,
+            status: crate::ai_agents::AgentStatus::Idle,
+            rule_id: "test.prompt_idle".into(),
+        };
+        assert!(!view.agent_activity.observe_cancel(Some(idle())));
+        assert!(view.agent_activity.observe_cancel(Some(idle())));
+        assert_eq!(view.agent_activity.status(), crate::ai_agents::AgentStatus::Idle);
+        assert_eq!(view.runtime_task_state(), RuntimeTaskState::Running);
+        assert_eq!(view.sidebar_activity(), SidebarActivity::Running);
+    });
+}

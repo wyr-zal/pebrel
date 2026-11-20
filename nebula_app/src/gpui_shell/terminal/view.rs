@@ -419,6 +419,7 @@ pub struct TerminalView {
     agent_activity: crate::ai_hook::lifecycle::AgentActivity,
     program_status: Option<program_status::ProgramStatus>,
     program_status_seen: bool,
+    program_root_state: Option<nebula_terminal::program_status::State>,
     pty_failed: bool,
     #[cfg(windows)]
     codex_failure_probe: Option<gpui::Task<()>>,

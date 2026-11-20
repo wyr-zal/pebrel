@@ -603,7 +603,8 @@ mod tests {
                 .is_some()
         );
         let mut failure = event("StopFailure", "unknown");
-        failure.background_tasks = Some(super::super::AiBackgroundTasks { active: 1, total: 1 });
+        failure.background_tasks =
+            Some(super::super::AiBackgroundTasks { active: 1, total: 1, ..Default::default() });
         assert!(state.observe(&failure, now, 3, interval).is_none());
         assert!(state.pending().is_none());
         assert!(
@@ -710,7 +711,8 @@ mod tests {
         assert!(state.observe(&failure, now, 3, interval).is_none());
         state.observe(&event("UserPromptSubmit", ""), now, 3, interval);
         failure.source = "claude".into();
-        failure.background_tasks = Some(super::super::AiBackgroundTasks { active: 1, total: 1 });
+        failure.background_tasks =
+            Some(super::super::AiBackgroundTasks { active: 1, total: 1, ..Default::default() });
         assert!(state.observe(&failure, now, 3, interval).is_none());
     }
 }

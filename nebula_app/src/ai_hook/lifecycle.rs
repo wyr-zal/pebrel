@@ -35,6 +35,23 @@ struct Owner {
     bridge_instance: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackgroundShellRest {
+    source: String,
+    session: String,
+    turn: String,
+    pid: Option<u32>,
+    start_time: Option<u64>,
+    remote_process: Option<String>,
+    shell_ids: Option<Vec<String>>,
+}
+
+impl BackgroundShellRest {
+    pub(crate) fn shell_ids(&self) -> Option<&[String]> {
+        self.shell_ids.as_deref()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Compaction {
     prompt_id: Option<String>,
@@ -79,6 +96,8 @@ pub(crate) struct AgentActivity {
     uncertainty: Option<AgentStatusUncertainty>,
     coverage: HookCoverage,
     owner: Option<Owner>,
+    background_shell_rest: Option<BackgroundShellRest>,
+    background_tasks_active: bool,
     /// Screen-only idle confirmation and remote renewed-work confirmation
     /// have separate counters; neither can complete a Hook-owned turn.
     idle_samples: u8,
@@ -122,6 +141,8 @@ impl Default for AgentActivity {
             uncertainty: None,
             coverage: HookCoverage::None,
             owner: None,
+            background_shell_rest: None,
+            background_tasks_active: false,
             idle_samples: 0,
             working_samples: 0,
             unmatched_samples: 0,
@@ -176,6 +197,32 @@ impl AgentActivity {
     pub fn hook_seen(&self) -> bool {
         self.coverage != HookCoverage::None
     }
+    pub(crate) fn background_shell_rest(&self) -> Option<&BackgroundShellRest> {
+        let rest = self.background_shell_rest.as_ref()?;
+        let owner = self.owner.as_ref()?;
+        (self.status == AgentStatus::Working
+            && self.source == AgentStatusSource::Hook
+            && self.background_tasks_active
+            && !self.pending_submit
+            && !self.pending_hook_prompt
+            && self.uncertainty.is_none()
+            && !self.cancel_requested
+            && !self.turn_cancelled
+            && self.compaction.is_none()
+            && owner.source == rest.source
+            && owner.session.as_deref() == Some(rest.session.as_str())
+            && owner.pid == rest.pid
+            && owner.start_time == rest.start_time
+            && owner.remote_process == rest.remote_process
+            && self.turn_id.as_deref() == Some(rest.turn.as_str()))
+        .then_some(rest)
+    }
+    pub(crate) fn background_tasks_active(&self) -> bool {
+        self.background_tasks_active
+    }
+    pub(crate) fn revoke_background_shell_rest(&mut self) {
+        self.background_shell_rest = None;
+    }
     pub fn primary_pid(&self) -> Option<u32> {
         self.owner.as_ref().and_then(|owner| owner.pid)
     }
@@ -203,10 +250,7 @@ impl AgentActivity {
             || self.pending_submit
             || self.codex_input_pending
             || self.status != AgentStatus::Working
-            || self
-                .rule
-                .as_deref()
-                .is_some_and(|rule| rule.starts_with("hook.background_tasks.active="))
+            || self.background_tasks_active
         {
             return None;
         }
@@ -366,6 +410,7 @@ impl AgentActivity {
     }
 
     fn input_sent_at(&mut self, received_sequence: u64) {
+        self.background_shell_rest = None;
         self.submit_receive_sequence = received_sequence;
         self.codex_input_pending |= self.native_codex && self.turn_id.is_some();
         self.cancel_requested = false;
@@ -612,6 +657,12 @@ impl AgentActivity {
     }
 
     pub fn request_cancel(&mut self) {
+        if self.background_shell_rest().is_some() {
+            // Escape is new foreground evidence. The shell may still be alive,
+            // so revoke only the badge projection and keep the overall work active.
+            self.revoke_background_shell_rest();
+            self.idle_samples = 0;
+        }
         if self.compacting()
             || (self.owner.as_ref().is_some_and(|owner| owner.source == "claude")
                 && self.hook_seen()
@@ -620,6 +671,7 @@ impl AgentActivity {
                 && self.rule.is_none()
                 && matches!(self.status, AgentStatus::Working | AgentStatus::Blocked))
         {
+            self.background_shell_rest = None;
             self.cancel_requested = true;
             self.idle_samples = 0;
         }
@@ -691,12 +743,46 @@ impl AgentActivity {
         }
     }
 
+    fn background_shell_rest_for(&self, event: &AiHookEvent) -> Option<BackgroundShellRest> {
+        if event.source != "claude"
+            || event.kind != AiHookKind::TurnDone
+            || event.turn_outcome != super::AiTurnOutcome::Succeeded
+        {
+            return None;
+        }
+        let tasks = event.background_tasks.as_ref()?;
+        if tasks.active == 0 || tasks.active_shells != tasks.active {
+            return None;
+        }
+        let session = event.session_id.as_ref()?;
+        let turn = event.turn_id.as_ref()?;
+        let owner = self.owner.as_ref()?;
+        if owner.source != event.source || owner.session.as_ref() != Some(session) {
+            return None;
+        }
+        let shell_ids = tasks
+            .shell_ids
+            .as_ref()
+            .filter(|ids| ids.len() == tasks.active_shells as usize)
+            .cloned();
+        Some(BackgroundShellRest {
+            source: event.source.clone(),
+            session: session.clone(),
+            turn: turn.clone(),
+            pid: owner.pid,
+            start_time: owner.start_time,
+            remote_process: owner.remote_process.clone(),
+            shell_ids,
+        })
+    }
+
     /// Apply an already ordered event. A nested/foreign session has no authority
     /// over the primary pane, including its identity, attention and notifications.
     pub fn apply_hook(&mut self, event: &AiHookEvent) -> bool {
         if !self.accepts_hook(event) {
             return false;
         }
+        self.background_shell_rest = None;
         self.pending_hook_prompt = false;
         let new_codex_turn = event.source == "codex"
             && event.kind == AiHookKind::PromptSubmit
@@ -804,6 +890,10 @@ impl AgentActivity {
             AiHookKind::CompactionEnd => self.end_compaction().unwrap_or(self.status),
             AiHookKind::SessionStart => {
                 self.turn_observed = false;
+                // A fresh session (`/clear`, restart or resume) must not inherit
+                // the previous session's background snapshot. Compaction
+                // SessionStart is handled above and keeps it.
+                self.background_tasks_active = false;
                 AgentStatus::Idle
             },
             AiHookKind::PromptSubmit | AiHookKind::ToolComplete => {
@@ -837,6 +927,10 @@ impl AgentActivity {
             AiHookKind::NeedsAttention => AgentStatus::Blocked,
             AiHookKind::SessionEnd => unreachable!("handled above"),
         };
+        if event.kind == AiHookKind::TurnDone {
+            self.background_tasks_active = event.active_background_tasks() > 0;
+        }
+        self.background_shell_rest = self.background_shell_rest_for(event);
         self.last_activity_at = Some(std::time::Instant::now());
         true
     }
@@ -980,6 +1074,7 @@ impl AgentActivity {
             || self.pending_submit
             || self.cancel_requested
             || self.turn_cancelled
+            || self.background_tasks_active
         {
             self.working_samples = 0;
             return false;

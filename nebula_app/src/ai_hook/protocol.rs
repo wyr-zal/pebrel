@@ -148,6 +148,7 @@ fn parse_envelope_with_sequence(bytes: &[u8], received_sequence: u64) -> Option<
         payload.get("fullyIdle").and_then(Value::as_bool).map(|idle| super::AiBackgroundTasks {
             active: u32::from(!idle),
             total: u32::from(!idle),
+            ..Default::default()
         })
     } else {
         background_task_summary(&payload)

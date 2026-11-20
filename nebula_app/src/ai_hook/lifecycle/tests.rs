@@ -1170,7 +1170,8 @@ fn verified_process_can_change_session_and_background_tasks_keep_working() {
     late.agent_pid = Some(10);
     assert!(!activity.apply_hook(&late), "the old session cannot undo a verified /clear");
     start.kind = AiHookKind::TurnDone;
-    start.background_tasks = Some(super::super::AiBackgroundTasks { active: 1, total: 2 });
+    start.background_tasks =
+        Some(super::super::AiBackgroundTasks { active: 1, total: 2, ..Default::default() });
     activity.apply_hook(&start);
     assert_eq!(activity.status(), AgentStatus::Working);
     start.background_tasks.as_mut().unwrap().active = 0;
@@ -1251,6 +1252,176 @@ fn shell_command_end_rejects_late_hooks_until_a_new_command_starts() {
     }
     activity.begin_command(true);
     assert!(activity.apply_hook(&event("codex", "new", "notify")));
+}
+
+#[test]
+fn active_background_shells_block_stalled_turn_reconciliation() {
+    let mut activity = AgentActivity::default();
+    let submit = event_with_turn("claude", "shell-rest", "UserPromptSubmit", "turn");
+    assert!(activity.apply_hook(&submit));
+
+    let stop = crate::ai_hook::parse_remote_envelope(
+        br#"nebula-hook/1 source=claude
+{"hook_event_name":"Stop","session_id":"shell-rest","turn_id":"turn","background_tasks":[{"id":"service","type":"shell","status":"running"}]}"#,
+        Some(1),
+    )
+    .unwrap();
+    assert!(activity.apply_hook(&stop));
+    assert_eq!(activity.status(), AgentStatus::Working);
+    assert!(activity.background_shell_rest().is_some());
+
+    activity.backdate_activity_for_test(std::time::Duration::from_secs(30));
+    for _ in 0..3 {
+        assert!(!activity.reconcile_stalled_turn(screen(AgentStatus::Idle).as_ref(), true));
+        assert_eq!(activity.status(), AgentStatus::Working);
+        assert_eq!(activity.source(), AgentStatusSource::Hook);
+    }
+}
+
+fn shell_rest_activity() -> AgentActivity {
+    let mut activity = AgentActivity::default();
+    assert!(activity.apply_hook(&event_with_turn(
+        "claude",
+        "shell-rest",
+        "UserPromptSubmit",
+        "turn",
+    )));
+    let stop = crate::ai_hook::parse_remote_envelope(
+        br#"nebula-hook/1 source=claude
+{"hook_event_name":"Stop","session_id":"shell-rest","turn_id":"turn","background_tasks":[{"id":"service","type":"shell","status":"running"}]}"#,
+        Some(1),
+    )
+    .unwrap();
+    assert!(activity.apply_hook(&stop));
+    activity
+}
+
+#[test]
+fn accepted_activity_and_cancellation_revoke_shell_rest_qualification() {
+    for name in ["PostToolUse", "PermissionRequest"] {
+        let mut activity = shell_rest_activity();
+        let next = event_with_turn("claude", "shell-rest", name, "turn");
+        assert!(activity.apply_hook(&next));
+        assert!(activity.background_shell_rest().is_none(), "{name}");
+    }
+
+    let mut compacting = shell_rest_activity();
+    let mut compact = event_with_turn("claude", "shell-rest", "UserPromptSubmit", "turn");
+    compact.kind = AiHookKind::CompactionStart;
+    compact.compaction_auto = true;
+    assert!(compacting.apply_hook(&compact));
+    assert!(compacting.background_shell_rest().is_none());
+
+    for outcome in [crate::ai_hook::AiTurnOutcome::Failed, crate::ai_hook::AiTurnOutcome::Cancelled]
+    {
+        let mut activity = shell_rest_activity();
+        let mut stop = event_with_turn("claude", "shell-rest", "Stop", "turn");
+        stop.turn_outcome = outcome;
+        stop.background_tasks = Some(super::super::AiBackgroundTasks {
+            active: 1,
+            total: 1,
+            active_shells: 1,
+            shell_ids: Some(vec!["service".into()]),
+        });
+        assert!(activity.apply_hook(&stop));
+        assert!(activity.background_shell_rest().is_none(), "{outcome:?}");
+    }
+
+    let mut cancelled = shell_rest_activity();
+    cancelled.request_cancel();
+    assert!(cancelled.background_shell_rest().is_none());
+    assert!(cancelled.background_tasks_active);
+    assert_eq!(cancelled.status(), AgentStatus::Working);
+
+    let mut ended = shell_rest_activity();
+    assert!(ended.apply_hook(&event("claude", "shell-rest", "SessionEnd")));
+    assert!(ended.background_shell_rest().is_none());
+    assert_eq!(ended.status(), AgentStatus::Unknown);
+}
+
+#[test]
+fn new_input_releases_only_the_shell_rest_projection_until_a_new_stop() {
+    let mut activity = shell_rest_activity();
+    activity.input_sent();
+    assert!(activity.background_shell_rest().is_none());
+    assert!(activity.background_tasks_active);
+    assert_eq!(activity.status(), AgentStatus::Working);
+    assert!(!activity.reconcile_stalled_turn(screen(AgentStatus::Idle).as_ref(), true));
+
+    let next = event_with_turn("claude", "shell-rest", "UserPromptSubmit", "next-turn");
+    assert!(activity.apply_hook(&next));
+    let old_stop = event_with_turn("claude", "shell-rest", "Stop", "turn");
+    assert!(
+        !activity.apply_hook(&old_stop),
+        "a delayed Stop from the previous turn cannot restore rest"
+    );
+    assert!(activity.background_shell_rest().is_none());
+    assert!(activity.background_tasks_active, "only a newer Stop replaces the task snapshot");
+}
+
+#[test]
+fn clear_session_drops_the_background_snapshot_but_compaction_keeps_it() {
+    let mut cleared = shell_rest_activity();
+    assert!(cleared.background_tasks_active);
+    assert!(cleared.apply_hook(&event("claude", "shell-rest", "SessionStart")));
+    assert!(
+        !cleared.background_tasks_active,
+        "a fresh session must not inherit old background work"
+    );
+    assert!(cleared.background_shell_rest().is_none());
+    assert_eq!(cleared.status(), AgentStatus::Idle);
+
+    let mut compacted = shell_rest_activity();
+    let mut compacted_start = event("claude", "shell-rest", "SessionStart");
+    compacted_start.session_compacted = true;
+    assert!(compacted.apply_hook(&compacted_start));
+    assert!(compacted.background_tasks_active, "compaction belongs to the same session");
+    assert!(compacted.background_shell_rest().is_none(), "compaction still revokes the badge rest");
+}
+
+#[test]
+fn a_previous_turn_background_snapshot_blocks_stalled_reconciliation() {
+    let mut activity = shell_rest_activity();
+    activity.input_sent();
+    let next = event_with_turn("claude", "shell-rest", "UserPromptSubmit", "next-turn");
+    assert!(activity.apply_hook(&next));
+    assert!(activity.background_tasks_active, "input alone cannot prove the shells ended");
+    assert!(!activity.reconcile_stalled_turn(screen(AgentStatus::Idle).as_ref(), true));
+    assert_eq!(activity.status(), AgentStatus::Working);
+}
+
+#[test]
+fn background_shell_rest_requires_every_active_task_to_be_a_shell() {
+    for tasks in [
+        serde_json::json!([
+            {"id":"service","type":"shell","status":"running"},
+            {"id":"agent","type":"subagent","status":"running"}
+        ]),
+        serde_json::json!([
+            {"id":"service","type":"shell","status":"running"},
+            {"id":"future","type":"future_task","status":"waiting"}
+        ]),
+    ] {
+        let mut activity = AgentActivity::default();
+        assert!(activity.apply_hook(&event_with_turn(
+            "claude",
+            "mixed-background",
+            "UserPromptSubmit",
+            "turn",
+        )));
+        let payload = serde_json::json!({
+            "hook_event_name": "Stop",
+            "session_id": "mixed-background",
+            "turn_id": "turn",
+            "background_tasks": tasks,
+        });
+        let wire = format!("nebula-hook/1 source=claude\n{payload}");
+        let stop = crate::ai_hook::parse_remote_envelope(wire.as_bytes(), Some(1)).unwrap();
+        assert!(activity.apply_hook(&stop));
+        assert!(activity.background_tasks_active);
+        assert!(activity.background_shell_rest().is_none());
+        assert_eq!(activity.status(), AgentStatus::Working);
+    }
 }
 
 /// A stalled remote Hook owner cannot be completed by repeated idle screens.

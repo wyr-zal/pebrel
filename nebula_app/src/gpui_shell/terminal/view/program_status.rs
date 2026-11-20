@@ -6,11 +6,23 @@ use super::{TerminalView, TerminalViewEvent};
 use crate::runtime_api::RuntimeTaskState;
 use crate::taskbar::TaskProgress;
 
+/// OSC 7501 reports Claude Code as `claude-code`; Hook sources use `claude`.
+const CLAUDE_OSC_APP: &str = "claude-code";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProgramRecord {
+    id: String,
+    state: State,
+    app: Option<String>,
+    result_acknowledged: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ProgramStatus {
     state: State,
     progress: Option<u8>,
     pub app: Option<String>,
+    records: Vec<ProgramRecord>,
 }
 
 impl ProgramStatus {
@@ -31,7 +43,71 @@ impl ProgramStatus {
             app: records.app_for(record).map(str::to_owned),
             state: record.state,
             progress: record.progress,
+            records: records
+                .iter()
+                .map(|record| ProgramRecord {
+                    id: record.id.clone(),
+                    state: record.state,
+                    app: records.app_for(record).map(str::to_owned),
+                    result_acknowledged: record.result_acknowledged,
+                })
+                .collect(),
         })
+    }
+
+    fn root_state(&self) -> Option<State> {
+        self.records.iter().find(|record| record.id.is_empty()).map(|record| record.state)
+    }
+
+    pub(super) fn supports_background_shell_rest(&self, shell_ids: &[String]) -> bool {
+        if shell_ids.is_empty() {
+            return false;
+        }
+        let mut matched_shell = false;
+        for record in self.records.iter().filter(|record| !record.result_acknowledged) {
+            match record.state {
+                State::Blocked | State::Error => return false,
+                State::Working => {
+                    if record.app.as_deref().is_some_and(|app| app != CLAUDE_OSC_APP) {
+                        return false;
+                    }
+                    if !record.id.is_empty() {
+                        if !shell_ids.iter().any(|id| id == &record.id) {
+                            return false;
+                        }
+                        matched_shell = true;
+                    }
+                },
+                // Historical results from other programs stay on screen (or in
+                // the ring) but cannot veto the current answer's badge.
+                State::Idle | State::Done => {},
+            }
+        }
+        // A missing app is trusted only when an active record matches the
+        // trusted Stop's shell ids exactly.
+        self.app.as_deref() == Some(CLAUDE_OSC_APP) || matched_shell
+    }
+
+    /// Work that appeared after the Stop and cannot be attributed to its
+    /// background shells withdraws the rest qualification for the whole turn.
+    pub(super) fn revokes_background_shell_rest(&self, shell_ids: &[String]) -> bool {
+        if shell_ids.is_empty() {
+            return false;
+        }
+        for record in self.records.iter().filter(|record| !record.result_acknowledged) {
+            match record.state {
+                State::Blocked | State::Error => return true,
+                State::Working => {
+                    if record.app.as_deref().is_some_and(|app| app != CLAUDE_OSC_APP)
+                        || (!record.id.is_empty() && !shell_ids.iter().any(|id| id == &record.id))
+                    {
+                        return true;
+                    }
+                },
+                State::Idle | State::Done => {},
+            }
+        }
+        false
     }
 
     pub fn task_state(&self) -> RuntimeTaskState {
@@ -87,6 +163,36 @@ impl TerminalView {
             let term = session.term.lock();
             (term.program_statuses().seen(), ProgramStatus::select(term.program_statuses()))
         });
+        let root_state = status.as_ref().and_then(ProgramStatus::root_state);
+        if self.agent_activity.background_shell_rest().is_some() {
+            let shell_ids_revoked = self
+                .agent_activity
+                .background_shell_rest()
+                .and_then(|rest| rest.shell_ids())
+                .is_some_and(|ids| {
+                    status
+                        .as_ref()
+                        .is_some_and(|status| status.revokes_background_shell_rest(ids))
+                        // The contradiction may have arrived before the Stop and
+                        // be cleared by the first refresh after it.
+                        || self
+                            .program_status
+                            .as_ref()
+                            .is_some_and(|status| status.revokes_background_shell_rest(ids))
+                });
+            // An unmatched active record or a Blocked/Error report is new work
+            // that cannot be explained by the Stop's shells. It must not become
+            // idle again without a fresh trusted Stop.
+            if shell_ids_revoked
+                || (matches!(self.program_root_state, Some(State::Idle | State::Done))
+                    && root_state == Some(State::Working))
+            {
+                self.agent_activity.revoke_background_shell_rest();
+            }
+        }
+        if root_state.is_some() {
+            self.program_root_state = root_state;
+        }
         if self.program_status_seen == seen && self.program_status == status {
             return;
         }
