@@ -107,7 +107,7 @@ pub(super) fn copy_launch(
     kind: CopyKind,
     origin: PaneOrigin<'_>,
 ) -> (LaunchSession, Option<PathBuf>) {
-    let mut focused = origin.guest;
+    let focused = origin.guest;
     match kind {
         CopyKind::Split if wsl_program_args(&launch).is_none() => {
             return (LaunchSession::Default, origin.host_cwd);
@@ -122,7 +122,9 @@ pub(super) fn copy_launch(
                 || wsl_program_args(&launch)
                     .and_then(|(program, args)| crate::shell_detect::wsl_launch(program, args))
                     .is_some_and(|options| options.chooses_directory);
-            focused = focused.filter(|_| !own_directory);
+            if own_directory {
+                return (launch, origin.host_cwd);
+            }
         },
     }
     let same_guest =
@@ -133,6 +135,15 @@ pub(super) fn copy_launch(
         });
     if same_guest && inherit_guest_directory(&mut launch, origin.cwd) {
         return (launch, None);
+    }
+    // A new tab deliberately selects the pane's host directory. Encode that
+    // choice before the final WSL adapter applies its default home directory.
+    if matches!(kind, CopyKind::NewTab)
+        && let Some(directory) = origin.host_cwd.as_deref().and_then(|path| path.to_str())
+    {
+        update_wsl_args(&mut launch, |program, args| {
+            crate::shell_detect::wsl_args_in_directory(program, args, directory)
+        });
     }
     (launch, origin.host_cwd)
 }
@@ -322,7 +333,7 @@ mod tests {
         ];
         let new_tabs: [Case; 5] = [
             (wsl("Ubuntu"), guest("ubuntu"), &["--cd", "/srv", "-d", "Ubuntu"], true),
-            (wsl("Debian"), guest("Ubuntu"), &["-d", "Debian"], false),
+            (wsl("Debian"), guest("Ubuntu"), &["--cd", r"D:\work", "-d", "Debian"], false),
             (pwsh, guest("Ubuntu"), &[], false),
             (own, guest("Ubuntu"), &["-d", "Ubuntu", "--cd", "~/work"], false),
             (
@@ -339,6 +350,141 @@ mod tests {
                 assert_eq!(args(&launch), expected);
                 assert_eq!(cwd.is_none(), inherits, "{expected:?}");
             }
+        }
+    }
+
+    #[test]
+    fn new_wsl_tab_carries_host_directory_through_pty_preparation() {
+        use crate::gpui_shell::terminal::view::TerminalLaunch;
+
+        for (directory, encoded) in [
+            (r"F:\ProjectsWork\Redeem", r"F:\ProjectsWork\Redeem"),
+            (r"F:\项目 目录\Redeem", r#""F:\项目 目录\Redeem""#),
+        ] {
+            for target in [
+                wsl("Ubuntu"),
+                LaunchSession::Profile {
+                    name: "Guest profile".into(),
+                    command: "wsl.exe".into(),
+                    args: ["-d", "Ubuntu", "-u", "guest", "--exec", "zsh", "-l"]
+                        .map(String::from)
+                        .to_vec(),
+                    cwd: None,
+                    shell_id: None,
+                },
+            ] {
+                let mut expected = vec!["--cd".to_owned(), encoded.to_owned()];
+                expected.extend_from_slice(args(&target));
+                let host = PathBuf::from(directory);
+                let origin =
+                    PaneOrigin { guest: None, cwd: directory, host_cwd: Some(host.clone()) };
+                let (launch, cwd) = copy_launch(target, CopyKind::NewTab, origin);
+                let TerminalLaunch::Local { shell, cwd, .. } =
+                    NebulaWorkspace::terminal_launch_from_session(&launch, cwd)
+                else {
+                    panic!("a WSL tab starts through the local PTY");
+                };
+                let mut options = nebula_terminal::tty::Options {
+                    shell,
+                    working_directory: cwd,
+                    ..Default::default()
+                };
+                crate::platform::launch_directory::prepare_wsl(&mut options, None);
+                assert_eq!(options.shell.unwrap().args(), expected, "{directory}");
+                assert_eq!(options.working_directory, Some(host));
+            }
+        }
+    }
+
+    #[test]
+    fn new_wsl_tab_preserves_explicit_directory_choices() {
+        for target in [
+            shell("chosen", "wsl.exe", &["-d", "Ubuntu", "--cd", "/chosen"]),
+            shell("home", "wsl.exe", &["~", "-d", "Ubuntu"]),
+            LaunchSession::Profile {
+                name: "Profile directory".into(),
+                command: "wsl.exe".into(),
+                args: vec!["-d".into(), "Ubuntu".into()],
+                cwd: Some("/profile".into()),
+                shell_id: None,
+            },
+        ] {
+            let host = PathBuf::from(r"F:\ProjectsWork\Redeem");
+            let origin =
+                PaneOrigin { guest: guest("Ubuntu"), cwd: "/source", host_cwd: Some(host.clone()) };
+            let (launch, cwd) = copy_launch(target.clone(), CopyKind::NewTab, origin);
+            assert_eq!(launch, target);
+            assert_eq!(cwd, Some(host));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires installed Ubuntu-22.04; launches isolated pwd without a GUI"]
+    fn new_wsl_tab_reaches_real_guest_directory() {
+        use crate::gpui_shell::terminal::view::TerminalLaunch;
+        use std::os::windows::process::CommandExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        for name in ["project", "项目 with spaces"] {
+            let host = root.path().join(name);
+            std::fs::create_dir(&host).unwrap();
+            let directory = host.to_str().unwrap();
+            let origin = PaneOrigin { guest: None, cwd: directory, host_cwd: Some(host.clone()) };
+            let target = shell(
+                "Ubuntu",
+                &crate::platform::shell::wsl_executable().unwrap(),
+                &["-d", "Ubuntu-22.04"],
+            );
+            let (launch, cwd) = copy_launch(target, CopyKind::NewTab, origin);
+            let TerminalLaunch::Local { shell, cwd, .. } =
+                NebulaWorkspace::terminal_launch_from_session(&launch, cwd)
+            else {
+                panic!("expected local WSL launch");
+            };
+            let mut options = nebula_terminal::tty::Options {
+                shell,
+                working_directory: cwd,
+                ..Default::default()
+            };
+            crate::platform::launch_directory::prepare_wsl(&mut options, None);
+            let shell = options.shell.unwrap();
+            let mut command = std::process::Command::new(shell.program());
+            command.raw_arg(shell.args().join(" ")).args(["--exec", "/bin/pwd"]);
+            command.current_dir(options.working_directory.unwrap());
+            let output = crate::platform::process_output::read_cancellable(
+                command,
+                std::time::Duration::from_secs(30),
+                4096,
+                &|| false,
+            )
+            .unwrap();
+            let native = directory.replace('\\', "/");
+            let expected = format!("/mnt/{}/{}", native[..1].to_ascii_lowercase(), &native[3..]);
+            assert_eq!(String::from_utf8(output).unwrap().trim_end(), expected);
+        }
+    }
+
+    #[test]
+    fn new_wsl_tab_without_host_directory_keeps_guest_or_home_policy() {
+        use crate::gpui_shell::terminal::view::TerminalLaunch;
+
+        for (focused, expected) in [(guest("Ubuntu"), "/home/wyr/project"), (None, "~")] {
+            let origin = PaneOrigin { guest: focused, cwd: "/home/wyr/project", host_cwd: None };
+            let (launch, cwd) = copy_launch(wsl("Ubuntu"), CopyKind::NewTab, origin);
+            let TerminalLaunch::Local { shell, cwd, .. } =
+                NebulaWorkspace::terminal_launch_from_session(&launch, cwd)
+            else {
+                panic!("expected local WSL launch");
+            };
+            let mut options = nebula_terminal::tty::Options {
+                shell,
+                working_directory: cwd,
+                ..Default::default()
+            };
+            crate::platform::launch_directory::prepare_wsl(&mut options, None);
+            assert_eq!(options.shell.unwrap().args(), &["--cd", expected, "-d", "Ubuntu"]);
+            assert!(options.working_directory.is_none());
         }
     }
 
